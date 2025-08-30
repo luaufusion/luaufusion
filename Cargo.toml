@@ -6,7 +6,11 @@ edition = "2024"
 [dependencies]
 mlua_scheduler = { git = "https://github.com/mluau/scheduler", version = "1.0.0" }
 mluau = { git = "https://github.com/mluau/mluau", version = "0.11.2" }
-rquickjs = { git = "https://github.com/mluau-quickjs-proxy/rquickjs", features = ["macro", "futures"] }
+rquickjs = { git = "https://github.com/mluau-quickjs-proxy/rquickjs", features = ["macro", "futures"], optional = true }
 tokio = "1.47.1"
 futures-util = "0.3"
 rand = "0.9"
+
+[features]
+default = ["rquickjs"]
+rquickjs = ["dep:rquickjs"]
