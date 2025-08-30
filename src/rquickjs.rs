@@ -3,6 +3,7 @@ use mlua_scheduler::taskmgr::get;
 use mlua_scheduler::LuaSchedulerAsync;
 use mlua_scheduler::LuaSchedulerAsyncUserData;
 
+use mluau::IntoLua;
 use mluau::UserDataMethods;
 use rquickjs::class::Trace;
 use tokio::sync::mpsc::{UnboundedSender as MSender, UnboundedReceiver as MReceiver, unbounded_channel};
@@ -960,24 +961,13 @@ pub fn proxy_from_quickjs<'js>(ctx: RQCtx<'js>, lua: &mluau::Lua, runtime: &Quic
         Ok(mluau::Value::UserData(lua.create_userdata(quickjs_promise)
             .map_err(|e| format!("Failed to create Lua QuickJS promise userdata: {}", e))?))
     } else if let Some(obj) = value.as_object() {
-        let table = lua.create_table_with_capacity(0, obj.len())
-            .map_err(|e| format!("Failed to create Lua table: {}", e))?;
-
-        for prop in obj.own_props(rquickjs::Filter::new().enum_only()) {
-            let (k, v) = prop?;
-            let k = proxy_from_quickjs(ctx.clone(), lua, runtime, k)?;
-            let v = proxy_from_quickjs(ctx.clone(), lua, runtime, v)?;
-            table.set(k, v)
-                .map_err(|e| format!("Failed to set Lua table key/value: {}", e))?;
-        }
-
-        table.set("proxy", JSObjectProxy {
+        let ud = JSObjectProxy {
             obj: runtime.proxy_objects.add(Persistent::save(&ctx, obj.clone())),
             weak_rt: runtime.weak(),
-        })
-            .map_err(|e| format!("Failed to set Lua table proxy field: {}", e))?;
+        }.into_lua(lua)
+            .map_err(|e| format!("Failed to create Lua JSObjectProxy userdata: {}", e))?;
 
-        Ok(mluau::Value::Table(table))
+        Ok(ud)
     } else if let Some(array_buf) = rquickjs::ArrayBuffer::from_value(value) {
         let Some(bytes) = array_buf.as_bytes() else {
             return Err("Failed to get bytes from ArrayBuffer".into());
@@ -1071,7 +1061,7 @@ local result = qjs:load("testmodule", [[
     }
 ]])
 
-return result, result.proxy:get("test")(5, 10)
+return result:get("test")(5, 10)
 "#;
 
             let func = lua.load(lua_code).into_function().expect("Failed to load Lua code");
@@ -1088,9 +1078,6 @@ return result, result.proxy:get("test")(5, 10)
                 .expect("Lua thread returned an error");
             
             println!("Output: {:?}", output);
-
-            let table = output.into_iter().next().unwrap().as_table().expect("Output is not a table").clone();
-            println!("Table: {:#?}", table);
         });
     }
 }
