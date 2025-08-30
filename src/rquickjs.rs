@@ -4,6 +4,7 @@ use mlua_scheduler::LuaSchedulerAsync;
 use mlua_scheduler::LuaSchedulerAsyncUserData;
 
 use mluau::IntoLua;
+use mluau::LuaSerdeExt;
 use mluau::UserDataMethods;
 use rquickjs::class::Trace;
 use tokio::sync::mpsc::{UnboundedSender as MSender, UnboundedReceiver as MReceiver, unbounded_channel};
@@ -43,6 +44,10 @@ enum RuntimeEvent {
         key: mluau::Value,
         result: MSender<Result<mluau::Value, mluau::Error>>,
     },
+    JsonifyQuickjsObject {
+        obj_idx: PersistentStoreHandler<rquickjs::Object<'static>>,
+        result: MSender<Result<serde_json::Value, mluau::Error>>,
+    }
 }
 
 #[derive(Clone)]
@@ -242,7 +247,6 @@ impl QuickjsRuntime {
                 let mut async_queue_quickjs_proxy = FuturesUnordered::new();
                 let mut async_queue_quickjs_promise = FuturesUnordered::new();
                 let mut async_queue_quickjs_module = FuturesUnordered::new();
-                let mut async_queue_quickjs_get_obj = FuturesUnordered::new();
 
                 loop {
                     tokio::select! {
@@ -337,21 +341,97 @@ impl QuickjsRuntime {
                                     );
                                 }
                                 RuntimeEvent::GetQuickjsObject { obj_idx, key, result } => {
-                                    let self_ref_cloned = self_ref.clone();
-                                    let ctx_ref = ctx.clone();
-                                    async_queue_quickjs_get_obj.push(
-                                        Self::get_quickjs_obj_impl(
-                                            self_ref_cloned,
-                                            obj_idx,
-                                            key,
-                                            ctx_ref,
-                                            result,
-                                        )
-                                    );
+                                    let Some(lua) = self_ref.lua.try_upgrade() else {
+                                        let _ = result.send(Err(mluau::Error::external("Lua state has been dropped")));
+                                        continue;
+                                    };
+
+                                    let obj = match self_ref.proxy_objects.get(obj_idx) {
+                                        Some(o) => o,
+                                        None => {
+                                            let _ = result.send(Err(mluau::Error::external("Invalid QuickJS object index")));
+                                            continue;
+                                        }
+                                    };
+
+                                    let key = match proxy_object(ctx.clone(), key, &self_ref) {
+                                        Ok(k) => k,
+                                        Err(e) => {
+                                            let _ = result.send(Err(mluau::Error::external(format!("Failed to proxy Lua key to QuickJS: {e}"))));
+                                            continue;
+                                        }
+                                    };
+
+                                    let key_atom = match rquickjs::Atom::from_value(ctx.clone(), &key) {
+                                        Ok(a) => a,
+                                        Err(e) => {
+                                            let _ = result.send(Err(mluau::Error::external(format!("Failed to convert QuickJS key to atom: {e}"))));
+                                            continue;
+                                        }
+                                    };
+
+                                    let obj_lifetime = match obj.restore(&ctx) {
+                                        Ok(o) => o,
+                                        Err(e) => {
+                                            let _ = result.send(Err(mluau::Error::external(format!("Failed to restore QuickJS object: {e}"))));
+                                            continue;
+                                        }
+                                    };
+
+                                    let value = match obj_lifetime.get(key_atom) {
+                                        Ok(v) => v,
+                                        Err(e) => {
+                                            let _ = result.send(Err(mluau::Error::external(format!("Failed to get property from QuickJS object: {e}"))));
+                                            continue;
+                                        }
+                                    };
+
+                                    let lua_res = match proxy_from_quickjs(ctx.clone(), &lua, &self_ref, value) {
+                                        Ok(v) => v,
+                                        Err(e) => {
+                                            let _ = result.send(Err(mluau::Error::external(format!("Failed to proxy QuickJS return value to Lua: {e}"))));
+                                            continue;
+                                        }
+                                    };
+
+                                    let _ = result.send(Ok(lua_res));
+                                    drop(lua);
+                                }
+                                RuntimeEvent::JsonifyQuickjsObject { obj_idx, result } => {
+                                    let Some(lua) = self_ref.lua.try_upgrade() else {
+                                        let _ = result.send(Err(mluau::Error::external("Lua state has been dropped")));
+                                        continue;
+                                    };
+
+                                    let obj = match self_ref.proxy_objects.get(obj_idx) {
+                                        Some(o) => o,
+                                        None => {
+                                            let _ = result.send(Err(mluau::Error::external("Invalid QuickJS object index")));
+                                            continue;
+                                        }
+                                    };
+
+                                    let obj_lifetime = match obj.restore(&ctx) {
+                                        Ok(o) => o,
+                                        Err(e) => {
+                                            let _ = result.send(Err(mluau::Error::external(format!("Failed to restore QuickJS object: {e}"))));
+                                            continue;
+                                        }
+                                    };
+
+                                    let svv: serde_json::Value = match rquickjs_serde::from_value(obj_lifetime.into_value()) {
+                                        Ok(v) => v,
+                                        Err(e) => {
+                                            let _ = result.send(Err(mluau::Error::external(format!("Failed to JSONify QuickJS object: {e}"))));
+                                            continue;
+                                        }
+                                    };
+
+                                    let _ = result.send(Ok(svv));
+                                    drop(lua)
                                 }
                             }
                         }
-                        Some(_) = async_queue_quickjs_get_obj.next() => {}
                         Some(_) = async_queue.next() => {}
                         Some(_) = async_queue_quickjs_proxy.next() => {}
                         Some(_) = async_queue_quickjs_promise.next() => {}
@@ -547,70 +627,6 @@ impl QuickjsRuntime {
         drop(lua);
     }
 
-    async fn get_quickjs_obj_impl(
-        self_ref: QuickjsRuntime,
-        obj_idx: PersistentStoreHandler<rquickjs::Object<'static>>,
-        key: mluau::Value,
-        ctx: RQCtx<'_>,
-        result: MSender<Result<mluau::Value, mluau::Error>>,
-    ) {
-        let Some(lua) = self_ref.lua.try_upgrade() else {
-            let _ = result.send(Err(mluau::Error::external("Lua state has been dropped")));
-            return;
-        };
-
-        let obj = match self_ref.proxy_objects.get(obj_idx) {
-            Some(o) => o,
-            None => {
-                let _ = result.send(Err(mluau::Error::external("Invalid QuickJS object index")));
-                return;
-            }
-        };
-
-        let key = match proxy_object(ctx.clone(), key, &self_ref) {
-            Ok(k) => k,
-            Err(e) => {
-                let _ = result.send(Err(mluau::Error::external(format!("Failed to proxy Lua key to QuickJS: {e}"))));
-                return;
-            }
-        };
-
-        let key_atom = match rquickjs::Atom::from_value(ctx.clone(), &key) {
-            Ok(a) => a,
-            Err(e) => {
-                let _ = result.send(Err(mluau::Error::external(format!("Failed to convert QuickJS key to atom: {e}"))));
-                return;
-            }
-        };
-
-        let obj_lifetime = match obj.restore(&ctx) {
-            Ok(o) => o,
-            Err(e) => {
-                let _ = result.send(Err(mluau::Error::external(format!("Failed to restore QuickJS object: {e}"))));
-                return;
-            }
-        };
-
-        let value = match obj_lifetime.get(key_atom) {
-            Ok(v) => v,
-            Err(e) => {
-                let _ = result.send(Err(mluau::Error::external(format!("Failed to get property from QuickJS object: {e}"))));
-                return;
-            }
-        };
-
-        let lua_res = match proxy_from_quickjs(ctx.clone(), &lua, &self_ref, value) {
-            Ok(v) => v,
-            Err(e) => {
-                let _ = result.send(Err(mluau::Error::external(format!("Failed to proxy QuickJS return value to Lua: {e}"))));
-                return;
-            }
-        };
-
-        let _ = result.send(Ok(lua_res));
-        drop(lua);
-    }
-
     pub fn weak(&self) -> WeakQuickjsRuntime {
         WeakQuickjsRuntime {
             inner: Rc::downgrade(&self.inner)
@@ -774,6 +790,25 @@ pub struct JSObjectProxy {
     weak_rt: WeakQuickjsRuntime,
 }
 
+impl JSObjectProxy {
+    pub async fn to_json(&self) -> mluau::Result<serde_json::Value> {
+        let Some(runtime) = self.weak_rt.upgrade() else {
+            return Err(mluau::Error::external("Lua state has been dropped"));
+        };
+
+        let (res_tx, mut res_rx) = tokio::sync::mpsc::unbounded_channel();
+        runtime.tx.send(RuntimeEvent::JsonifyQuickjsObject {
+            obj_idx: self.obj.clone(),
+            result: res_tx,
+        }).map_err(|e| mluau::Error::external(format!("Failed to request QuickJS for object: {e:?}")))?;
+
+        let lua_value = res_rx.recv().await
+            .ok_or(mluau::Error::external("Failed to receive result from QuickJS runtime"))??;
+
+        Ok(lua_value)
+    }
+}
+
 impl mluau::UserData for JSObjectProxy {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_scheduler_async_method("get", async move |_lua, this, key: mluau::Value| {
@@ -794,7 +829,31 @@ impl mluau::UserData for JSObjectProxy {
 
             Ok(lua_value)
         });
+
+        methods.add_scheduler_async_method("json", async move |lua, this, _: ()| {
+            let Some(runtime) = this.weak_rt.upgrade() else {
+                return Err(mluau::Error::external("Lua state has been dropped"));
+            };
+
+            let (res_tx, mut res_rx) = tokio::sync::mpsc::unbounded_channel();
+            runtime.tx.send(RuntimeEvent::JsonifyQuickjsObject {
+                obj_idx: this.obj.clone(),
+                result: res_tx,
+            }).map_err(|e| mluau::Error::external(format!("Failed to request QuickJS for object: {e:?}")))?;
+
+            let lua_value = res_rx.recv().await
+                .ok_or(mluau::Error::external("Failed to receive result from QuickJS runtime"))??;
+
+            Ok(lua.to_value(&lua_value))
+        });
     }
+}
+
+/// A cheap JSONable data
+/// 
+/// TODO: Finish
+pub struct JSON {
+    pub value: serde_json::Value
 }
 
 #[rquickjs::class(frozen)]
