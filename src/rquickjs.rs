@@ -3,6 +3,7 @@ use mlua_scheduler::taskmgr::get;
 use mlua_scheduler::LuaSchedulerAsync;
 use mlua_scheduler::LuaSchedulerAsyncUserData;
 
+use mluau::UserDataMethods;
 use rquickjs::class::Trace;
 use tokio::sync::mpsc::{UnboundedSender as MSender, UnboundedReceiver as MReceiver, unbounded_channel};
 use tokio::sync::oneshot::{Sender as OneShotSender};
@@ -22,6 +23,11 @@ enum RuntimeEvent {
         args: mluau::MultiValue,
         result: MSender<Result<mluau::MultiValue, mluau::Error>>,
     },
+    RunQuickjsModule {
+        name: String,
+        code: String,
+        result: MSender<Result<mluau::MultiValue, mluau::Error>>,
+    },
     RunQuickjsProxy {
         func_idx: PersistentStoreHandler<rquickjs::Function<'static>>,
         args: mluau::MultiValue,
@@ -30,6 +36,11 @@ enum RuntimeEvent {
     RunQuickjsPromiseProxy {
         promise_idx: PersistentStoreHandler<rquickjs::Promise<'static>>,
         result: MSender<Result<mluau::MultiValue, mluau::Error>>,
+    },
+    GetQuickjsObject {
+        obj_idx: PersistentStoreHandler<rquickjs::Object<'static>>,
+        key: mluau::Value,
+        result: MSender<Result<mluau::Value, mluau::Error>>,
     },
 }
 
@@ -132,6 +143,7 @@ pub struct QuickjsRuntimeInner {
     is_running: Rc<Cell<bool>>,
     proxy_funcs: PersistentStore<rquickjs::Function<'static>>,
     proxy_promises: PersistentStore<rquickjs::Promise<'static>>,
+    proxy_objects: PersistentStore<rquickjs::Object<'static>>,
 }
 
 #[derive(Clone)]
@@ -148,8 +160,39 @@ impl std::ops::Deref for QuickjsRuntime {
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
+pub struct LoaderAndResolver {
+    pub loader: rquickjs::loader::BuiltinLoader,
+    pub resolver: rquickjs::loader::BuiltinResolver,
+}
+
+impl LoaderAndResolver {
+    pub fn new() -> Self {
+        Self {
+            loader: rquickjs::loader::BuiltinLoader::default(),
+            resolver: rquickjs::loader::BuiltinResolver::default(),
+        }
+    }
+
+    pub fn add_module(&mut self, name: &str, code: &str) {
+        self.loader.add_module(name, code);
+        self.resolver.add_module(name);
+    }
+}
+
+impl rquickjs::loader::Loader for LoaderAndResolver {
+    fn load<'js>(&mut self, ctx: &RQCtx<'js>, name: &str) -> rquickjs::Result<rquickjs::Module<'js, rquickjs::module::Declared>> {
+        self.loader.load(ctx, name)
+    }
+}
+
+impl rquickjs::loader::Resolver for LoaderAndResolver {
+    fn resolve<'js>(&mut self, ctx: &RQCtx<'js>, base: &str, name: &str) -> rquickjs::Result<String> {
+        self.resolver.resolve(ctx, base, name)
+    }
+}
+
 impl QuickjsRuntime {
-    pub async fn new(lua: WeakLua) -> Result<Self, Error> {
+    pub async fn new(lua: WeakLua, builtin_loader: LoaderAndResolver) -> Result<Self, Error> {
         let (tx, rx) = unbounded_channel();
 
         let (start_tx, start_rx) = tokio::sync::oneshot::channel();
@@ -160,13 +203,14 @@ impl QuickjsRuntime {
                 is_running: Rc::new(Cell::new(false)), 
                 proxy_funcs: PersistentStore::new(),
                 proxy_promises: PersistentStore::new(),
+                proxy_objects: PersistentStore::new(),
             })
         };
 
         tokio::task::spawn_local({
             let runtime = runtime.clone();
             async move {
-                runtime.run(start_tx, rx).await;
+                runtime.run(start_tx, rx, builtin_loader).await;
             }
         });
 
@@ -176,12 +220,14 @@ impl QuickjsRuntime {
         Ok(runtime)
     }
 
-    async fn run(&self, start_tx: OneShotSender<()>, mut rx: MReceiver<RuntimeEvent>) {
+    async fn run(&self, start_tx: OneShotSender<()>, mut rx: MReceiver<RuntimeEvent>, builtin_loader: LoaderAndResolver) {
         if self.is_running.get() {
             panic!("QuickJS proxy runtime is already running");
         }
 
         let runtime = RQRuntime::new().expect("Failed to create QuickJS runtime");
+        runtime.set_loader(builtin_loader.resolver, builtin_loader.loader).await;
+
         let context = RQContext::full(&runtime).await.expect("Failed to create QuickJS context");
 
         self.is_running.set(true);
@@ -194,9 +240,12 @@ impl QuickjsRuntime {
             |ctx| Box::pin(async move {
                 let mut async_queue_quickjs_proxy = FuturesUnordered::new();
                 let mut async_queue_quickjs_promise = FuturesUnordered::new();
+                let mut async_queue_quickjs_module = FuturesUnordered::new();
+                let mut async_queue_quickjs_get_obj = FuturesUnordered::new();
 
                 loop {
                     tokio::select! {
+                        //biased;
                         Some(event) = rx.recv() => {
                             match event {
                                 RuntimeEvent::Shutdown => break,
@@ -273,11 +322,39 @@ impl QuickjsRuntime {
                                         )
                                     );
                                 }
+                                RuntimeEvent::RunQuickjsModule { name, code, result } => {
+                                    let self_ref_cloned = self_ref.clone();
+                                    let ctx_ref = ctx.clone();
+                                    async_queue_quickjs_module.push(
+                                        Self::run_quickjs_module_impl(
+                                            self_ref_cloned,
+                                            name,
+                                            code,
+                                            ctx_ref,
+                                            result,
+                                        )
+                                    );
+                                }
+                                RuntimeEvent::GetQuickjsObject { obj_idx, key, result } => {
+                                    let self_ref_cloned = self_ref.clone();
+                                    let ctx_ref = ctx.clone();
+                                    async_queue_quickjs_get_obj.push(
+                                        Self::get_quickjs_obj_impl(
+                                            self_ref_cloned,
+                                            obj_idx,
+                                            key,
+                                            ctx_ref,
+                                            result,
+                                        )
+                                    );
+                                }
                             }
                         }
+                        Some(_) = async_queue_quickjs_get_obj.next() => {}
                         Some(_) = async_queue.next() => {}
                         Some(_) = async_queue_quickjs_proxy.next() => {}
                         Some(_) = async_queue_quickjs_promise.next() => {}
+                        Some(_) = async_queue_quickjs_module.next() => {}
                     }
                 }
             })
@@ -289,6 +366,7 @@ impl QuickjsRuntime {
         // Make sure to clear the persistent proxy stores
         self.proxy_funcs.clear();
         self.proxy_promises.clear();
+        self.proxy_objects.clear();
     }
 
     async fn run_quick_js_proxy_impl(
@@ -410,10 +488,159 @@ impl QuickjsRuntime {
         drop(lua);
     }
 
-    fn weak(&self) -> WeakQuickjsRuntime {
+    async fn run_quickjs_module_impl(
+        self_ref: QuickjsRuntime,
+        name: String,
+        code: String,
+        ctx: RQCtx<'_>,
+        result: MSender<Result<mluau::MultiValue, mluau::Error>>,
+    ) {
+        let module = match rquickjs::Module::declare(ctx.clone(), name, code) {
+            Ok(m) => m,
+            Err(e) => {
+                let _ = result.send(Err(mluau::Error::external(format!("Failed to declare QuickJS module: {e}"))));
+                return;
+            }
+        };
+
+        let (module, promise) = match module.eval() {
+            Ok(m) => m,
+            Err(e) => {
+                let _ = result.send(Err(mluau::Error::external(format!("Failed to evaluate QuickJS module: {e}"))));
+                return;
+            }
+        };
+
+        match promise.into_future::<()>().await {
+            Ok(_) => {},
+            Err(e) => {
+                let _ = result.send(Err(mluau::Error::external(format!("Failed to await QuickJS module evaluation: {e}"))));
+                return;
+            }
+        }
+
+        let namespace = match module.namespace() {
+            Ok(n) => n,
+            Err(e) => {
+                let _ = result.send(Err(mluau::Error::external(format!("Failed to get QuickJS module namespace: {e}"))));
+                return;
+            }
+        }.into_value();
+
+        let Some(lua) = self_ref.lua.try_upgrade() else {
+            let _ = result.send(Err(mluau::Error::external("Lua state has been dropped")));
+            return;
+        };
+
+        let lua_res = match proxy_from_quickjs(ctx.clone(), &lua, &self_ref, namespace) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = result.send(Err(mluau::Error::external(format!("Failed to proxy QuickJS return value to Lua: {e}"))));
+                return;
+            }
+        };
+
+        let mut mv = mluau::MultiValue::with_capacity(1);
+        mv.push_back(lua_res);
+        let _ = result.send(Ok(mv));
+        drop(lua);
+    }
+
+    async fn get_quickjs_obj_impl(
+        self_ref: QuickjsRuntime,
+        obj_idx: PersistentStoreHandler<rquickjs::Object<'static>>,
+        key: mluau::Value,
+        ctx: RQCtx<'_>,
+        result: MSender<Result<mluau::Value, mluau::Error>>,
+    ) {
+        let Some(lua) = self_ref.lua.try_upgrade() else {
+            let _ = result.send(Err(mluau::Error::external("Lua state has been dropped")));
+            return;
+        };
+
+        let obj = match self_ref.proxy_objects.get(obj_idx) {
+            Some(o) => o,
+            None => {
+                let _ = result.send(Err(mluau::Error::external("Invalid QuickJS object index")));
+                return;
+            }
+        };
+
+        let key = match proxy_object(ctx.clone(), key, &self_ref) {
+            Ok(k) => k,
+            Err(e) => {
+                let _ = result.send(Err(mluau::Error::external(format!("Failed to proxy Lua key to QuickJS: {e}"))));
+                return;
+            }
+        };
+
+        let key_atom = match rquickjs::Atom::from_value(ctx.clone(), &key) {
+            Ok(a) => a,
+            Err(e) => {
+                let _ = result.send(Err(mluau::Error::external(format!("Failed to convert QuickJS key to atom: {e}"))));
+                return;
+            }
+        };
+
+        let obj_lifetime = match obj.restore(&ctx) {
+            Ok(o) => o,
+            Err(e) => {
+                let _ = result.send(Err(mluau::Error::external(format!("Failed to restore QuickJS object: {e}"))));
+                return;
+            }
+        };
+
+        let value = match obj_lifetime.get(key_atom) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = result.send(Err(mluau::Error::external(format!("Failed to get property from QuickJS object: {e}"))));
+                return;
+            }
+        };
+
+        let lua_res = match proxy_from_quickjs(ctx.clone(), &lua, &self_ref, value) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = result.send(Err(mluau::Error::external(format!("Failed to proxy QuickJS return value to Lua: {e}"))));
+                return;
+            }
+        };
+
+        let _ = result.send(Ok(lua_res));
+        drop(lua);
+    }
+
+    pub fn weak(&self) -> WeakQuickjsRuntime {
         WeakQuickjsRuntime {
             inner: Rc::downgrade(&self.inner)
         }
+    }
+}
+
+impl mluau::UserData for QuickjsRuntime {
+    fn add_methods<M: mluau::UserDataMethods<Self>>(methods: &mut M) {
+        // Returns if the runtime is currently running
+        //
+        // TODO: Remove later
+        methods.add_method("isrunning", |_, this, _: ()| {
+            Ok(this.is_running.get())
+        });
+
+        methods.add_scheduler_async_method("load", async move |_, this, (name, code): (String, String)| {
+            // Push to the runtime event queue
+            let (res_tx, mut res_rx) = tokio::sync::mpsc::unbounded_channel();
+            this.tx.send(RuntimeEvent::RunQuickjsModule {
+                name,
+                code,
+                result: res_tx,
+            }).map_err(|e| mluau::Error::external(format!("Failed to send event to runtime: {}", e)))?;
+
+            let res = res_rx.recv().await
+                .ok_or(mluau::Error::external("Failed to receive result from runtime"))?
+                .map_err(|e| mluau::Error::external(e.to_string()))?;
+
+            Ok(res)
+        });
     }
 }
 
@@ -429,7 +656,7 @@ impl WeakQuickjsRuntime {
 }
 
 // On drop, signal the runtime to shut down
-impl Drop for QuickjsRuntime {
+impl Drop for QuickjsRuntimeInner {
     fn drop(&mut self) {
         let _ = self.tx.send(RuntimeEvent::Shutdown);
     }
@@ -537,6 +764,35 @@ impl LuaFunction {
             .map_err(|e| format!("Failed to create Lua function: {}", e))?;
 
         Ok(lua_func)
+    }
+}
+
+/// A proxy from a QuickJS object to a Lua object
+pub struct JSObjectProxy {
+    obj: PersistentStoreHandler<rquickjs::Object<'static>>,
+    weak_rt: WeakQuickjsRuntime,
+}
+
+impl mluau::UserData for JSObjectProxy {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_scheduler_async_method("get", async move |_lua, this, key: mluau::Value| {
+            let Some(runtime) = this.weak_rt.upgrade() else {
+                return Err(mluau::Error::external("Lua state has been dropped"));
+            };
+
+            let (res_tx, mut res_rx) = tokio::sync::mpsc::unbounded_channel();
+            runtime.tx.send(RuntimeEvent::GetQuickjsObject {
+                obj_idx: this.obj.clone(),
+                key,
+                result: res_tx,
+            }).map_err(|e| mluau::Error::external(format!("Failed to request QuickJS for object: {e:?}")))?;
+
+            let lua_value = res_rx.recv().await
+                .ok_or(mluau::Error::external("Failed to receive result from QuickJS runtime"))??;
+
+
+            Ok(lua_value)
+        });
     }
 }
 
@@ -682,18 +938,6 @@ pub fn proxy_from_quickjs<'js>(ctx: RQCtx<'js>, lua: &mluau::Lua, runtime: &Quic
 
             Ok(mluau::Value::Table(table))
         }
-    } else if let Some(obj) = value.as_object() {
-        let table = lua.create_table_with_capacity(0, obj.len())
-            .map_err(|e| format!("Failed to create Lua table: {}", e))?;
-
-        for prop in obj.own_props(rquickjs::Filter::new().enum_only()) {
-            let (k, v) = prop?;
-            let k = proxy_from_quickjs(ctx.clone(), lua, runtime, k)?;
-            let v = proxy_from_quickjs(ctx.clone(), lua, runtime, v)?;
-            table.set(k, v)
-                .map_err(|e| format!("Failed to set Lua table key/value: {}", e))?;
-        }
-        Ok(mluau::Value::Table(table))
     } else if let Some(func) = value.as_function() {
         Ok(LuaFunction::from_quickjs(ctx, func.clone(), runtime.clone(), lua)
             .map(mluau::Value::Function)
@@ -715,6 +959,25 @@ pub fn proxy_from_quickjs<'js>(ctx: RQCtx<'js>, lua: &mluau::Lua, runtime: &Quic
         let quickjs_promise = QuickJSPromise { promise: Some(promise_idx), weak_rt: runtime.weak() };
         Ok(mluau::Value::UserData(lua.create_userdata(quickjs_promise)
             .map_err(|e| format!("Failed to create Lua QuickJS promise userdata: {}", e))?))
+    } else if let Some(obj) = value.as_object() {
+        let table = lua.create_table_with_capacity(0, obj.len())
+            .map_err(|e| format!("Failed to create Lua table: {}", e))?;
+
+        for prop in obj.own_props(rquickjs::Filter::new().enum_only()) {
+            let (k, v) = prop?;
+            let k = proxy_from_quickjs(ctx.clone(), lua, runtime, k)?;
+            let v = proxy_from_quickjs(ctx.clone(), lua, runtime, v)?;
+            table.set(k, v)
+                .map_err(|e| format!("Failed to set Lua table key/value: {}", e))?;
+        }
+
+        table.set("proxy", JSObjectProxy {
+            obj: runtime.proxy_objects.add(Persistent::save(&ctx, obj.clone())),
+            weak_rt: runtime.weak(),
+        })
+            .map_err(|e| format!("Failed to set Lua table proxy field: {}", e))?;
+
+        Ok(mluau::Value::Table(table))
     } else if let Some(array_buf) = rquickjs::ArrayBuffer::from_value(value) {
         let Some(bytes) = array_buf.as_bytes() else {
             return Err("Failed to get bytes from ArrayBuffer".into());
@@ -725,5 +988,109 @@ pub fn proxy_from_quickjs<'js>(ctx: RQCtx<'js>, lua: &mluau::Lua, runtime: &Quic
         )
     } else {
         Err("Cannot proxy unknown JS value to Lua".into())
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use mluau::prelude::*;
+    use mlua_scheduler::{LuaSchedulerAsync, XRc};
+    use mlua_scheduler::taskmgr::NoopHooks;
+
+    #[test]
+    fn test_proxy() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async move {
+            let lua = mluau::Lua::new_with(mluau::StdLib::ALL_SAFE, mluau::LuaOptions::default())
+                .expect("Failed to create Lua");
+
+            let compiler = mluau::Compiler::new().set_optimization_level(2);
+
+            lua.set_compiler(compiler);
+
+            let returns_tracker = mlua_scheduler::taskmgr::ReturnTracker::new();
+
+            let mut wildcard_sender = returns_tracker.track_wildcard_thread();
+
+            tokio::task::spawn_local(async move {
+                while let Some((thread, result)) = wildcard_sender.recv().await {
+                    if let Err(e) = result {
+                        eprintln!("Error in thread {e:?}: {:?}", thread.to_pointer());
+                    }
+                }
+            });
+
+            let task_mgr = mlua_scheduler::taskmgr::TaskManager::new(&lua, returns_tracker, XRc::new(NoopHooks {})).await.expect("Failed to create task manager");
+
+            lua.globals()
+                .set(
+                    "_PANIC",
+                    lua.create_scheduler_async_function(|_lua, n: i32| async move {
+                        panic!("Panic test: {n}");
+                        #[allow(unreachable_code)]
+                        Ok(())
+                    })
+                    .expect("Failed to create async function"),
+                )
+                .expect("Failed to set _OS global");
+
+            lua.globals()
+                .set(
+                    "task",
+                    mlua_scheduler::userdata::task_lib(&lua).expect("Failed to create table"),
+                )
+                .expect("Failed to set task global");
+
+            lua.sandbox(true).expect("Sandboxed VM"); // Sandbox VM
+
+            let mut loader_and_resolver = super::LoaderAndResolver::new();
+            loader_and_resolver.add_module("mymodule", r#"
+export function add(a, b) {
+    return a + b;
+}
+            "#);
+
+            let qjs_proxy = super::QuickjsRuntime::new(
+                lua.weak(),
+                loader_and_resolver,
+            )
+            .await
+            .expect("Failed to create QuickJS runtime");
+
+            let lua_code = r#"
+local qjs = ...
+local result = qjs:load("testmodule", [[
+    import { add } from './mymodule';
+    export function test(a, b) {
+        return add(a, b);
+    }
+]])
+
+return result, result.proxy:get("test")(5, 10)
+"#;
+
+            let func = lua.load(lua_code).into_function().expect("Failed to load Lua code");
+            let th = lua.create_thread(func).expect("Failed to create Lua thread");
+            
+            let mut args = mluau::MultiValue::new();
+            args.push_back(qjs_proxy.into_lua(&lua).expect("Failed to push QuickJS runtime to Lua"));
+
+            let output = task_mgr
+                .spawn_thread_and_wait(th, args)
+                .await
+                .expect("Failed to run Lua thread")
+                .expect("Lua thread returned no value")
+                .expect("Lua thread returned an error");
+            
+            println!("Output: {:?}", output);
+
+            let table = output.into_iter().next().unwrap().as_table().expect("Output is not a table").clone();
+            println!("Table: {:#?}", table);
+        });
     }
 }
