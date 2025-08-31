@@ -1,5 +1,7 @@
 #[cfg(feature = "rquickjs")]
 pub mod rquickjs;
+#[cfg(feature = "deno")]
+pub mod deno;
 
 use mluau::LuaSerdeExt;
 

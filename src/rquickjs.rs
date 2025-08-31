@@ -849,13 +849,6 @@ impl mluau::UserData for JSObjectProxy {
     }
 }
 
-/// A cheap JSONable data
-/// 
-/// TODO: Finish
-pub struct JSON {
-    pub value: serde_json::Value
-}
-
 #[rquickjs::class(frozen)]
 #[derive(Trace, JsLifetime)]
 pub struct LuaThread {
