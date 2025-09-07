@@ -164,7 +164,7 @@ impl std::ops::Deref for QuickjsRuntime {
     }
 }
 
-pub type Error = Box<dyn std::error::Error + Send + Sync>;
+pub type Error = Box<dyn std::error::Error>;
 
 pub struct LoaderAndResolver {
     pub loader: rquickjs::loader::BuiltinLoader,
@@ -849,6 +849,7 @@ impl mluau::UserData for JSObjectProxy {
     }
 }
 
+// TODO: Add methods to these structs
 #[rquickjs::class(frozen)]
 #[derive(Trace, JsLifetime)]
 pub struct LuaThread {
@@ -856,6 +857,7 @@ pub struct LuaThread {
     th: mluau::Thread
 }
 
+// TODO: Add methods to these structs
 #[rquickjs::class(frozen)]
 #[derive(Trace, JsLifetime)]
 pub struct LuaUserData {
@@ -863,6 +865,7 @@ pub struct LuaUserData {
     ud: mluau::AnyUserData
 }
 
+// TODO: Add methods to these structs
 #[rquickjs::class(frozen)]
 #[derive(Trace, JsLifetime)]
 pub struct LuaLightUserData {
@@ -905,8 +908,8 @@ pub fn proxy_object<'js>(ctx: RQCtx<'js>, value: mluau::Value, runtime: &Quickjs
         mluau::Value::Nil => Ok(rquickjs::Value::new_null(ctx)),
         mluau::Value::Boolean(b) => Ok(rquickjs::Value::new_bool(ctx, b)),
         mluau::Value::LightUserData(lu) => {
-            let lua_light_userdata = LuaLightUserData { lud: lu };
-            Ok(lua_light_userdata.into_js(&ctx)?)
+            let ptr = lu.0 as usize;
+            Ok(rquickjs::Value::new_big_int(ctx, ptr as i64))
         }
         mluau::Value::Integer(i) => {
             if i > i32::MAX.into() {
@@ -930,6 +933,23 @@ pub fn proxy_object<'js>(ctx: RQCtx<'js>, value: mluau::Value, runtime: &Quickjs
         }
         mluau::Value::Table(t) => {
             // Make it a js object
+            if let Some(lua) = t.weak_lua().try_upgrade() {
+                if t.metatable() == Some(lua.array_metatable()) {
+                    // Convert to array
+                    let len = t.raw_len();
+                    let arr = rquickjs::Array::new(ctx.clone())?;
+                    for i in 1..=len {
+                        let v = t.raw_get(i)
+                            .map_err(|e| mluau::Error::external(format!("Failed to get array element {}: {}", i, e)))?;
+                        let v = proxy_object(ctx.clone(), v, runtime)
+                            .map_err(|e| mluau::Error::external(format!("Failed to proxy array element {}: {}", i, e)))?;
+                        arr.set(i - 1, v)
+                            .map_err(|e| mluau::Error::external(format!("Failed to set array element {}: {}", i - 1, e)))?;
+                    }
+                    return Ok(rquickjs::Value::from_array(arr));
+                }
+            }
+
             let obj = rquickjs::Object::new(ctx.clone())?;
             t.for_each(|k, v| {
                 let k = proxy_object(ctx.clone(), k, runtime).map_err(|e| mluau::Error::external(format!("Failed to proxy key: {}", e)))?;
