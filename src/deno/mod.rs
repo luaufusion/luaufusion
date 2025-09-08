@@ -16,48 +16,124 @@ use tokio_util::sync::CancellationToken;
 
 pub type Error = Box<dyn std::error::Error>;
 
-type NeedsFinalizers<T> = Rc<RefCell<HashSet<*mut T>>>;
+const MAX_REFS: usize = 500;
 
-const MAX_FUNCTION_REFS: usize = 500;
+/// Stores a pointer to a Rust struct and a V8 weak reference (with finalizer) to ensure the Rust struct is dropped when V8 garbage collects the associated object.
+struct Finalizer<T> {
+    ptr: *mut T,
+    weak: v8::Weak<v8::External>,
+    finalized: Rc<RefCell<bool>>,
+}
+
+impl<T: 'static> Finalizer<T> {
+    // Create a new Finalizer given scope and Rust struct
+    //
+    // Returns the V8 local `v8::External`
+    // and the Finalizer struct itself which contains a weak reference to the `v8::External` with finalizer
+    fn new<'s>(
+        scope: &mut v8::HandleScope<'s, ()>,
+        rust_obj: T,
+    ) -> (*mut T, v8::Local<'s, v8::External>, Self) {
+        let ptr = Box::into_raw(Box::new(rust_obj));
+        let external = v8::External::new(scope, ptr as *mut std::ffi::c_void);
+        let global_external = v8::Global::new(scope, external);
+        
+        let finalized = Rc::new(RefCell::new(false));
+
+        let finalized_ref = finalized.clone();
+        let weak = v8::Weak::with_guaranteed_finalizer(scope, global_external, Box::new(move || {
+            // Finalizer callback when V8 garbage collects the object
+            if !*finalized_ref.borrow() {
+                *finalized_ref.borrow_mut() = true; // Mark as finalized before droping to avoid double free in Drop
+                unsafe {
+                    drop(Box::from_raw(ptr));
+                }
+            }
+        }));
+
+        let finalizer = Self {
+            ptr,
+            weak,
+            finalized,
+        };
+
+        (ptr, external, finalizer)
+    }
+}
+
+impl<T> Drop for Finalizer<T> {
+    fn drop(&mut self) {
+        if !*self.finalized.borrow() {
+            unsafe {
+                drop(Box::from_raw(self.ptr));
+            }
+            *self.finalized.borrow_mut() = true;
+        }
+    }
+}
+
+pub struct FinalizerList<T> {
+    list: Rc<RefCell<Vec<Finalizer<T>>>>,
+    ptrs: Rc<RefCell<HashSet<usize>>>, // SAFETY: We store them as usizes to avoid improper use of T
+}
+
+impl<T: 'static> Default for FinalizerList<T> {
+    fn default() -> Self {
+        Self {
+            list: Rc::default(),
+            ptrs: Rc::default(),
+        }
+    }
+}
+
+impl<T: 'static> Clone for FinalizerList<T> {
+    fn clone(&self) -> Self {
+        Self {
+            list: self.list.clone(),
+            ptrs: self.ptrs.clone(),
+        }
+    }
+}
+
+impl<T: 'static> FinalizerList<T> {
+    pub fn add<'s>(&self, scope: &mut v8::HandleScope<'s, ()>, rust_obj: T) -> Option<v8::Local<'s, v8::External>> {
+        let (ptr, external, finalizer) = Finalizer::new(scope, rust_obj);
+        let mut list = self.list.borrow_mut();
+        if list.len() >= MAX_REFS {
+            return None;
+        }
+
+        list.push(finalizer);
+
+        self.ptrs.borrow_mut().insert(ptr as usize);
+
+        Some(external)
+    }
+
+    pub fn contains(&self, ptr: *mut T) -> bool {
+        let list = self.ptrs.borrow();
+        list.contains(&(ptr as usize))
+    }
+}
 
 pub struct V8IsolateManagerInner {
     deno: deno_core::JsRuntime,
     cancellation_token: CancellationToken,
     userdata_templates: RefCell<v8::Global<v8::ObjectTemplate>>,
 
-    uds: NeedsFinalizers<UserData>,
-    funcs: NeedsFinalizers<Function>,
-}
-
-impl Drop for V8IsolateManagerInner {
-    fn drop(&mut self) {
-        if let Ok(uds) = self.uds.try_borrow() {
-            for ptr in uds.iter() {
-                unsafe {
-                    drop(Box::from_raw(*ptr));
-                }
-            }
-        }
-
-        if let Ok(funcs) = self.funcs.try_borrow() {
-            for ptr in funcs.iter() {
-                unsafe {
-                    drop(Box::from_raw(*ptr));
-                }
-            }
-        }
-    }
+    uds: FinalizerList<UserData>,
+    funcs: FinalizerList<Function>,
 }
 
 #[derive(Clone)]
 pub struct FinalizerAttachments {
-    ud: NeedsFinalizers<UserData>,
-    func: NeedsFinalizers<Function>,
+    ud: FinalizerList<UserData>,
+    func: FinalizerList<Function>,
 }
 
 impl V8IsolateManagerInner {
     // Internal, use proxy_to_v8_safe to ensure finalizers are also set
-    fn proxy_to_v8_impl(&mut self, value: LuaValue) -> Result<v8::Global<v8::Value>, Error> {
+    fn proxy_to_v8_impl(&mut self, lua: &Lua, value: LuaValue) -> Result<v8::Global<v8::Value>, Error> {
         let userdata_template = self.userdata_templates.try_borrow()?.clone();
 
         let finalizers = FinalizerAttachments {
@@ -71,7 +147,7 @@ impl V8IsolateManagerInner {
         let v8_ctx = v8::Global::new(scope, v8_ctx);
         let v8_ctx = v8::Local::new(scope, v8_ctx);
         let scope = &mut v8::ContextScope::new(scope, v8_ctx);
-        let v8_value = Self::proxy_to_v8(scope, &userdata_template, finalizers, value)?;
+        let v8_value = Self::proxy_to_v8(scope, &userdata_template, finalizers, lua, value)?;
         Ok(v8::Global::new(scope, v8_value))
     }
     
@@ -79,6 +155,7 @@ impl V8IsolateManagerInner {
         scope: &mut v8::HandleScope<'s>, 
         userdata_template: &v8::Global<v8::ObjectTemplate>,
         finalizers: FinalizerAttachments,
+        lua: &Lua,
         value: LuaValue
     ) -> Result<v8::Local<'s, v8::Value>, Error> {
         let v8_value: v8::Local<v8::Value> = match value {
@@ -116,7 +193,7 @@ impl V8IsolateManagerInner {
                             for i in 1..=len {
                                 let v = t.raw_get(i)
                                     .map_err(|e| mluau::Error::external(format!("Failed to get array element {}: {}", i, e)))?;
-                                let v = Self::proxy_to_v8(scope, userdata_template, finalizers.clone(), v)?;
+                                let v = Self::proxy_to_v8(scope, userdata_template, finalizers.clone(), &lua, v)?;
                                 arr.set_index(scope, (i - 1) as u32, v);
                             }
                             return Ok(arr.into());
@@ -126,8 +203,8 @@ impl V8IsolateManagerInner {
 
                 let obj = v8::Object::new(scope);
                 t.for_each(|k, v| {
-                    let v8_key = Self::proxy_to_v8(scope, userdata_template, finalizers.clone(), k).map_err(|e| LuaError::external(e.to_string()))?;
-                    let v8_val = Self::proxy_to_v8(scope, userdata_template, finalizers.clone(), v).map_err(|e| LuaError::external(e.to_string()))?;
+                    let v8_key = Self::proxy_to_v8(scope, userdata_template, finalizers.clone(), lua, k).map_err(|e| LuaError::external(e.to_string()))?;
+                    let v8_val = Self::proxy_to_v8(scope, userdata_template, finalizers.clone(), lua, v).map_err(|e| LuaError::external(e.to_string()))?;
                     obj.set(scope, v8_key, v8_val);
                     Ok(())
                 })?;
@@ -143,22 +220,68 @@ impl V8IsolateManagerInner {
                 
                 let local_template = v8::Local::new(scope, obj_template);
                 
-                let ptr = Box::into_raw(Box::new(UserData { ud }));
-                let external = v8::External::new(scope, ptr as *mut std::ffi::c_void);
+                let external = finalizers.ud.add(scope, UserData::new(ud))
+                    .ok_or("Maximum number of userdata references reached")?;
                 let obj = local_template.new_instance(scope).ok_or("Failed to create V8 object")?;
                 obj.set_internal_field(0, external.into());
-                finalizers.ud.borrow_mut().insert(ptr);
                 obj.into()
             },
             mluau::Value::Function(func) => {
-                if finalizers.func.borrow().len() >= MAX_FUNCTION_REFS {
-                    return Err("Maximum number of function references reached".into());
-                }
+                let external = finalizers.func.add(scope, Function { func, weak_lua: lua.weak(), finalizers: finalizers.clone() })
+                    .ok_or("Maximum number of function references reached")?;
 
-                let ptr = Box::into_raw(Box::new(Function { func }));
+                let func= v8::Function::builder(|scope: &mut v8::HandleScope, args: v8::FunctionCallbackArguments, mut rv: v8::ReturnValue| {
+                    let data = args.data();
+                    if !data.is_external() {
+                        let message = v8::String::new(scope, "Internal function data is not valid").unwrap();
+                        let exception = v8::Exception::type_error(scope, message);
+                        scope.throw_exception(exception);
+                        return;
+                    }
+                    let external = match v8::Local::<v8::External>::try_from(data) {
+                        Ok(ext) => ext,
+                        Err(e) => {
+                            let message = v8::String::new(scope, &format!("{e:?}")).unwrap();
+                            let exception = v8::Exception::type_error(scope, message);
+                            scope.throw_exception(exception);
+                            return;
+                        }
+                    };
+                    if external.value().is_null() {
+                        let message = v8::String::new(scope, "Cannot access function data").unwrap();
+                        let exception = v8::Exception::type_error(scope, message);
+                        scope.throw_exception(exception);
+                        return;
+                    }
+                    let ptr = external.value() as *mut Function;
+                    // SAFETY: We already checked that the pointer is not null
+                    let func = unsafe { &*(ptr) };
 
-                finalizers.func.borrow_mut().insert(ptr);                
-                let func = v8::Function::new(scope, move |scope: &mut v8::HandleScope, args: v8::FunctionCallbackArguments, mut rv: v8::ReturnValue| {
+                    let Some(lua) = func.weak_lua.try_upgrade() else {
+                        let message = v8::String::new(scope, "Lua state has been dropped").unwrap();
+                        let exception = v8::Exception::type_error(scope, message);
+                        scope.throw_exception(exception);
+                        return;
+                    };
+                    
+                    let promise_resolver = match v8::PromiseResolver::new(scope) {
+                        Some(pr) => pr,
+                        None => {
+                            let message = v8::String::new(scope, "Failed to create PromiseResolver").unwrap();
+                            let exception = v8::Exception::type_error(scope, message);
+                            scope.throw_exception(exception);
+                            return;
+                        }
+                    };
+                    let promise = promise_resolver.get_promise(scope);
+                    rv.set(promise.into());
+                })
+                .constructor_behavior(v8::ConstructorBehavior::Throw)
+                .data(external.into())
+                .build(scope)
+                .ok_or("Failed to create V8 function")?;
+
+                /*let func = v8::Function::new(scope, move |scope: &mut v8::HandleScope, args: v8::FunctionCallbackArguments, mut rv: v8::ReturnValue| {
                     let func = unsafe { &*(ptr) };
                     println!("V8 function called with {:?} args", func.func);
                     let Some(promise_resolver) = v8::PromiseResolver::new(scope) else {
@@ -174,7 +297,7 @@ impl V8IsolateManagerInner {
                     tokio::task::spawn_local(async move {
                         //let th = func.weak_lua();
                     });
-                }).ok_or("Failed to create V8 function")?;
+                }).ok_or("Failed to create V8 function")?;*/
                 
                 func.into()
             },
@@ -243,7 +366,7 @@ impl V8IsolateManagerInner {
                     if let Ok(external) = v8::Local::<v8::External>::try_from(internal) {
                         
                         // Case 1: UserData proxy
-                        if finalizers.ud.try_borrow()?.contains(&(external.value() as *mut UserData)) {
+                        if finalizers.ud.contains(external.value() as *mut UserData) {
                             let ptr = external.value() as *mut UserData;
                             if !ptr.is_null() {
                                 let ud = unsafe { &*ptr };
@@ -324,8 +447,8 @@ impl V8IsolateManager {
                 deno,
                 cancellation_token: heap_exhausted_token,
                 userdata_templates: RefCell::new(userdata_template),
-                uds: Rc::default(),
-                funcs: Rc::default(),
+                uds: FinalizerList::default(),
+                funcs: FinalizerList::default(),
             }))
         }
     }
@@ -344,10 +467,10 @@ impl V8IsolateManager {
         template
     }
 
-    fn proxy_to_v8(&self, value: LuaValue) -> Result<v8::Global<v8::Value>, Error> {
+    fn proxy_to_v8(&self, lua: &Lua, value: LuaValue) -> Result<v8::Global<v8::Value>, Error> {
         let value = {
             let mut inner = self.inner.try_borrow_mut()?;
-            inner.proxy_to_v8_impl(value)?
+            inner.proxy_to_v8_impl(lua, value)?
         };
         
         Ok(value)
@@ -371,11 +494,83 @@ impl WeakV8IsolateManager {
     }
 }
 
-pub struct Function {
-    func: mluau::Function
+struct Function {
+    func: mluau::Function,
+    weak_lua: WeakLua,
+    finalizers: FinalizerAttachments,
 }
 
-pub struct UserData {
+/*
+impl Function {
+    async fn create() {
+        let args_count = args.length();
+        let mut lua_args = LuaMultiValue::with_capacity(args_count as usize);
+        for i in 0..args_count {
+            let arg = args.get(i);
+            match Self::proxy_from_v8(scope, &lua, arg, finalizers.clone()) {
+                Ok(v) => lua_args.push_back(v),
+                Err(e) => {
+                    let _ = promise_resolver.reject(scope, v8::String::new(scope, &format!("Failed to convert argument {}: {}", i, e)).unwrap().into());
+                    return;
+                }
+            }
+        }
+
+        let th = match lua.create_thread(func.func.clone()) {
+            Ok(th) => th,
+            Err(e) => {
+                let _ = promise_resolver.reject(scope, v8::String::new(scope, &format!("Failed to create Lua thread: {}", e)).unwrap().into());
+                return;
+            }
+        };
+
+        let scheduler = taskmgr::get(&lua);
+        let result = match scheduler.spawn_thread_and_wait(th, lua_args).await {
+            Ok(ret) => {
+                match ret {
+                    Some(v) => v,
+                    None => {
+                        let _ = promise_resolver.reject(scope, v8::String::new(scope, "Lua thread returned no values").unwrap().into());
+                        return;
+                    }
+                }
+            },
+            Err(e) => {
+                let _ = promise_resolver.reject(scope, v8::String::new(scope, &format!("Lua thread error: {}", e)).unwrap().into());
+                return;
+            }
+        };
+        
+
+
+        match result {
+            Ok(ret) => {
+                let results = vec![];
+                for ret in ret {
+                    match Self::proxy_to_v8(scope, userdata_template, finalizers.clone(), &lua, ret) {
+                        Ok(v8_ret) => results.push(v8_ret),
+                        Err(e) => {
+                            let _ = promise_resolver.reject(scope, v8::String::new(scope, &format!("Failed to convert return value: {}", e)).unwrap().into());
+                            return;
+                        }
+                    }
+                }
+
+                let arr = v8::Array::new(scope, results.len() as i32);
+                for (i, v) in results.into_iter().enumerate() {
+                    arr.set_index(scope, i as u32, v);
+                }
+
+                let _ = promise_resolver.resolve(scope, arr.into());
+            },
+            Err(e) => {
+                let _ = promise_resolver.reject(scope, v8::String::new(scope, &format!("Lua function error: {}", e)).unwrap().into());
+            }
+        }
+    }
+}*/
+
+struct UserData {
     pub ud: mluau::AnyUserData,
 }
 
@@ -479,7 +674,7 @@ mod tests {
         let lua_value = mluau::Value::UserData(ud);
 
         // Create a ProxyData
-        let v8_value = manager.proxy_to_v8(lua_value).unwrap();
+        let v8_value = manager.proxy_to_v8(&lua, lua_value).unwrap();
         let mut inner = manager.inner.borrow_mut();
         let context = inner.deno.main_context();
 
