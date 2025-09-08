@@ -138,3 +138,4 @@ pub(crate) fn all_extensions(is_snapshot: bool) -> Vec<Extension> {
     exts.extend(structuredclone_extensions(is_snapshot));
     exts
 }
+

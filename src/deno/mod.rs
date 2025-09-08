@@ -2,21 +2,27 @@ pub(crate) mod extension;
 pub(crate) mod base64_ops;
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use mlua_scheduler::LuaSchedulerAsyncUserData;
 
 //use deno_core::error::{CoreError, CoreErrorKind};
 use deno_core::v8::CreateParams;
-use deno_core::v8;
+use deno_core::{op2, v8, Extension, OpState};
+use futures_util::stream::FuturesUnordered;
+use futures_util::StreamExt;
 use mluau::prelude::*;
 //use deno_core::{op2, OpState};
 //use deno_error::JsErrorBox;
 //use mluau::serde::de;
 use tokio_util::sync::CancellationToken;
 
+use crate::deno::extension::ExtensionTrait;
+
 pub type Error = Box<dyn std::error::Error>;
 
 const MAX_REFS: usize = 500;
+const MIN_HEAP_LIMIT: usize = 10 * 1024 * 1024; // 10MB
 
 /// Stores a pointer to a Rust struct and a V8 weak reference (with finalizer) to ensure the Rust struct is dropped when V8 garbage collects the associated object.
 struct Finalizer<T> {
@@ -33,6 +39,7 @@ impl<T: 'static> Finalizer<T> {
     fn new<'s>(
         scope: &mut v8::HandleScope<'s, ()>,
         rust_obj: T,
+        ext_cb: Option<Box<dyn FnOnce()>>,
     ) -> (*mut T, v8::Local<'s, v8::External>, Self) {
         let ptr = Box::into_raw(Box::new(rust_obj));
         let external = v8::External::new(scope, ptr as *mut std::ffi::c_void);
@@ -45,8 +52,13 @@ impl<T: 'static> Finalizer<T> {
             // Finalizer callback when V8 garbage collects the object
             if !*finalized_ref.borrow() {
                 *finalized_ref.borrow_mut() = true; // Mark as finalized before droping to avoid double free in Drop
+                println!("Finalized V8 external and dropped Rust object at {:p}", ptr);
                 unsafe {
                     drop(Box::from_raw(ptr));
+                }
+
+                if let Some(cb) = ext_cb {
+                    cb();
                 }
             }
         }));
@@ -96,8 +108,8 @@ impl<T: 'static> Clone for FinalizerList<T> {
 }
 
 impl<T: 'static> FinalizerList<T> {
-    pub fn add<'s>(&self, scope: &mut v8::HandleScope<'s, ()>, rust_obj: T) -> Option<v8::Local<'s, v8::External>> {
-        let (ptr, external, finalizer) = Finalizer::new(scope, rust_obj);
+    pub fn add<'s>(&self, scope: &mut v8::HandleScope<'s, ()>, rust_obj: T, ext_cb: Option<Box<dyn FnOnce()>>) -> Option<v8::Local<'s, v8::External>> {
+        let (ptr, external, finalizer) = Finalizer::new(scope, rust_obj, ext_cb);
         let mut list = self.list.borrow_mut();
         if list.len() >= MAX_REFS {
             return None;
@@ -116,13 +128,41 @@ impl<T: 'static> FinalizerList<T> {
     }
 }
 
+/// Stores a lua function state
+pub struct FunctionState {
+    func: Function,
+    runs: Rc<RefCell<HashMap<i32, FunctionRunState>>>,
+}
+
+pub enum FunctionRunState {
+    Bound {
+        lua_args: LuaMultiValue,
+    },
+    Executed {
+        lua_resp: LuaMultiValue,
+    }
+}
+
+#[derive(Clone)]
+pub struct CommonState {
+    list: Rc<RefCell<HashMap<i32, FunctionState>>>,
+    weak_lua: WeakLua,
+    userdata_template: Rc<v8::Global<v8::ObjectTemplate>>, 
+    func_template: Rc<v8::Global<v8::ObjectTemplate>>,
+    finalizer_attachments: FinalizerAttachments,
+}
+
+/// Internal manager for a single V8 isolate with a minimal Deno runtime.
+/// 
+/// This should not be used directly, use V8IsolateManager instead
+/// which uses a tokio task w/ channel to communicate with the isolate manager.
+/// 
+/// Alternatively, use a (WIP) IsolatePool to manage multiple isolates with drops
+/// in LIFO order (needed for v8)
 pub struct V8IsolateManagerInner {
     deno: deno_core::JsRuntime,
     cancellation_token: CancellationToken,
-    userdata_templates: RefCell<v8::Global<v8::ObjectTemplate>>,
-
-    uds: FinalizerList<UserData>,
-    funcs: FinalizerList<Function>,
+    common_state: CommonState
 }
 
 #[derive(Clone)]
@@ -133,29 +173,20 @@ pub struct FinalizerAttachments {
 
 impl V8IsolateManagerInner {
     // Internal, use proxy_to_v8_safe to ensure finalizers are also set
-    fn proxy_to_v8_impl(&mut self, lua: &Lua, value: LuaValue) -> Result<v8::Global<v8::Value>, Error> {
-        let userdata_template = self.userdata_templates.try_borrow()?.clone();
-
-        let finalizers = FinalizerAttachments {
-            ud: self.uds.clone(),
-            func: self.funcs.clone(),
-        };
-
+    fn proxy_to_v8_impl(&mut self, value: LuaValue) -> Result<v8::Global<v8::Value>, Error> {
         let v8_ctx = self.deno.main_context();
         let isolate = self.deno.v8_isolate();
         let scope = &mut v8::HandleScope::new(isolate);
         let v8_ctx = v8::Global::new(scope, v8_ctx);
         let v8_ctx = v8::Local::new(scope, v8_ctx);
         let scope = &mut v8::ContextScope::new(scope, v8_ctx);
-        let v8_value = Self::proxy_to_v8(scope, &userdata_template, finalizers, lua, value)?;
+        let v8_value = Self::proxy_to_v8(scope, &self.common_state, value)?;
         Ok(v8::Global::new(scope, v8_value))
     }
     
     fn proxy_to_v8<'s>(
         scope: &mut v8::HandleScope<'s>, 
-        userdata_template: &v8::Global<v8::ObjectTemplate>,
-        finalizers: FinalizerAttachments,
-        lua: &Lua,
+        common_state: &CommonState,
         value: LuaValue
     ) -> Result<v8::Local<'s, v8::Value>, Error> {
         let v8_value: v8::Local<v8::Value> = match value {
@@ -193,7 +224,7 @@ impl V8IsolateManagerInner {
                             for i in 1..=len {
                                 let v = t.raw_get(i)
                                     .map_err(|e| mluau::Error::external(format!("Failed to get array element {}: {}", i, e)))?;
-                                let v = Self::proxy_to_v8(scope, userdata_template, finalizers.clone(), &lua, v)?;
+                                let v = Self::proxy_to_v8(scope, common_state, v)?;
                                 arr.set_index(scope, (i - 1) as u32, v);
                             }
                             return Ok(arr.into());
@@ -203,8 +234,8 @@ impl V8IsolateManagerInner {
 
                 let obj = v8::Object::new(scope);
                 t.for_each(|k, v| {
-                    let v8_key = Self::proxy_to_v8(scope, userdata_template, finalizers.clone(), lua, k).map_err(|e| LuaError::external(e.to_string()))?;
-                    let v8_val = Self::proxy_to_v8(scope, userdata_template, finalizers.clone(), lua, v).map_err(|e| LuaError::external(e.to_string()))?;
+                    let v8_key = Self::proxy_to_v8(scope, common_state, k).map_err(|e| LuaError::external(e.to_string()))?;
+                    let v8_val = Self::proxy_to_v8(scope, common_state, v).map_err(|e| LuaError::external(e.to_string()))?;
                     obj.set(scope, v8_key, v8_val);
                     Ok(())
                 })?;
@@ -216,90 +247,113 @@ impl V8IsolateManagerInner {
                 v8::BigInt::new_from_u64(scope, num).into()
             },
             mluau::Value::UserData(ud) => {
-                let obj_template = userdata_template.clone();
+                let obj_template = common_state.userdata_template.clone();
                 
-                let local_template = v8::Local::new(scope, obj_template);
+                let local_template = v8::Local::new(scope, (*obj_template).clone());
                 
-                let external = finalizers.ud.add(scope, UserData::new(ud))
+                let external = common_state.finalizer_attachments.ud.add(scope, UserData::new(ud, common_state.clone()), None)
                     .ok_or("Maximum number of userdata references reached")?;
                 let obj = local_template.new_instance(scope).ok_or("Failed to create V8 object")?;
                 obj.set_internal_field(0, external.into());
                 obj.into()
             },
             mluau::Value::Function(func) => {
-                let external = finalizers.func.add(scope, Function { func, weak_lua: lua.weak(), finalizers: finalizers.clone() })
-                    .ok_or("Maximum number of function references reached")?;
+                // We can emulate functions using both a function object (so it can be proxied back to Lua)
+                // and a function which uses a function ID to perform the call. The function object is also used
+                // for finalizers
+                // 
+                // TODO: Generate function proxy using Deno ops
 
-                let func= v8::Function::builder(|scope: &mut v8::HandleScope, args: v8::FunctionCallbackArguments, mut rv: v8::ReturnValue| {
-                    let data = args.data();
-                    if !data.is_external() {
-                        let message = v8::String::new(scope, "Internal function data is not valid").unwrap();
-                        let exception = v8::Exception::type_error(scope, message);
-                        scope.throw_exception(exception);
-                        return;
+                let func_id = loop {
+                    let id = rand::random::<i32>();
+                    let list = common_state.list.borrow();
+
+                    if list.len() >= MAX_REFS {
+                        return Err("Maximum number of running functions reached".into());
                     }
-                    let external = match v8::Local::<v8::External>::try_from(data) {
-                        Ok(ext) => ext,
-                        Err(e) => {
-                            let message = v8::String::new(scope, &format!("{e:?}")).unwrap();
-                            let exception = v8::Exception::type_error(scope, message);
-                            scope.throw_exception(exception);
-                            return;
-                        }
-                    };
-                    if external.value().is_null() {
-                        let message = v8::String::new(scope, "Cannot access function data").unwrap();
-                        let exception = v8::Exception::type_error(scope, message);
-                        scope.throw_exception(exception);
-                        return;
+
+                    if !list.contains_key(&id) {
+                        break id;
                     }
-                    let ptr = external.value() as *mut Function;
-                    // SAFETY: We already checked that the pointer is not null
-                    let func = unsafe { &*(ptr) };
+                };
 
-                    let Some(lua) = func.weak_lua.try_upgrade() else {
-                        let message = v8::String::new(scope, "Lua state has been dropped").unwrap();
-                        let exception = v8::Exception::type_error(scope, message);
-                        scope.throw_exception(exception);
-                        return;
-                    };
-                    
-                    let promise_resolver = match v8::PromiseResolver::new(scope) {
-                        Some(pr) => pr,
-                        None => {
-                            let message = v8::String::new(scope, "Failed to create PromiseResolver").unwrap();
-                            let exception = v8::Exception::type_error(scope, message);
-                            scope.throw_exception(exception);
-                            return;
-                        }
-                    };
-                    let promise = promise_resolver.get_promise(scope);
-                    rv.set(promise.into());
-                })
-                .constructor_behavior(v8::ConstructorBehavior::Throw)
-                .data(external.into())
-                .build(scope)
-                .ok_or("Failed to create V8 function")?;
-
-                /*let func = v8::Function::new(scope, move |scope: &mut v8::HandleScope, args: v8::FunctionCallbackArguments, mut rv: v8::ReturnValue| {
-                    let func = unsafe { &*(ptr) };
-                    println!("V8 function called with {:?} args", func.func);
-                    let Some(promise_resolver) = v8::PromiseResolver::new(scope) else {
-                        let message = v8::String::new(scope, "Failed to create PromiseResolver").unwrap();
-                        let exception = v8::Exception::type_error(scope, message);
-                        scope.throw_exception(exception);
-                        return;
-                    };
-                    let promise = promise_resolver.get_promise(scope);
-                    rv.set(promise.into());
-
-                    let global_p = v8::Global::new(scope, promise_resolver);
-                    tokio::task::spawn_local(async move {
-                        //let th = func.weak_lua();
-                    });
-                }).ok_or("Failed to create V8 function")?;*/
+                let func = Function { func };
+                let obj_template = common_state.func_template.clone();
                 
-                func.into()
+                let local_template = v8::Local::new(scope, (*obj_template).clone());
+                
+                let func_state_ref = common_state.list.clone();
+                let external = common_state.finalizer_attachments.func.add(scope, func.clone(), Some(Box::new(move || {
+                    // Remove from running functions list
+                    let mut list = func_state_ref.borrow_mut();
+                    list.remove(&func_id);
+                })))
+                    .ok_or("Maximum number of function references reached")?;
+                let obj = local_template.new_instance(scope).ok_or("Failed to create V8 object")?;
+                obj.set_internal_field(0, external.into());
+
+                // NOTE: We've already gotten a free function id
+                {
+                    let mut list = common_state.list.borrow_mut();
+                    list.insert(func_id, FunctionState {
+                        func,
+                        runs: Rc::new(RefCell::new(HashMap::new())),
+                    });
+                }
+
+                let func_id_val = v8::Integer::new(scope, func_id);
+                let func_id_key = v8::String::new(scope, "__funcId").ok_or("Failed to create function ID string")?;
+                obj.set(scope, func_id_key.into(), func_id_val.into());
+                                
+                let code = r#"
+                    (function(dataToCapture) {
+                        let func = async function(...args) {
+                            let funcId = dataToCapture.__funcId;
+                            console.log("Calling Lua function with ID", funcId);
+                            let runId = Deno.core.ops.__luabind(funcId, args);
+                            await Deno.core.ops.__luaexecute(funcId, runId);
+                            let ret = Deno.core.ops.__luaresult(funcId, runId);
+                            if (Array.isArray(ret) && ret.length <= 1) {
+                                return ret[0]; // Cast to single value due to lua multivalue things
+                            }
+                            return ret;
+                        };
+                        func.__funcObj = dataToCapture;
+                        return func;   
+                    })
+                "#;
+
+                let try_catch = &mut v8::TryCatch::new(scope);
+
+                let source = v8::String::new(try_catch, code).unwrap();
+                let script = match v8::Script::compile(try_catch, source, None) {
+                    Some(s) => s,
+                    None => {
+                        if try_catch.has_caught() {
+                            let exception = try_catch.exception().unwrap();
+                            let exception_string = exception.to_rust_string_lossy(try_catch);
+                            return Err(format!("Failed to compile function proxy script: {}", exception_string).into());
+                        }
+                        return Err("Failed to compile function proxy script".into())
+                    },
+                };
+                let result = script.run(try_catch).unwrap();
+                let creator_fn: v8::Local<v8::Function> = result.try_into().unwrap();
+                let global = try_catch.get_current_context().global(try_catch);
+                let result = match creator_fn.call(try_catch, global.into(), &[obj.into()]) {
+                    Some(r) => r,
+                    None => {
+                        if try_catch.has_caught() {
+                            let exception = try_catch.exception().unwrap();
+                            let exception_string = exception.to_rust_string_lossy(try_catch);
+                            return Err(format!("Failed to run function proxy script: {}", exception_string).into());
+                        }
+                        return Err("Failed to run function proxy script".into())
+                    },
+                };
+                let final_closure: v8::Local<v8::Function> = result.try_into().unwrap();
+
+                final_closure.into()
             },
             mluau::Value::Buffer(buf) => {
                 let bytes = buf.to_vec();
@@ -393,22 +447,25 @@ impl V8IsolateManagerInner {
 
         Ok(LuaValue::Nil) // TODO: Implement
     }
-}
 
-/// Internal manager for a single V8 isolate with a minimal Deno runtime.
-#[derive(Clone)]
-pub struct V8IsolateManager {
-    inner: Rc<RefCell<V8IsolateManagerInner>>,
-}
-
-const MIN_HEAP_LIMIT: usize = 10 * 1024 * 1024; // 10MB
-
-impl V8IsolateManager {
-    pub fn new(heap_limit: usize) -> Self {
+    pub fn new(lua: &Lua, heap_limit: usize) -> Self {
         let heap_limit = heap_limit.max(MIN_HEAP_LIMIT);
 
         // TODO: Support snapshots maybe
-        let extensions = extension::all_extensions(false);
+        let mut extensions = extension::all_extensions(false);
+
+        // Add the __luabind, __luaexecute and __luaresult ops
+        deno_core::extension!(
+            init_lua_op,
+            ops = [__luabind, __luaexecute, __luaresult],
+        );
+        impl ExtensionTrait<()> for init_lua_op {
+            fn init((): ()) -> Extension {
+                init_lua_op::init()
+            }
+        }
+
+        extensions.push(init_lua_op::build((), false));
 
         let mut deno = deno_core::JsRuntime::new(deno_core::RuntimeOptions {
             create_params: Some(
@@ -435,21 +492,40 @@ impl V8IsolateManager {
             5 * current_value
         });
 
-        let userdata_template = {
+        let userdata_template = Rc::new({
             let isolate = deno.v8_isolate();
             let scope = &mut v8::HandleScope::new(isolate);
             let template = Self::create_ud_proxy_template(scope);
             v8::Global::new(scope, template)
+        });
+
+        let function_template = Rc::new({
+            let isolate = deno.v8_isolate();
+            let scope = &mut v8::HandleScope::new(isolate);
+            let template = Self::create_func_proxy_template(scope);
+            v8::Global::new(scope, template)
+        });
+
+        let uds = FinalizerList::default();
+        let funcs = FinalizerList::default();
+
+        let common_state = CommonState {
+            list: Rc::new(RefCell::new(HashMap::new())),
+            weak_lua: lua.weak(),
+            userdata_template,
+            func_template: function_template,
+            finalizer_attachments: FinalizerAttachments {
+                ud: uds.clone(),
+                func: funcs.clone(),
+            },
         };
 
+        deno.op_state().borrow_mut().put(common_state.clone());
+
         Self {
-            inner: Rc::new(RefCell::new(V8IsolateManagerInner {
-                deno,
-                cancellation_token: heap_exhausted_token,
-                userdata_templates: RefCell::new(userdata_template),
-                uds: FinalizerList::default(),
-                funcs: FinalizerList::default(),
-            }))
+            deno,
+            cancellation_token: heap_exhausted_token,
+            common_state
         }
     }
 
@@ -467,121 +543,468 @@ impl V8IsolateManager {
         template
     }
 
-    fn proxy_to_v8(&self, lua: &Lua, value: LuaValue) -> Result<v8::Global<v8::Value>, Error> {
-        let value = {
-            let mut inner = self.inner.try_borrow_mut()?;
-            inner.proxy_to_v8_impl(lua, value)?
-        };
+    fn create_func_proxy_template<'s>(scope: &mut v8::HandleScope<'s, ()>) -> v8::Local<'s, v8::ObjectTemplate> {
+        let template = v8::ObjectTemplate::new(scope);
+        // Reserve space for the pointer to the Rust struct.
+        template.set_internal_field_count(1);
         
+        template
+    }
+}
+
+pub enum V8IsolateManagerMessage {
+    Shutdown,
+    ProxyToV8 {
+        value: LuaValue,
+        resp: tokio::sync::oneshot::Sender<Result<v8::Global<v8::Value>, Error>>,
+    },
+    ProxyMultipleToV8 {
+        values: LuaMultiValue,
+        resp: tokio::sync::oneshot::Sender<Result<Vec<v8::Global<v8::Value>>, Error>>,
+    },
+    ProxyFromV8 {
+        value: v8::Global<v8::Value>,
+        resp: tokio::sync::oneshot::Sender<Result<LuaValue, Error>>,
+    },
+    ErrSubscribe {
+        resp: tokio::sync::oneshot::Sender<tokio::sync::watch::Receiver<Option<deno_core::error::CoreError>>>,
+    },
+    CodeExec {
+        code: String,
+        args: Vec<v8::Global<v8::Value>>,
+        resp: tokio::sync::oneshot::Sender<Result<v8::Global<v8::Value>, Error>>,
+    }
+}
+
+/// Internal manager for a single V8 isolate with a minimal Deno runtime.
+#[derive(Clone)]
+pub struct V8IsolateManager {
+    tx: tokio::sync::mpsc::UnboundedSender<V8IsolateManagerMessage>,
+}
+
+impl Drop for V8IsolateManager {
+    fn drop(&mut self) {
+        let _ = self.tx.send(V8IsolateManagerMessage::Shutdown);
+    }
+}
+
+impl V8IsolateManager {
+    // Create a new isolate manager and spawn its task
+    pub fn new() -> (Self, tokio::sync::mpsc::UnboundedReceiver<V8IsolateManagerMessage>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+
+        (Self {
+            tx
+        }, rx)
+    }
+
+    /// Run the isolate manager task
+    /// 
+    /// This must be called for anything to work
+    /// 
+    /// Returns the inner isolate manager for any pool cleanup etc. after shutdown
+    pub async fn run(mut inner: V8IsolateManagerInner, mut rx: tokio::sync::mpsc::UnboundedReceiver<V8IsolateManagerMessage>, start_tx: tokio::sync::oneshot::Sender<()>) -> V8IsolateManagerInner {
+        let (err_tx, err_rx) = tokio::sync::watch::channel(None);
+
+        // Async futures unordered queue for code execution
+        let mut code_exec_queue = FuturesUnordered::new();
+
+        let _ = start_tx.send(());
+
+        loop {
+            tokio::select! {
+                Some(msg) = rx.recv() => {
+                    // Handle message
+                    match msg {
+                        V8IsolateManagerMessage::Shutdown => {
+                            // Terminate isolate
+                            break;
+                        }
+                        V8IsolateManagerMessage::ProxyToV8 { value, resp } => {
+                            let result = inner.proxy_to_v8_impl(value);
+                            let _ = resp.send(result);
+                        }
+                        V8IsolateManagerMessage::ProxyMultipleToV8 { values, resp } => {
+                            let mut results = Vec::with_capacity(values.len());
+                            let mut error = None;
+                            for v in values {
+                                match inner.proxy_to_v8_impl(v) {
+                                    Ok(v8_val) => results.push(v8_val),
+                                    Err(e) => {
+                                        error = Some(e);
+                                        break;
+                                    }
+                                }
+                            }
+                            match error {
+                                Some(e) => {
+                                    let _ = resp.send(Err(e));
+                                }
+                                None => {
+                                    let _ = resp.send(Ok(results));
+                                }
+                            }
+                        }
+                        V8IsolateManagerMessage::ProxyFromV8 { value, resp } => {
+                            let result = {
+                                let v8_ctx = inner.deno.main_context();
+                                let isolate = inner.deno.v8_isolate();
+                                let scope = &mut v8::HandleScope::new(isolate);
+                                let v8_ctx = v8::Local::new(scope, v8_ctx);
+                                let scope = &mut v8::ContextScope::new(scope, v8_ctx);
+                                let local_value = v8::Local::new(scope, value);
+                                let lua = inner.common_state.weak_lua.try_upgrade().ok_or("Lua state has been dropped".to_string());
+                                match lua {
+                                    Ok(lua) => {
+                                        V8IsolateManagerInner::proxy_from_v8(scope, &lua, local_value, inner.common_state.finalizer_attachments.clone())
+                                    }
+                                    Err(e) => {
+                                        let _ = resp.send(Err(e.into()));
+                                        continue;
+                                    },
+                                }
+                            };
+                            let _ = resp.send(result);
+                        }
+                        V8IsolateManagerMessage::ErrSubscribe { resp } => {
+                            let _ = resp.send(err_rx.clone());
+                        }
+                        V8IsolateManagerMessage::CodeExec { code, args, resp } => {
+                            let func = {
+                                let main_ctx = inner.deno.main_context();
+                                let isolate = inner.deno.v8_isolate();
+                                let scope = &mut v8::HandleScope::new(isolate);
+                                let main_ctx = v8::Local::new(scope, main_ctx);
+                                let context_scope = &mut v8::ContextScope::new(scope, main_ctx);
+                                let try_catch = &mut v8::TryCatch::new(context_scope);
+                                let script = v8::String::new(try_catch, &code)
+                                    .and_then(|s| v8::Script::compile(try_catch, s, None))
+                                    .ok_or_else(|| {
+                                        if try_catch.has_caught() {
+                                            let exception = try_catch.exception().unwrap();
+                                            let exception_string = exception.to_rust_string_lossy(try_catch);
+                                            format!("Failed to compile script: {}", exception_string)
+                                        } else {
+                                            "Failed to compile script".to_string()
+                                        }
+                                    });
+
+                                let script = match script {
+                                    Ok(s) => s,
+                                    Err(e) => {
+                                        let _ = resp.send(Err(e.into()));
+                                        continue;
+                                    }
+                                };
+
+                                // Convert and proxy
+                                let local_func = match script.run(try_catch) {
+                                    Some(result) => {
+                                        if result.is_function() {
+                                            let v = v8::Local::<v8::Function>::try_from(result);
+                                            match v {
+                                                Ok(f) => f,
+                                                Err(_) => {
+                                                    let _ = resp.send(Err("Script did not return a function".to_string().into()));
+                                                    continue;
+                                                },
+                                            }
+                                        } else {
+                                            let _ = resp.send(Err("Script did not return a function".to_string().into()));
+                                            continue;
+                                        }
+                                    },
+                                    None => {
+                                        if try_catch.has_caught() {
+                                            let exception = try_catch.exception().unwrap();
+                                            let exception_string = exception.to_rust_string_lossy(try_catch);
+                                            let _ = resp.send(Err(format!("Failed to run script: {}", exception_string).into()));
+                                            continue;
+                                        } else {
+                                            let _ = resp.send(Err("Failed to run script".to_string().into()));
+                                            continue;
+                                        }
+                                    }
+                                };
+
+                                v8::Global::new(try_catch, local_func)
+                            };
+
+                            // Call the function with args
+                            // using denos' call_with_args
+                            let fut = inner.deno.call_with_args(&func, &args);
+                            code_exec_queue.push(async {
+                                let result = fut.await;
+                                let _ = resp.send(result.map_err(|e| e.into()));
+                            });
+                        }
+                    }
+                },
+                _ = inner.cancellation_token.cancelled() => {
+                    // Terminate isolate
+                    break;
+                }
+                Some(_) = code_exec_queue.next() => {
+                    // A code execution future has completed
+                    // We don't need to do anything here as the future already sent the response
+                }
+                res = inner.deno.run_event_loop(deno_core::PollEventLoopOptions::default()), if !code_exec_queue.is_empty() => {
+                    // Continue running
+                    match res {
+                        Ok(_) => {},
+                        Err(e) => {
+                            err_tx.send_replace(Some(e));
+                        }
+                    };
+
+                    tokio::task::yield_now().await; // Yield to allow other tasks to run
+                }
+            }
+        }
+
+        inner // Return the inner isolate manager for any pool cleanup etc.
+    }
+
+    /// Proxies a Lua value to V8
+    pub async fn proxy_to_v8(&self, value: LuaValue) -> Result<v8::Global<v8::Value>, Error> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let msg = V8IsolateManagerMessage::ProxyToV8 { value, resp: tx };
+        self.tx.send(msg).map_err(|_| "Failed to send ProxyToV8 message".to_string())?;
+        let value = rx.await.map_err(|_| "Failed to receive ProxyToV8 response".to_string())??;
         Ok(value)
     }
 
-    pub fn weak(&self) -> WeakV8IsolateManager {
-        WeakV8IsolateManager {
-            inner: Rc::downgrade(&self.inner)
-        }
+    /// Returns a watch receiver for errors from the isolates event loop
+    pub async fn err_subscribe(&self) -> Result<tokio::sync::watch::Receiver<Option<deno_core::error::CoreError>>, Error> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let msg = V8IsolateManagerMessage::ErrSubscribe { resp: tx };
+        self.tx.send(msg).map_err(|_| "Failed to send ErrSubscribe message".to_string())?;
+        let rx = rx.await.map_err(|_| "Failed to receive ErrSubscribe response".to_string())?;
+        Ok(rx)
+    }
+
+    pub async fn eval(&self, code: &str, args: Vec<v8::Global<v8::Value>>) -> Result<v8::Global<v8::Value>, Error> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let msg = V8IsolateManagerMessage::CodeExec { code: code.to_string(), args, resp: tx };
+        self.tx.send(msg).map_err(|_| "Failed to send CodeExec message".to_string())?;
+        let value = rx.await.map_err(|_| "Failed to receive CodeExec response".to_string())??;
+        Ok(value)   
+    }
+}
+
+impl LuaUserData for V8IsolateManager {
+    fn add_methods<M: LuaUserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("isrunning", |_, this, _: ()| {
+            Ok(!this.tx.is_closed())
+        });
+
+        // TODO: load function for ES modules
+        methods.add_scheduler_async_method("eval", async move |_, this, (code, args): (String, LuaMultiValue)| {
+            // First proxy args to V8
+            let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+            this.tx.send(V8IsolateManagerMessage::ProxyMultipleToV8 {
+                values: args,
+                resp: res_tx,
+            }).map_err(|e| mluau::Error::external(format!("Failed to send event to runtime: {}", e)))?;
+            let args = res_rx.await
+                .map_err(|e| mluau::Error::external(e.to_string()))?
+                .map_err(|e| mluau::Error::external(e.to_string()))?;
+            
+            // Push to the runtime event queue
+            let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+            this.tx.send(V8IsolateManagerMessage::CodeExec {
+                args,
+                code,
+                resp: res_tx,
+            }).map_err(|e| mluau::Error::external(format!("Failed to send event to runtime: {}", e)))?;
+
+            let res = res_rx.await
+                .map_err(|e| mluau::Error::external(e.to_string()))?
+                .map_err(|e| mluau::Error::external(e.to_string()))?;
+
+            let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+            this.tx.send(V8IsolateManagerMessage::ProxyFromV8 {
+                value: res,
+                resp: res_tx,
+            }).map_err(|e| mluau::Error::external(format!("Failed to send event to runtime: {}", e)))?;
+            let res = res_rx.await
+                .map_err(|e| mluau::Error::external(e.to_string()))?
+                .map_err(|e| mluau::Error::external(e.to_string()))?;
+
+            Ok(res)
+        });
     }
 }
 
 #[derive(Clone)]
-pub struct WeakV8IsolateManager {
-    inner: std::rc::Weak<RefCell<V8IsolateManagerInner>>,
-}
-
-impl WeakV8IsolateManager {
-    pub fn upgrade(&self) -> Option<V8IsolateManager> {
-        self.inner.upgrade().map(|inner| V8IsolateManager { inner })
-    }
-}
-
 struct Function {
     func: mluau::Function,
-    weak_lua: WeakLua,
-    finalizers: FinalizerAttachments,
 }
 
-/*
-impl Function {
-    async fn create() {
-        let args_count = args.length();
-        let mut lua_args = LuaMultiValue::with_capacity(args_count as usize);
-        for i in 0..args_count {
-            let arg = args.get(i);
-            match Self::proxy_from_v8(scope, &lua, arg, finalizers.clone()) {
-                Ok(v) => lua_args.push_back(v),
-                Err(e) => {
-                    let _ = promise_resolver.reject(scope, v8::String::new(scope, &format!("Failed to convert argument {}: {}", i, e)).unwrap().into());
-                    return;
-                }
-            }
-        }
-
-        let th = match lua.create_thread(func.func.clone()) {
-            Ok(th) => th,
+// OP to bind arguments to a function by ID, returning a run ID
+#[op2(fast)]
+fn __luabind(
+    #[state] state: &CommonState,
+    scope: &mut v8::HandleScope,
+    func_id: i32,
+    args: v8::Local<v8::Array>,
+) -> Result<i32, deno_error::JsErrorBox> {
+    println!("__luabind called with func_id: {}, args len: {}", func_id, args.length());
+    let Some(lua) = state.weak_lua.try_upgrade() else {
+        return Err(deno_error::JsErrorBox::generic("Lua state has been dropped".to_string()));
+    };
+    // Proxy every argument to Lua
+    let args_count = args.length();
+    let mut lua_args = LuaMultiValue::with_capacity(args_count as usize);
+    for i in 0..args_count {
+        let arg = args.get_index(scope, i).ok_or_else(|| deno_error::JsErrorBox::generic(format!("Failed to get argument {}", i)))?;
+        match V8IsolateManagerInner::proxy_from_v8(scope, &lua, arg, state.finalizer_attachments.clone()) {
+            Ok(v) => lua_args.push_back(v),
             Err(e) => {
-                let _ = promise_resolver.reject(scope, v8::String::new(scope, &format!("Failed to create Lua thread: {}", e)).unwrap().into());
-                return;
-            }
-        };
-
-        let scheduler = taskmgr::get(&lua);
-        let result = match scheduler.spawn_thread_and_wait(th, lua_args).await {
-            Ok(ret) => {
-                match ret {
-                    Some(v) => v,
-                    None => {
-                        let _ = promise_resolver.reject(scope, v8::String::new(scope, "Lua thread returned no values").unwrap().into());
-                        return;
-                    }
-                }
-            },
-            Err(e) => {
-                let _ = promise_resolver.reject(scope, v8::String::new(scope, &format!("Lua thread error: {}", e)).unwrap().into());
-                return;
-            }
-        };
-        
-
-
-        match result {
-            Ok(ret) => {
-                let results = vec![];
-                for ret in ret {
-                    match Self::proxy_to_v8(scope, userdata_template, finalizers.clone(), &lua, ret) {
-                        Ok(v8_ret) => results.push(v8_ret),
-                        Err(e) => {
-                            let _ = promise_resolver.reject(scope, v8::String::new(scope, &format!("Failed to convert return value: {}", e)).unwrap().into());
-                            return;
-                        }
-                    }
-                }
-
-                let arr = v8::Array::new(scope, results.len() as i32);
-                for (i, v) in results.into_iter().enumerate() {
-                    arr.set_index(scope, i as u32, v);
-                }
-
-                let _ = promise_resolver.resolve(scope, arr.into());
-            },
-            Err(e) => {
-                let _ = promise_resolver.reject(scope, v8::String::new(scope, &format!("Lua function error: {}", e)).unwrap().into());
+                return Err(deno_error::JsErrorBox::generic(format!("Failed to convert argument {}: {}", i, e)));
             }
         }
     }
-}*/
+
+    loop {
+        let list = state.list.borrow_mut();
+        if list.len() >= MAX_REFS {
+            return Err(deno_error::JsErrorBox::generic("Maximum number of running functions reached".to_string()));
+        } else {
+            let run_id = rand::random::<i32>();
+            if list.contains_key(&run_id) {
+                continue; // Collision, try again
+            }
+
+            let func = list.get(&func_id).ok_or_else(|| deno_error::JsErrorBox::generic("Function ID not found".to_string()))?;
+            func.runs.borrow_mut().insert(run_id, FunctionRunState::Bound { lua_args });
+
+            return Ok(run_id);
+        }
+    }
+}
+
+// OP to execute a bound function by func ID/run ID
+//
+// Returns nothing
+#[op2(async)]
+async fn __luaexecute(
+    state_rc: Rc<RefCell<OpState>>,
+    func_id: i32,
+    run_id: i32,
+) -> Result<(), deno_error::JsErrorBox> {
+    let running_funcs = {
+        let state = state_rc.try_borrow()
+            .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
+        
+        state.try_borrow::<CommonState>()
+            .ok_or_else(|| deno_error::JsErrorBox::generic("CommonState not found".to_string()))?
+            .clone()
+    };
+
+    let (func_state, func) = {
+        let list = running_funcs.list.borrow();
+        let func_state = list.get(&func_id)
+            .ok_or_else(|| deno_error::JsErrorBox::generic("Function ID not found".to_string()))?;
+
+        // We can remove here because we are executing it now
+        let run_state = func_state.runs.borrow_mut().remove(&run_id)
+            .ok_or_else(|| deno_error::JsErrorBox::generic("Run ID not found".to_string()))?;
+
+        (run_state, func_state.func.func.clone())
+    };
+
+    let lua_args = match func_state {
+        FunctionRunState::Bound { lua_args } => lua_args,
+        FunctionRunState::Executed { .. } => {
+            return Err(deno_error::JsErrorBox::generic("Function has already been executed".to_string()));
+        }
+    };
+
+    let Some(lua) = running_funcs.weak_lua.try_upgrade() else {
+        return Err(deno_error::JsErrorBox::generic("Lua state has been dropped".to_string()));
+    };
+
+    let th = lua.create_thread(func)
+        .map_err(|e| deno_error::JsErrorBox::generic(format!("Failed to create Lua thread: {}", e)))?;
+
+    let scheduler = mlua_scheduler::taskmgr::get(&lua);
+    match scheduler.spawn_thread_and_wait(th, lua_args).await {
+        Ok(ret) => {
+            match ret {
+                Some(v) => {
+                    let v = v.map_err(|e| deno_error::JsErrorBox::generic(format!("Lua function error: {}", e)))?;
+                    // Store the result in the run state
+                    let mut list = running_funcs.list.borrow_mut();
+                    let func_state = list.get_mut(&func_id)
+                        .ok_or_else(|| deno_error::JsErrorBox::generic("Function ID not found".to_string()))?;
+                    func_state.runs.borrow_mut().insert(run_id, FunctionRunState::Executed { lua_resp: v });
+                    Ok(())
+                },
+                None => Err(deno_error::JsErrorBox::generic("Lua thread returned no values".to_string())),
+            }
+        }
+        Err(e) => Err(deno_error::JsErrorBox::generic(format!("Lua thread error: {}", e))),
+    }
+}
+
+// OP to get the results of a function by func ID/run ID
+#[op2]
+fn __luaresult<'s>(
+    #[state] state: &CommonState,
+    scope: &mut v8::HandleScope<'s>,
+    func_id: i32,
+    run_id: i32,
+) -> Result<v8::Local<'s, v8::Array>, deno_error::JsErrorBox> {
+    let lua_resp = {
+        let list = state.list.borrow();
+        let func_state = list.get(&func_id)
+            .ok_or_else(|| deno_error::JsErrorBox::generic("Function ID not found".to_string()))?;
+
+        let mut runs_g = func_state.runs.borrow_mut();
+        let run_state = runs_g.remove(&run_id)
+            .ok_or_else(|| deno_error::JsErrorBox::generic("Run ID not found".to_string()))?;
+
+        match run_state {
+            FunctionRunState::Executed { lua_resp } => lua_resp,
+            FunctionRunState::Bound { .. } => {
+                return Err(deno_error::JsErrorBox::generic("Function has not been executed yet".to_string()));
+            }
+        }
+    };
+
+    // Proxy every return value to V8
+    let mut results = vec![];
+    for ret in lua_resp {
+        match V8IsolateManagerInner::proxy_to_v8(scope, state, ret) {
+            Ok(v8_ret) => results.push(v8_ret),
+            Err(e) => {
+                return Err(deno_error::JsErrorBox::generic(format!("Failed to convert return value: {}", e)));
+            }
+        }
+    }
+
+    let arr = v8::Array::new(scope, results.len() as i32);
+    for (i, v) in results.into_iter().enumerate() {
+        arr.set_index(scope, i as u32, v);
+    }
+
+    Ok(arr)
+}
 
 struct UserData {
     pub ud: mluau::AnyUserData,
+    pub common_state: CommonState,
 }
 
 impl UserData {
-    pub fn new(ud: mluau::AnyUserData) -> Self {
-        Self { ud }
+    pub fn new(ud: mluau::AnyUserData, common_state: CommonState) -> Self {
+        Self { ud, common_state }
     }
 
-    fn named_property_getter(
-        scope: &mut v8::HandleScope,
-        key: v8::Local<v8::Name>,
+    fn named_property_getter<'s>(
+        scope: &mut v8::HandleScope<'s>,
+        key: v8::Local<'s, v8::Name>,
         args: v8::PropertyCallbackArguments,
         mut rv: v8::ReturnValue,
     ) -> v8::Intercepted {
@@ -595,17 +1018,62 @@ impl UserData {
             }
             return v8::Intercepted::No;
         }
-        let _rust_obj = unsafe { &*(external.value() as *mut UserData) };
-        println!("UD: getting property {:?}, ud: {:?}", key, _rust_obj.ud);
-        return v8::Intercepted::No; // TODO: Implement
+        let rust_obj = unsafe { &*(external.value() as *mut UserData) };
+        println!("UD: getting property {:?}, ud: {:?}", key, rust_obj.ud);
+        // Get the property from the userdata
+        let key = {
+            let Some(lua) = rust_obj.common_state.weak_lua.try_upgrade() else {
+                if let Some(message) = v8::String::new(scope, "Lua state has been dropped") {
+                    let exception = v8::Exception::type_error(scope, message);
+                    scope.throw_exception(exception);
+                }
+                return v8::Intercepted::No;
+            };
+
+            match V8IsolateManagerInner::proxy_from_v8(scope, &lua, key.into(), rust_obj.common_state.finalizer_attachments.clone()) {
+                Ok(v) => v,
+                Err(e) => {
+                    if let Some(message) = v8::String::new(scope, &format!("Failed to convert key: {}", e)) {
+                        let exception = v8::Exception::type_error(scope, message);
+                        scope.throw_exception(exception);
+                    }
+                    return v8::Intercepted::No;
+                }
+            }
+        };
+
+        let val = match rust_obj.ud.get::<LuaValue>(key) {
+            Ok(v) => v,
+            Err(e) => {
+                if let Some(message) = v8::String::new(scope, &format!("Failed to get property from userdata: {}", e)) {
+                    let exception = v8::Exception::type_error(scope, message);
+                    scope.throw_exception(exception);
+                }
+                return v8::Intercepted::No;
+            }
+        };
+
+        let v8_val = match V8IsolateManagerInner::proxy_to_v8(scope, &rust_obj.common_state, val) {
+            Ok(v) => v,
+            Err(e) => {
+                if let Some(message) = v8::String::new(scope, &format!("Failed to convert property to V8: {}", e)) {
+                    let exception = v8::Exception::type_error(scope, message);
+                    scope.throw_exception(exception);
+                }
+                return v8::Intercepted::No;
+            }
+        };
+
+        rv.set(v8_val);
+        return v8::Intercepted::Yes;
     }
 
     fn named_property_setter(
         scope: &mut v8::HandleScope,
-        key: v8::Local<v8::Name>,
-        value: v8::Local<v8::Value>,
+        _key: v8::Local<v8::Name>,
+        _value: v8::Local<v8::Value>,
         args: v8::PropertyCallbackArguments,
-        mut rv: v8::ReturnValue<()>,
+        mut _rv: v8::ReturnValue<()>,
     ) -> v8::Intercepted {
         let this = args.this();
         let external = v8::Local::<v8::External>::try_from(this.get_internal_field(scope, 0).unwrap()).unwrap();
@@ -620,77 +1088,105 @@ impl UserData {
         let _rust_obj = unsafe { &*(external.value() as *mut UserData) };
         return v8::Intercepted::No; // TODO: Implement
     }
-}
+} 
 
-struct ProxyData {
-    userdata_wrapper: v8::Global<v8::Object>,
-    isolate: v8::Global<v8::Isolate>,
-}
-
-/*#[derive(Clone)]
-struct ProxyFn {
-    func: Rc<dyn Fn()>
-}
-
-#[op2(async)]
-async fn function_proxy(
-   state: Rc<RefCell<OpState>>,
-) -> Result<(), CoreError> {
-    let state_guard = state.try_borrow()
-        .map_err(|e| CoreError(
-            Box::new(CoreErrorKind::JsBox(JsErrorBox::generic(e.to_string()))))
-        )?;
-    
-    let state = state_guard.try_borrow::<ProxyFn>()
-        .ok_or_else(|| CoreError(
-            Box::new(CoreErrorKind::JsBox(JsErrorBox::generic("Proxy function not found".to_string())))
-        ))?;
-
-    Ok(())
-}*/
 
 #[cfg(test)]
 mod tests {
     use deno_core::v8;
+    use mlua_scheduler::{taskmgr::NoopHooks, LuaSchedulerAsync, XRc};
+    use mluau::IntoLua;
+
+    use crate::deno::V8IsolateManager;
     #[test]
     fn test_v8_isolate_manager() {
-        let manager = super::V8IsolateManager::new(super::MIN_HEAP_LIMIT);
-
-        // Test userdata
+        println!("Starting V8 isolate manager test");
         let lua = mluau::Lua::new();
-        struct MyUD {
-            value: i32
-        }
+        let compiler = mluau::Compiler::new().set_optimization_level(2);
+        lua.set_compiler(compiler);
 
-        impl mluau::UserData for MyUD {
-            fn add_methods<'lua, M: mluau::UserDataMethods<Self>>(methods: &mut M) {
-                methods.add_method("get_value", |_, this, ()| {
-                    Ok(this.value)
-                });
-            }
-        }
+        let manager_i = super::V8IsolateManagerInner::new(&lua, super::MIN_HEAP_LIMIT);
 
-        let ud = lua.create_userdata(MyUD { value: 42 }).unwrap();
-        let lua_value = mluau::Value::UserData(ud);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
 
-        // Create a ProxyData
-        let v8_value = manager.proxy_to_v8(&lua, lua_value).unwrap();
-        let mut inner = manager.inner.borrow_mut();
-        let context = inner.deno.main_context();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async move {
+            println!("Creating Lua scheduler and task manager");
+            let returns_tracker = mlua_scheduler::taskmgr::ReturnTracker::new();
 
-        let isolate = inner.deno.v8_isolate();
-        let scope = &mut v8::HandleScope::new(isolate);
-        let v8_value = v8::Local::new(scope, v8_value);
-        println!("V8 Value: {:?} is_obj={}", v8_value, v8_value.is_object());
+            let mut wildcard_sender = returns_tracker.track_wildcard_thread();
 
-        let context = v8::Local::new(scope, context);
-        let scope = &mut v8::ContextScope::new(scope, context);
-        let Some(obj) = v8_value.to_object(scope) else {
-            panic!("Expected V8 object");
-        };
+            tokio::task::spawn_local(async move {
+                while let Some((thread, result)) = wildcard_sender.recv().await {
+                    if let Err(e) = result {
+                        eprintln!("Error in thread {e:?}: {:?}", thread.to_pointer());
+                    }
+                }
+            });
 
-        let s = v8::String::new(scope, "get_value").unwrap();
-        let v = obj.get(scope, s.into()).unwrap();
-        println!("typeof: {:?}", v.type_of(scope).to_rust_string_lossy(scope));
+            let task_mgr = mlua_scheduler::taskmgr::TaskManager::new(&lua, returns_tracker, XRc::new(NoopHooks {})).await.expect("Failed to create task manager");
+
+            lua.globals()
+                .set(
+                    "_PANIC",
+                    lua.create_scheduler_async_function(|_lua, n: i32| async move {
+                        panic!("Panic test: {n}");
+                        #[allow(unreachable_code)]
+                        Ok(())
+                    })
+                    .expect("Failed to create async function"),
+                )
+                .expect("Failed to set _OS global");
+
+            lua.globals()
+                .set(
+                    "task",
+                    mlua_scheduler::userdata::task_lib(&lua).expect("Failed to create table"),
+                )
+                .expect("Failed to set task global");
+
+            lua.sandbox(true).expect("Sandboxed VM"); // Sandbox VM
+
+            let (manager, rx) = V8IsolateManager::new();
+            let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+            tokio::task::spawn_local(async move {
+                let _inner = V8IsolateManager::run(manager_i, rx, start_tx).await;
+            });
+            start_rx.await.expect("Failed to start V8 isolate manager");
+            println!("V8 isolate manager started");
+
+            // Call the v8 function now as a async script
+            let lua_code = r#"
+local v8 = ...
+local result = v8:eval([[
+  (function() {
+    async function f(waiter) {
+        return await waiter();
+    }
+
+    return f;
+  })()
+]], function() print('am here'); return task.wait(1) end)
+return result
+"#;
+
+            let func = lua.load(lua_code).into_function().expect("Failed to load Lua code");
+            let th = lua.create_thread(func).expect("Failed to create Lua thread");
+            
+            let mut args = mluau::MultiValue::new();
+            args.push_back(manager.into_lua(&lua).expect("Failed to push QuickJS runtime to Lua"));
+
+            let output = task_mgr
+                .spawn_thread_and_wait(th, args)
+                .await
+                .expect("Failed to run Lua thread")
+                .expect("Lua thread returned no value")
+                .expect("Lua thread returned an error");
+            
+            println!("Output: {:?}", output);
+        });
     }
 }
