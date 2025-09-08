@@ -1164,16 +1164,18 @@ mod tests {
 local v8 = ...
 local result = v8:eval([[
   (function() {
-    async function f(waiter) {
+    async function f(waiter, v8ud) {
         // Allocate a large array to test heap limits
         //let arr = new Array(1e6).fill(0).map((_, i) => i);
         //console.log('Array allocated with length:', arr.length);
+        let v = await v8ud.isrunning(v8ud);
+        console.log('V8 userdata:', v8ud, v, typeof v);
         return await waiter();
     }
 
     return f;
   })()
-]], function() print('am here'); return task.wait(1) end)
+]], function() print('am here'); return task.wait(1) end, v8)
 return result
 "#;
 
