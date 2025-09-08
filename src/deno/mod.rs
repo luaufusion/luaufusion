@@ -148,6 +148,7 @@ pub struct CommonState {
     list: Rc<RefCell<HashMap<i32, FunctionState>>>,
     weak_lua: WeakLua,
     userdata_template: Rc<v8::Global<v8::ObjectTemplate>>, 
+    buffer_template: Rc<v8::Global<v8::ObjectTemplate>>,
     func_template: Rc<v8::Global<v8::ObjectTemplate>>,
     finalizer_attachments: FinalizerAttachments,
 }
@@ -169,6 +170,7 @@ pub struct V8IsolateManagerInner {
 pub struct FinalizerAttachments {
     ud: FinalizerList<UserData>,
     func: FinalizerList<Function>,
+    buf: FinalizerList<mluau::Buffer>,
 }
 
 impl V8IsolateManagerInner {
@@ -356,10 +358,28 @@ impl V8IsolateManagerInner {
                 final_closure.into()
             },
             mluau::Value::Buffer(buf) => {
+                // We also need to store a pointer to the buffer in the finalizer list to enable conversion back to Lua
+                let buf_ext = match common_state.finalizer_attachments.buf.add(scope, buf.clone(), None) {
+                    Some(b) => b,
+                    None => return Err("Maximum number of buffer references reached".into()),
+                };
+
                 let bytes = buf.to_vec();
                 let bs = v8::ArrayBuffer::new_backing_store_from_boxed_slice(bytes.into_boxed_slice()).make_shared();
-                let array = v8::ArrayBuffer::with_backing_store(scope, &bs);
-                array.into()
+                let array = v8::ArrayBuffer::with_backing_store(scope, &bs);                
+
+                let buf_obj = {
+                    let obj_template = common_state.buffer_template.clone();
+                    let local_template = v8::Local::new(scope, (*obj_template).clone());
+                    let obj = local_template.new_instance(scope).ok_or("Failed to create V8 object")?;
+                    obj.set_internal_field(0, buf_ext.into());
+                    let buf_field = v8::String::new(scope, "buffer").ok_or("Failed to create buffer string")?;
+                    obj.set(scope, buf_field.into(), array.into());
+                    obj
+                };
+
+
+                buf_obj.into()
             },
             mluau::Value::Error(e) => return Err(format!("Cannot proxy Lua error: {}", e).into()),
             mluau::Value::Other(_) => return Err("Cannot proxy unknown/other Lua value".into()),
@@ -427,6 +447,15 @@ impl V8IsolateManagerInner {
                                 return Ok(LuaValue::UserData(ud.ud.clone()));
                             }
                         }
+
+                        // Case 2: Buffer proxy
+                        if finalizers.buf.contains(external.value() as *mut mluau::Buffer) {
+                            let ptr = external.value() as *mut mluau::Buffer;
+                            if !ptr.is_null() {
+                                let buf = unsafe { &*ptr };
+                                return Ok(LuaValue::Buffer(buf.clone()));
+                            }
+                        }                        
                     }
                 }
             }
@@ -507,17 +536,27 @@ impl V8IsolateManagerInner {
             v8::Global::new(scope, template)
         });
 
+        let buffer_template = Rc::new({
+            let isolate = deno.v8_isolate();
+            let scope = &mut v8::HandleScope::new(isolate);
+            let template = Self::create_buf_proxy_template(scope);
+            v8::Global::new(scope, template)
+        });
+
         let uds = FinalizerList::default();
         let funcs = FinalizerList::default();
+        let bufs = FinalizerList::default();
 
         let common_state = CommonState {
             list: Rc::new(RefCell::new(HashMap::new())),
             weak_lua: lua.weak(),
             userdata_template,
             func_template: function_template,
+            buffer_template,
             finalizer_attachments: FinalizerAttachments {
-                ud: uds.clone(),
-                func: funcs.clone(),
+                ud: uds,
+                func: funcs,
+                buf: bufs,
             },
         };
 
@@ -541,6 +580,14 @@ impl V8IsolateManagerInner {
             .setter(UserData::named_property_setter);
         template.set_named_property_handler(named_handler);
 
+        template
+    }
+
+    fn create_buf_proxy_template<'s>(scope: &mut v8::HandleScope<'s, ()>) -> v8::Local<'s, v8::ObjectTemplate> {
+        let template = v8::ObjectTemplate::new(scope);
+        // Reserve space for the pointer to the Rust struct.
+        template.set_internal_field_count(1);
+        
         template
     }
 
@@ -1164,19 +1211,22 @@ mod tests {
 local v8 = ...
 local result = v8:eval([[
   (function() {
-    async function f(waiter, v8ud) {
+    async function f(waiter, v8ud, buf) {
         // Allocate a large array to test heap limits
         //let arr = new Array(1e6).fill(0).map((_, i) => i);
         //console.log('Array allocated with length:', arr.length);
         let v = await v8ud.isrunning(v8ud);
         console.log('V8 userdata:', v8ud, v, typeof v);
-        return await waiter();
+        console.log('Buffer:', buf, typeof buf.buffer, buf.buffer.byteLength);
+        let waited = await waiter();
+        return [waited, buf, v8ud]
     }
 
     return f;
   })()
-]], function() print('am here'); return task.wait(1) end, v8)
-return result
+]], function() print('am here'); return task.wait(1) end, v8, buffer.create(10))
+assert(result[3] == v8)
+return result[1], result[2], result[3]
 "#;
 
             let func = lua.load(lua_code).into_function().expect("Failed to load Lua code");
