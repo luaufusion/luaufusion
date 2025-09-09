@@ -354,7 +354,7 @@ impl QuickjsRuntime {
                                         }
                                     };
 
-                                    let key = match proxy_object(ctx.clone(), key, &self_ref) {
+                                    let key = match proxy_object(ctx.clone(), key, &self_ref, 0) {
                                         Ok(k) => k,
                                         Err(e) => {
                                             let _ = result.send(Err(mluau::Error::external(format!("Failed to proxy Lua key to QuickJS: {e}"))));
@@ -386,7 +386,7 @@ impl QuickjsRuntime {
                                         }
                                     };
 
-                                    let lua_res = match proxy_from_quickjs(ctx.clone(), &lua, &self_ref, value) {
+                                    let lua_res = match proxy_from_quickjs(ctx.clone(), &lua, &self_ref, value, 0) {
                                         Ok(v) => v,
                                         Err(e) => {
                                             let _ = result.send(Err(mluau::Error::external(format!("Failed to proxy QuickJS return value to Lua: {e}"))));
@@ -467,7 +467,7 @@ impl QuickjsRuntime {
 
         let mut func_args = rquickjs::function::Args::new(ctx.clone(), args.len());      
         for arg in args {
-            let qjs_value = match proxy_object(ctx.clone(), arg, &self_ref) {
+            let qjs_value = match proxy_object(ctx.clone(), arg, &self_ref, 0) {
                 Ok(v) => v,
                 Err(e) => {
                     let _ = result.send(Err(mluau::Error::external(format!("Failed to proxy Lua argument to QuickJS: {e}"))));
@@ -506,7 +506,7 @@ impl QuickjsRuntime {
             return;
         };
 
-        let lua_res = match proxy_from_quickjs(ctx.clone(), &lua, &self_ref, res) {
+        let lua_res = match proxy_from_quickjs(ctx.clone(), &lua, &self_ref, res, 0) {
             Ok(v) => v,
             Err(e) => {
                 let _ = result.send(Err(mluau::Error::external(format!("Failed to proxy QuickJS return value to Lua: {e}"))));
@@ -555,7 +555,7 @@ impl QuickjsRuntime {
             return;
         };
 
-        let lua_res = match proxy_from_quickjs(ctx.clone(), &lua, &self_ref, res) {
+        let lua_res = match proxy_from_quickjs(ctx.clone(), &lua, &self_ref, res, 0) {
             Ok(v) => v,
             Err(e) => {
                 let _ = result.send(Err(mluau::Error::external(format!("Failed to proxy QuickJS return value to Lua: {e}"))));
@@ -613,7 +613,7 @@ impl QuickjsRuntime {
             return;
         };
 
-        let lua_res = match proxy_from_quickjs(ctx.clone(), &lua, &self_ref, namespace) {
+        let lua_res = match proxy_from_quickjs(ctx.clone(), &lua, &self_ref, namespace, 0) {
             Ok(v) => v,
             Err(e) => {
                 let _ = result.send(Err(mluau::Error::external(format!("Failed to proxy QuickJS return value to Lua: {e}"))));
@@ -690,7 +690,7 @@ impl LuaFunction {
         };
 
         for arg in args.0 {
-            let lua_arg = proxy_from_quickjs(ctx.clone(), &lua, &runtime, arg)?;
+            let lua_arg = proxy_from_quickjs(ctx.clone(), &lua, &runtime, arg, 0)?;
             lua_args.push_back(lua_arg);
         }
 
@@ -710,11 +710,11 @@ impl LuaFunction {
         if res.len() == 0 {
             Ok(rquickjs::Value::new_undefined(ctx.clone()))
         } else if res.len() == 1 {
-            proxy_object(ctx.clone(), res.into_iter().next().unwrap(), &runtime)
+            proxy_object(ctx.clone(), res.into_iter().next().unwrap(), &runtime, 0)
         } else {
             let arr = rquickjs::Array::new(ctx.clone())?;
             for (i, v) in res.into_iter().enumerate() {
-                let js_v = proxy_object(ctx.clone(), v, &runtime)?;
+                let js_v = proxy_object(ctx.clone(), v, &runtime, 0)?;
                 arr.set(i, js_v)?;
             }
             Ok(rquickjs::Value::from_array(arr))
@@ -903,7 +903,11 @@ impl mluau::UserData for QuickJSPromise {
     }
 }
 
-pub fn proxy_object<'js>(ctx: RQCtx<'js>, value: mluau::Value, runtime: &QuickjsRuntime) -> Result<rquickjs::Value<'js>, Error> {
+pub fn proxy_object<'js>(ctx: RQCtx<'js>, value: mluau::Value, runtime: &QuickjsRuntime, depth: usize) -> Result<rquickjs::Value<'js>, Error> {
+    if depth > MAX_PROXY_DEPTH {
+        return Err("Maximum proxy depth exceeded".into());
+    }
+    
     match value {
         mluau::Value::Nil => Ok(rquickjs::Value::new_null(ctx)),
         mluau::Value::Boolean(b) => Ok(rquickjs::Value::new_bool(ctx, b)),
@@ -941,7 +945,7 @@ pub fn proxy_object<'js>(ctx: RQCtx<'js>, value: mluau::Value, runtime: &Quickjs
                     for i in 1..=len {
                         let v = t.raw_get(i)
                             .map_err(|e| mluau::Error::external(format!("Failed to get array element {}: {}", i, e)))?;
-                        let v = proxy_object(ctx.clone(), v, runtime)
+                        let v = proxy_object(ctx.clone(), v, runtime, depth + 1)
                             .map_err(|e| mluau::Error::external(format!("Failed to proxy array element {}: {}", i, e)))?;
                         arr.set(i - 1, v)
                             .map_err(|e| mluau::Error::external(format!("Failed to set array element {}: {}", i - 1, e)))?;
@@ -952,8 +956,8 @@ pub fn proxy_object<'js>(ctx: RQCtx<'js>, value: mluau::Value, runtime: &Quickjs
 
             let obj = rquickjs::Object::new(ctx.clone())?;
             t.for_each(|k, v| {
-                let k = proxy_object(ctx.clone(), k, runtime).map_err(|e| mluau::Error::external(format!("Failed to proxy key: {}", e)))?;
-                let v = proxy_object(ctx.clone(), v, runtime).map_err(|e| mluau::Error::external(format!("Failed to proxy value: {}", e)))?;
+                let k = proxy_object(ctx.clone(), k, runtime, depth + 1).map_err(|e| mluau::Error::external(format!("Failed to proxy key: {}", e)))?;
+                let v = proxy_object(ctx.clone(), v, runtime, depth + 1).map_err(|e| mluau::Error::external(format!("Failed to proxy value: {}", e)))?;
                 obj.set(k, v).map_err(|e| mluau::Error::external(format!("Failed to set object property: {}", e)))?;
                 Ok(())
             }).map_err(|e| format!("Failed to iterate table: {}", e))?;
@@ -980,7 +984,12 @@ pub fn proxy_object<'js>(ctx: RQCtx<'js>, value: mluau::Value, runtime: &Quickjs
     }
 }
 
-pub fn proxy_from_quickjs<'js>(ctx: RQCtx<'js>, lua: &mluau::Lua, runtime: &QuickjsRuntime, value: rquickjs::Value<'js>) -> Result<mluau::Value, Error> {
+const MAX_PROXY_DEPTH: usize = 10;
+pub fn proxy_from_quickjs<'js>(ctx: RQCtx<'js>, lua: &mluau::Lua, runtime: &QuickjsRuntime, value: rquickjs::Value<'js>, depth: usize) -> Result<mluau::Value, Error> {
+    if depth > MAX_PROXY_DEPTH {
+        return Err("Maximum proxy depth exceeded".into());
+    }
+    
     if value.is_null() || value.is_undefined() {
         Ok(mluau::Value::Nil)
     } else if let Some(b) = value.as_bool() {
@@ -1005,7 +1014,7 @@ pub fn proxy_from_quickjs<'js>(ctx: RQCtx<'js>, lua: &mluau::Lua, runtime: &Quic
             .map_err(|e| format!("Failed to create Lua table: {}", e))?;
 
             for value in arr.iter() {
-                let v = proxy_from_quickjs(ctx.clone(), lua, runtime, value?)?;
+                let v = proxy_from_quickjs(ctx.clone(), lua, runtime, value?, depth + 1)?;
                 table.raw_push(v).map_err(|e| format!("Failed to push value to Lua table: {}", e))?;
             }
 

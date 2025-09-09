@@ -3,6 +3,8 @@ pub mod rquickjs;
 #[cfg(feature = "deno")]
 pub mod deno;
 
+pub mod parallelluau;
+
 use mluau::LuaSerdeExt;
 
 #[allow(async_fn_in_trait)]

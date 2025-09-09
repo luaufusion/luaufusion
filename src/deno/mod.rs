@@ -27,7 +27,7 @@ const MIN_HEAP_LIMIT: usize = 10 * 1024 * 1024; // 10MB
 /// Stores a pointer to a Rust struct and a V8 weak reference (with finalizer) to ensure the Rust struct is dropped when V8 garbage collects the associated object.
 struct Finalizer<T> {
     ptr: *mut T,
-    weak: v8::Weak<v8::External>,
+    _weak: v8::Weak<v8::External>,
     finalized: Rc<RefCell<bool>>,
 }
 
@@ -65,7 +65,7 @@ impl<T: 'static> Finalizer<T> {
 
         let finalizer = Self {
             ptr,
-            weak,
+            _weak: weak,
             finalized,
         };
 
@@ -158,8 +158,7 @@ pub struct CommonState {
 /// This should not be used directly, use V8IsolateManager instead
 /// which uses a tokio task w/ channel to communicate with the isolate manager.
 /// 
-/// Alternatively, use a (WIP) IsolatePool to manage multiple isolates with drops
-/// in LIFO order (needed for v8)
+/// It is unsafe to hold more than one V8IsolateManagerInner in the same thread at once.
 pub struct V8IsolateManagerInner {
     deno: deno_core::JsRuntime,
     cancellation_token: CancellationToken,
@@ -173,24 +172,38 @@ pub struct FinalizerAttachments {
     buf: FinalizerList<mluau::Buffer>,
 }
 
+pub const MAX_PROXY_DEPTH: usize = 10;
+
 impl V8IsolateManagerInner {
     // Internal, use proxy_to_v8_safe to ensure finalizers are also set
     fn proxy_to_v8_impl(&mut self, value: LuaValue) -> Result<v8::Global<v8::Value>, Error> {
         let v8_ctx = self.deno.main_context();
         let isolate = self.deno.v8_isolate();
-        let scope = &mut v8::HandleScope::new(isolate);
-        let v8_ctx = v8::Global::new(scope, v8_ctx);
-        let v8_ctx = v8::Local::new(scope, v8_ctx);
-        let scope = &mut v8::ContextScope::new(scope, v8_ctx);
-        let v8_value = Self::proxy_to_v8(scope, &self.common_state, value)?;
-        Ok(v8::Global::new(scope, v8_value))
+
+        let v8_value = {
+            let mut scope = v8::HandleScope::new(isolate);
+            let v8_ctx = v8::Local::new(&mut scope, v8_ctx);
+            let scope = &mut v8::ContextScope::new(&mut scope, v8_ctx);
+            match Self::proxy_to_v8(scope, &self.common_state, value, 0) {
+                Ok(v) => Ok(v8::Global::new(scope, v)),
+                Err(e) => Err(e),
+            }
+        };
+
+        println!("Proxied Lua value to V8");
+        
+        v8_value
     }
     
     fn proxy_to_v8<'s>(
         scope: &mut v8::HandleScope<'s>, 
         common_state: &CommonState,
-        value: LuaValue
+        value: LuaValue,
+        depth: usize,
     ) -> Result<v8::Local<'s, v8::Value>, Error> {
+        if depth > MAX_PROXY_DEPTH {
+            return Err("Maximum proxy depth exceeded".into());
+        }
         let v8_value: v8::Local<v8::Value> = match value {
             LuaValue::Nil => v8::null(scope).into(),
             LuaValue::Boolean(b) => v8::Boolean::new(scope, b).into(),
@@ -226,7 +239,7 @@ impl V8IsolateManagerInner {
                             for i in 1..=len {
                                 let v = t.raw_get(i)
                                     .map_err(|e| mluau::Error::external(format!("Failed to get array element {}: {}", i, e)))?;
-                                let v = Self::proxy_to_v8(scope, common_state, v)?;
+                                let v = Self::proxy_to_v8(scope, common_state, v, depth + 1)?;
                                 arr.set_index(scope, (i - 1) as u32, v);
                             }
                             return Ok(arr.into());
@@ -236,8 +249,8 @@ impl V8IsolateManagerInner {
 
                 let obj = v8::Object::new(scope);
                 t.for_each(|k, v| {
-                    let v8_key = Self::proxy_to_v8(scope, common_state, k).map_err(|e| LuaError::external(e.to_string()))?;
-                    let v8_val = Self::proxy_to_v8(scope, common_state, v).map_err(|e| LuaError::external(e.to_string()))?;
+                    let v8_key = Self::proxy_to_v8(scope, common_state, k, depth + 1).map_err(|e| LuaError::external(e.to_string()))?;
+                    let v8_val = Self::proxy_to_v8(scope, common_state, v, depth + 1).map_err(|e| LuaError::external(e.to_string()))?;
                     obj.set(scope, v8_key, v8_val);
                     Ok(())
                 })?;
@@ -394,7 +407,12 @@ impl V8IsolateManagerInner {
         lua: &mluau::Lua,
         value: v8::Local<'s, v8::Value>,
         finalizers: FinalizerAttachments,
+        depth: usize,
     ) -> Result<LuaValue, Error> {
+        if depth > MAX_PROXY_DEPTH {
+            return Err("Maximum proxy depth exceeded".into());
+        }
+
         if value.is_null() || value.is_undefined() {
             return Ok(LuaValue::Nil);
         } else if value.is_boolean() {
@@ -418,7 +436,7 @@ impl V8IsolateManagerInner {
             let table = lua.create_table_with_capacity(length, 0)?;
             for i in 0..length {
                 let elem = arr.get_index(scope, i as u32).ok_or(format!("Failed to get array element {}", i))?;
-                let lua_elem = Self::proxy_from_v8(scope, lua, elem, finalizers.clone())?;
+                let lua_elem = Self::proxy_from_v8(scope, lua, elem, finalizers.clone(), depth + 1)?;
                 table.raw_set(i + 1, lua_elem)?; // Lua arrays are 1-based
             }
             return Ok(LuaValue::Table(table));
@@ -431,6 +449,12 @@ impl V8IsolateManagerInner {
             let slice = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, bs.byte_length()) };
             let buf = lua.create_buffer(slice)?;
             return Ok(LuaValue::Buffer(buf));
+        } else if value.is_function() {
+            // TODO: Support function proxy directly
+            //
+            // For now, we just proxy directly to a lua async function which calls the V8 function
+            let func = v8::Local::<v8::Function>::try_from(value).map_err(|_| "Failed to convert to function")?;
+            let global_func = v8::Global::new(scope, func);
         } else if value.is_object() {
             let obj = value.to_object(scope).ok_or("Failed to convert to object")?;
             let num_internal_fields = obj.internal_field_count();
@@ -467,8 +491,8 @@ impl V8IsolateManagerInner {
             for i in 0..length {
                 let key = props.get_index(scope, i).ok_or(format!("Failed to get property at index {}", i))?;
                 let val = obj.get(scope, key).ok_or("Failed to get property value")?;
-                let lua_key = Self::proxy_from_v8(scope, lua, key, finalizers.clone())?;
-                let lua_val = Self::proxy_from_v8(scope, lua, val, finalizers.clone())?;
+                let lua_key = Self::proxy_from_v8(scope, lua, key, finalizers.clone(), depth + 1)?;
+                let lua_val = Self::proxy_from_v8(scope, lua, val, finalizers.clone(), depth + 1)?;
                 table.raw_set(lua_key, lua_val)?;
             }
             return Ok(LuaValue::Table(table));
@@ -627,7 +651,7 @@ pub enum V8IsolateManagerMessage {
 /// Internal manager for a single V8 isolate with a minimal Deno runtime.
 #[derive(Clone)]
 pub struct V8IsolateManager {
-    tx: tokio::sync::mpsc::UnboundedSender<V8IsolateManagerMessage>,
+    pub tx: tokio::sync::mpsc::UnboundedSender<V8IsolateManagerMessage>,
 }
 
 impl Drop for V8IsolateManager {
@@ -651,13 +675,15 @@ impl V8IsolateManager {
     /// This must be called for anything to work
     /// 
     /// Returns the inner isolate manager for any pool cleanup etc. after shutdown
-    pub async fn run(mut inner: V8IsolateManagerInner, mut rx: tokio::sync::mpsc::UnboundedReceiver<V8IsolateManagerMessage>, start_tx: tokio::sync::oneshot::Sender<()>) -> V8IsolateManagerInner {
+    pub async fn run(
+        mut inner: V8IsolateManagerInner, 
+        mut rx: tokio::sync::mpsc::UnboundedReceiver<V8IsolateManagerMessage>, 
+        shutdown_token: CancellationToken,
+    ) -> V8IsolateManagerInner {
         let (err_tx, err_rx) = tokio::sync::watch::channel(None);
 
         // Async futures unordered queue for code execution
         let mut code_exec_queue = FuturesUnordered::new();
-
-        let _ = start_tx.send(());
 
         loop {
             tokio::select! {
@@ -704,7 +730,7 @@ impl V8IsolateManager {
                                 let lua = inner.common_state.weak_lua.try_upgrade().ok_or("Lua state has been dropped".to_string());
                                 match lua {
                                     Ok(lua) => {
-                                        V8IsolateManagerInner::proxy_from_v8(scope, &lua, local_value, inner.common_state.finalizer_attachments.clone())
+                                        V8IsolateManagerInner::proxy_from_v8(scope, &lua, local_value, inner.common_state.finalizer_attachments.clone(), 0)
                                     }
                                     Err(e) => {
                                         let _ = resp.send(Err(e.into()));
@@ -721,9 +747,10 @@ impl V8IsolateManager {
                             let func = {
                                 let main_ctx = inner.deno.main_context();
                                 let isolate = inner.deno.v8_isolate();
-                                let scope = &mut v8::HandleScope::new(isolate);
-                                let main_ctx = v8::Local::new(scope, main_ctx);
-                                let context_scope = &mut v8::ContextScope::new(scope, main_ctx);
+                                let mut scope = v8::HandleScope::new(isolate);
+                                let main_ctx = v8::Global::new(&mut scope, main_ctx);
+                                let main_ctx = v8::Local::new(&mut scope, main_ctx);
+                                let context_scope = &mut v8::ContextScope::new(&mut scope, main_ctx);
                                 let try_catch = &mut v8::TryCatch::new(context_scope);
                                 let script = v8::String::new(try_catch, &code)
                                     .and_then(|s| v8::Script::compile(try_catch, s, None))
@@ -809,6 +836,8 @@ impl V8IsolateManager {
                 }
             }
         }
+
+        shutdown_token.cancel();
 
         inner // Return the inner isolate manager for any pool cleanup etc.
     }
@@ -906,7 +935,7 @@ fn __luabind(
     let mut lua_args = LuaMultiValue::with_capacity(args_count as usize);
     for i in 0..args_count {
         let arg = args.get_index(scope, i).ok_or_else(|| deno_error::JsErrorBox::generic(format!("Failed to get argument {}", i)))?;
-        match V8IsolateManagerInner::proxy_from_v8(scope, &lua, arg, state.finalizer_attachments.clone()) {
+        match V8IsolateManagerInner::proxy_from_v8(scope, &lua, arg, state.finalizer_attachments.clone(), 0) {
             Ok(v) => lua_args.push_back(v),
             Err(e) => {
                 return Err(deno_error::JsErrorBox::generic(format!("Failed to convert argument {}: {}", i, e)));
@@ -1024,7 +1053,7 @@ fn __luaresult<'s>(
     // Proxy every return value to V8
     let mut results = vec![];
     for ret in lua_resp {
-        match V8IsolateManagerInner::proxy_to_v8(scope, state, ret) {
+        match V8IsolateManagerInner::proxy_to_v8(scope, state, ret, 0) {
             Ok(v8_ret) => results.push(v8_ret),
             Err(e) => {
                 return Err(deno_error::JsErrorBox::generic(format!("Failed to convert return value: {}", e)));
@@ -1078,7 +1107,7 @@ impl UserData {
                 return v8::Intercepted::No;
             };
 
-            match V8IsolateManagerInner::proxy_from_v8(scope, &lua, key.into(), rust_obj.common_state.finalizer_attachments.clone()) {
+            match V8IsolateManagerInner::proxy_from_v8(scope, &lua, key.into(), rust_obj.common_state.finalizer_attachments.clone(), 0) {
                 Ok(v) => v,
                 Err(e) => {
                     if let Some(message) = v8::String::new(scope, &format!("Failed to convert key: {}", e)) {
@@ -1101,7 +1130,7 @@ impl UserData {
             }
         };
 
-        let v8_val = match V8IsolateManagerInner::proxy_to_v8(scope, &rust_obj.common_state, val) {
+        let v8_val = match V8IsolateManagerInner::proxy_to_v8(scope, &rust_obj.common_state, val, 0) {
             Ok(v) => v,
             Err(e) => {
                 if let Some(message) = v8::String::new(scope, &format!("Failed to convert property to V8: {}", e)) {
@@ -1141,9 +1170,9 @@ impl UserData {
 
 #[cfg(test)]
 mod tests {
-    use deno_core::v8;
     use mlua_scheduler::{taskmgr::NoopHooks, LuaSchedulerAsync, XRc};
     use mluau::IntoLua;
+    use tokio_util::sync::CancellationToken;
 
     use crate::deno::V8IsolateManager;
     #[test]
@@ -1199,12 +1228,9 @@ mod tests {
             lua.sandbox(true).expect("Sandboxed VM"); // Sandbox VM
 
             let (manager, rx) = V8IsolateManager::new();
-            let (start_tx, start_rx) = tokio::sync::oneshot::channel();
             tokio::task::spawn_local(async move {
-                let _inner = V8IsolateManager::run(manager_i, rx, start_tx).await;
+                let _inner = V8IsolateManager::run(manager_i, rx, CancellationToken::new()).await;
             });
-            start_rx.await.expect("Failed to start V8 isolate manager");
-            println!("V8 isolate manager started");
 
             // Call the v8 function now as a async script
             let lua_code = r#"
