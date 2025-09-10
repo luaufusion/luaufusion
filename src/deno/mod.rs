@@ -1,3 +1,5 @@
+// TODO: Switch to using LuaProxyBridge to enable luau and v8 to be on different threads
+
 pub(crate) mod extension;
 pub(crate) mod base64_ops;
 
