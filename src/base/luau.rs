@@ -2,6 +2,9 @@ use futures_util::{stream::FuturesUnordered, StreamExt};
 use mluau::{LuaSerdeExt, WeakLua};
 use tokio::sync::{mpsc::{UnboundedReceiver, UnboundedSender}, oneshot::Sender};
 
+#[cfg(feature = "deno")]
+use crate::deno::v8proxy::ProxiedV8Value;
+
 use super::{StringAtom, StringAtomList, MAX_PROXY_DEPTH, ObjectRegistry};
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -49,7 +52,7 @@ impl ProxiedLuaValue {
             mluau::Value::Boolean(b) => ProxiedLuaValue::Boolean(b),
             mluau::Value::Integer(i) => ProxiedLuaValue::Integer(i),
             mluau::Value::Number(n) => ProxiedLuaValue::Number(n),
-            mluau::Value::String(s) => ProxiedLuaValue::String(plc.atom_list.get(s)),
+            mluau::Value::String(s) => ProxiedLuaValue::String(plc.atom_list.get(s.as_bytes().as_ref())),
             mluau::Value::Table(t) => {
                 let Some(lua) = t.weak_lua().try_upgrade() else {
                     return Err("Table's Lua state has been dropped".into());
@@ -82,20 +85,24 @@ impl ProxiedLuaValue {
                 ProxiedLuaValue::Table(entries)
             }
             mluau::Value::Function(f) => {
-                let func_id = plc.func_registry.add(f);
+                let func_id = plc.func_registry.add(f)
+                    .ok_or_else(|| "Function registry is full".to_string())?;
                 ProxiedLuaValue::Function(func_id)
             }
             mluau::Value::UserData(ud) => {
-                let userdata_id = plc.userdata_registry.add(ud);
+                let userdata_id = plc.userdata_registry.add(ud)
+                    .ok_or_else(|| "UserData registry is full".to_string())?;
                 ProxiedLuaValue::UserData(userdata_id)
             }
             mluau::Value::Vector(v) => ProxiedLuaValue::Vector((v.x(), v.y(), v.z())),
             mluau::Value::Buffer(b) => {
-                let buffer_id = plc.buffer_registry.add(b);
+                let buffer_id = plc.buffer_registry.add(b)
+                    .ok_or_else(|| "Buffer registry is full".to_string())?;
                 ProxiedLuaValue::Buffer(buffer_id)
             }
             mluau::Value::Thread(th) => {
-                let thread_id = plc.thread_registry.add(th);
+                let thread_id = plc.thread_registry.add(th)
+                    .ok_or_else(|| "Thread registry is full".to_string())?;
                 ProxiedLuaValue::Thread(thread_id)
             }
             mluau::Value::Error(e) => return Err(format!("Cannot proxy Lua error value: {}", e).into()),
@@ -106,7 +113,7 @@ impl ProxiedLuaValue {
                 let s = format!("unknown({r:?})");
                 let s = lua.create_string(&s)
                     .map_err(|e| format!("Failed to create string for unknown value: {}", e))?;
-                ProxiedLuaValue::String(plc.atom_list.get(s))
+                ProxiedLuaValue::String(plc.atom_list.get(s.as_bytes().as_ref()))
             },
         };
 
@@ -178,10 +185,26 @@ pub(crate) enum ObjectRegistryType {
     Thread,
 }
 
+pub(crate) enum ValueArgs {
+    Lua(Vec<ProxiedLuaValue>),
+    #[cfg(feature = "deno")]
+    V8(Vec<ProxiedV8Value>),
+}
+
+impl ValueArgs {
+    pub fn len(&self) -> usize {
+        match self {
+            ValueArgs::Lua(v) => v.len(),
+            #[cfg(feature = "deno")]
+            ValueArgs::V8(v) => v.len(),
+        }
+    }
+}
+
 pub(crate) enum LuaProxyBridgeMessage {
     CallFunction {
         func_id: i32,
-        args: Vec<ProxiedLuaValue>,
+        args: ValueArgs,
         resp: Sender<Result<Vec<ProxiedLuaValue>, Error>>,
     },
     ReadBuffer {
@@ -244,12 +267,29 @@ impl LuaProxyBridge {
 
                             let mut mv = mluau::MultiValue::with_capacity(args.len());
                             let mut fail = None;
-                            for value in args {
-                                match value.to_lua_value(&lua, &plc, 0) {
-                                    Ok(v) => mv.push_back(v),
-                                    Err(e) => {
-                                        fail = Some(e);
-                                        break;
+
+                            match args {
+                                ValueArgs::Lua(args) => {
+                                    for value in args {
+                                        match value.to_lua_value(&lua, &plc, 0) {
+                                            Ok(v) => mv.push_back(v),
+                                            Err(e) => {
+                                                fail = Some(e);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                                #[cfg(feature = "deno")]
+                                ValueArgs::V8(args) => {
+                                    for value in args {
+                                        match value.proxy_to_lua(&lua) {
+                                            Ok(v) => mv.push_back(v),
+                                            Err(e) => {
+                                                fail = Some(e);
+                                                break;
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -336,10 +376,18 @@ impl LuaProxyBridge {
         }
     }
 
+    #[cfg(feature = "deno")]
+    pub(crate) async fn call_function_v8(&self, func_id: i32, args: Vec<ProxiedV8Value>) -> Result<Vec<ProxiedLuaValue>, Error> {
+        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+        self.x.send(LuaProxyBridgeMessage::CallFunction { func_id, args: ValueArgs::V8(args), resp: resp_tx })
+            .map_err(|e| format!("Failed to send CallFunction message: {}", e))?;
+        resp_rx.await.map_err(|e| format!("Failed to receive CallFunction response: {}", e))?
+    }
+
     /// Calls a Lua function by its ID with the given arguments
     pub(crate) async fn call_function(&self, func_id: i32, args: Vec<ProxiedLuaValue>) -> Result<Vec<ProxiedLuaValue>, Error> {
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-        self.x.send(LuaProxyBridgeMessage::CallFunction { func_id, args, resp: resp_tx })
+        self.x.send(LuaProxyBridgeMessage::CallFunction { func_id, args: ValueArgs::Lua(args), resp: resp_tx })
             .map_err(|e| format!("Failed to send CallFunction message: {}", e))?;
         resp_rx.await.map_err(|e| format!("Failed to receive CallFunction response: {}", e))?
     }
