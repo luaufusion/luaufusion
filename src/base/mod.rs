@@ -92,6 +92,12 @@ impl<T: Clone + PartialEq> ObjectRegistry<T> {
         let objs = self.objs.borrow();
         objs.get(&obj_id).cloned()
     }
+
+    /// Remove a object by its ID
+    pub fn remove(&self, obj_id: i32) {
+        let mut objs = self.objs.borrow_mut();
+        objs.remove(&obj_id);
+    }
 }
 
 #[derive(Clone)]
@@ -130,6 +136,12 @@ impl<T: Clone + PartialEq> ObjectRegistrySend<T> {
     pub fn get(&self, obj_id: i32) -> Option<T> {
         let objs = self.objs.read().unwrap();
         objs.get(&obj_id).cloned()
+    }
+
+    /// Remove a object by its ID
+    pub fn remove(&self, obj_id: i32) {
+        let mut objs = self.objs.write().unwrap();
+        objs.remove(&obj_id);
     }
 }
 
