@@ -1,4 +1,5 @@
-use crate::{base::{ObjectRegistry, StringAtom, StringAtomList}, deno::{Error, MAX_PROXY_DEPTH}};
+use super::{ObjectRegistry, StringAtom, StringAtomList};
+use crate::deno::{Error, V8IsolateManager, MAX_PROXY_DEPTH};
 use deno_core::v8;
 
 /// A V8 value that can now be easily proxied to Luau
@@ -17,11 +18,30 @@ pub(crate) enum ProxiedV8Value {
 }
 
 impl ProxiedV8Value {
-    pub fn proxy_to_lua(self, lua: &mluau::Lua) -> Result<mluau::Value, mluau::Error> {
-        Ok(mluau::Value::Nil) // TODO
+    pub(crate) fn proxy_to_lua(self, lua: &mluau::Lua, bridge: &V8IsolateManager) -> Result<mluau::Value, mluau::Error> {
+        match self {
+            ProxiedV8Value::Nil | ProxiedV8Value::Undefined => Ok(mluau::Value::Nil),
+            ProxiedV8Value::Boolean(b) => Ok(mluau::Value::Boolean(b)),
+            ProxiedV8Value::Integer(i) => Ok(mluau::Value::Integer(i as i64)),
+            ProxiedV8Value::Number(n) => Ok(mluau::Value::Number(n)),
+            ProxiedV8Value::String(sid) => {
+                lua.create_string(sid.as_bytes()).map(mluau::Value::String)
+            }
+            ProxiedV8Value::Buffer(buf) => {
+                lua.create_buffer(buf).map(mluau::Value::Buffer)
+            },
+            ProxiedV8Value::Array(elems) => {
+                let tbl = lua.create_table_with_capacity(elems.len(), 0)?;
+                for elem in elems {
+                    tbl.raw_push(elem.proxy_to_lua(lua, bridge)?)?;
+                }
+                Ok(mluau::Value::Table(tbl))
+            },
+            _ => Err(mluau::Error::external("Unsupported V8 value type for proxying to Lua")),
+        }
     }
 
-    pub(super) fn proxy_from_v8<'s>(
+    pub(crate) fn proxy_from_v8<'s>(
         scope: &mut v8::HandleScope<'s>, 
         value: v8::Local<'s, v8::Value>,
         plc: &ProxyV8Client,

@@ -2,7 +2,6 @@
 
 pub(crate) mod extension;
 pub(crate) mod base64_ops;
-pub(crate) mod v8proxy;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -15,17 +14,16 @@ use deno_core::v8::CreateParams;
 use deno_core::{op2, v8, Extension, OpState};
 use futures_util::stream::FuturesUnordered;
 use futures_util::StreamExt;
-use mluau::prelude::*;
 //use deno_core::{op2, OpState};
 //use deno_error::JsErrorBox;
 //use mluau::serde::de;
 use tokio_util::sync::CancellationToken;
 
 use crate::base::luau::{LuaProxyBridge, ObjectRegistryType, ProxiedLuaValue};
+use crate::base::ValueArgs;
 use crate::deno::extension::ExtensionTrait;
 
-use crate::base::{StringAtomList, ObjectRegistry};
-use crate::deno::v8proxy::{ProxiedV8Value, ProxyV8Client};
+use crate::base::{StringAtomList, ObjectRegistry, deno::{ProxiedV8Value, ProxyV8Client}};
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
@@ -455,7 +453,7 @@ impl V8IsolateManagerInner {
     }
 }
 
-enum V8IsolateManagerMessage {
+pub(crate) enum V8IsolateManagerMessage {
     Shutdown,
     ErrSubscribe {
         resp: tokio::sync::oneshot::Sender<tokio::sync::watch::Receiver<Option<deno_core::error::CoreError>>>,
@@ -464,7 +462,12 @@ enum V8IsolateManagerMessage {
         code: String,
         args: Vec<ProxiedLuaValue>,
         resp: tokio::sync::oneshot::Sender<Result<ProxiedV8Value, Error>>,
-    }
+    },
+    GetObjectProperty {
+        obj_id: i32,
+        key: ProxiedLuaValue,
+        resp: tokio::sync::oneshot::Sender<Result<ProxiedV8Value, Error>>,
+    },
 }
 
 /// Internal manager for a single V8 isolate with a minimal Deno runtime.
@@ -494,7 +497,7 @@ impl V8IsolateManager {
     /// This must be called for anything to work
     /// 
     /// Returns the inner isolate manager for any pool cleanup etc. after shutdown
-    pub async fn run(
+    pub(crate) async fn run(
         mut inner: V8IsolateManagerInner, 
         mut rx: tokio::sync::mpsc::UnboundedReceiver<V8IsolateManagerMessage>, 
         shutdown_token: CancellationToken,
@@ -593,6 +596,67 @@ impl V8IsolateManager {
                                 let result = fut.await;
                                 (result, resp)
                             });
+                        },
+                        V8IsolateManagerMessage::GetObjectProperty { obj_id, key, resp } => {
+                            let obj = match inner.common_state.proxy_client.obj_registry.get(obj_id) {
+                                Some(v) => v,
+                                None => {
+                                    let _ = resp.send(Err("Object ID not found".into()));
+                                    continue;
+                                }
+                            };
+
+                            let key = match inner.proxy_to_v8_impl(key) {
+                                Ok(k) => k,
+                                Err(e) => {
+                                    let _ = resp.send(Err(e));
+                                    continue;
+                                }
+                            };
+
+                            {
+                                let main_ctx = inner.deno.main_context();
+                                let isolate = inner.deno.v8_isolate();
+                                let mut scope = v8::HandleScope::new(isolate);
+                                let main_ctx = v8::Local::new(&mut scope, main_ctx);
+                                let context_scope = &mut v8::ContextScope::new(&mut scope, main_ctx);
+                                let try_catch = &mut v8::TryCatch::new(context_scope);
+
+                                let local_obj = v8::Local::new(try_catch, obj);
+                                let local_key = v8::Local::new(try_catch, key);
+
+                                let result = local_obj.get(try_catch, local_key);
+                                let result = match result {
+                                    Some(v) => v,
+                                    None => {
+                                        if try_catch.has_caught() {
+                                            let exception = try_catch.exception().unwrap();
+                                            let exception_string = exception.to_rust_string_lossy(try_catch);
+                                            let _ = resp.send(Err(format!("Failed to get object property: {}", exception_string).into()));
+                                            continue;
+                                        } else {
+                                            let _ = resp.send(Err("Failed to get object property".into()));
+                                            continue;
+                                        }
+                                    }
+                                };
+
+                                // Convert to ProxiedV8Value
+                                match ProxiedV8Value::proxy_from_v8(try_catch, result, &inner.common_state.proxy_client, 0) {
+                                    Ok(v) => {
+                                        let _ = resp.send(Ok(v));
+                                    }
+                                    Err(e) => {
+                                        if try_catch.has_caught() {
+                                            let exception = try_catch.exception().unwrap();
+                                            let exception_string = exception.to_rust_string_lossy(try_catch);
+                                            let _ = resp.send(Err(format!("Failed to convert object property to ProxiedV8Value: {} ({})", exception_string, e).into()));
+                                            continue;
+                                        }
+                                        let _ = resp.send(Err(e.into()));
+                                    }
+                                };
+                            }
                         }
                     }
                 },
@@ -730,7 +794,7 @@ fn __luadispatch(
     let bridge = state.bridge.clone();
     funcs.insert(run_id, FunctionRunState::Created {
         fut: Box::pin(async move { 
-            bridge.call_function_v8(func_id, args_proxied).await
+            bridge.call_function(func_id, ValueArgs::V8(args_proxied)).await
         })
     });
     Ok(run_id)

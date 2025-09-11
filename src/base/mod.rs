@@ -1,8 +1,12 @@
 pub mod luau;
+#[cfg(feature = "deno")]
+pub mod deno;
 
 use std::{cell::RefCell, collections::{HashMap, HashSet}, rc::Rc, sync::{Arc, Mutex, RwLock}};
 
-use crate::deno::MAX_PROXY_DEPTH;
+#[cfg(feature = "deno")]
+use crate::deno::V8IsolateManager;
+use crate::{base::luau::ProxyLuaClient, deno::MAX_PROXY_DEPTH};
 
 pub const MAX_INTERN_SIZE: usize = 1024 * 512; // 512 KB
 pub const MAX_OBJECT_REGISTRY_SIZE: usize = 1024; // 1024 objects
@@ -114,58 +118,53 @@ impl<T: Clone + PartialEq> ObjectRegistry<T> {
     }
 }
 
-#[derive(Clone)]
-/// A list of objects that can be called from another language
-/// 
-/// This struct maps objects to integer IDs for easy referencing
-/// 
-/// Use ObjectRegistrySend for thread safe version
-pub(crate) struct ObjectRegistrySend<T: Clone + PartialEq> {
-    objs: Arc<RwLock<HashMap<i32, T>>>,   
+pub(crate) enum ValueArgs {
+    Lua(Vec<luau::ProxiedLuaValue>),
+    #[cfg(feature = "deno")]
+    V8(Vec<deno::ProxiedV8Value>),
 }
 
-impl<T: Clone + PartialEq> ObjectRegistrySend<T> {
-    /// Creates a new object registry
-    pub fn new() -> Self {
-        Self {
-            objs: Arc::new(RwLock::new(HashMap::new())),
+pub(crate) struct OtherProxyBridges {
+    #[cfg(feature = "deno")]
+    pub v8: V8IsolateManager,
+}
+
+impl ValueArgs {
+    pub fn len(&self) -> usize {
+        match self {
+            ValueArgs::Lua(v) => v.len(),
+            #[cfg(feature = "deno")]
+            ValueArgs::V8(v) => v.len(),
         }
     }
 
-    /// Registers a new object and returns its ID
-    pub fn add(&self, obj: T) -> i32 {
-        let mut objs = self.objs.write().unwrap();
-        for (id, f) in objs.iter() {
-            if f == &obj {
-                return *id;
-            }
+    /// Converts the ValueArgs to a mluau::MultiValue
+    pub fn to_lua_value(self, lua: &mluau::Lua, plc: &ProxyLuaClient, ol: &OtherProxyBridges) -> Result<mluau::MultiValue, mluau::Error> {
+        match self {
+            ValueArgs::Lua(v) => {
+                let mut arr = mluau::MultiValue::with_capacity(v.len());
+                for val in v {
+                    arr.push_back(val.to_lua_value(lua, plc, 0)?);
+                }
+                Ok(arr)
+            },
+            #[cfg(feature = "deno")]
+            ValueArgs::V8(v) => {
+                let mut arr = mluau::MultiValue::with_capacity(v.len());
+                for val in v {
+                    arr.push_back(val.proxy_to_lua(lua, &ol.v8)?);
+                }
+                Ok(arr)
+            },
         }
-
-        let obj_id = objs.len() as i32 + 1;
-        objs.insert(obj_id, obj);
-        obj_id
-    }
-
-    /// Gets a object by its ID
-    pub fn get(&self, obj_id: i32) -> Option<T> {
-        let objs = self.objs.read().unwrap();
-        objs.get(&obj_id).cloned()
-    }
-
-    /// Remove a object by its ID
-    pub fn remove(&self, obj_id: i32) {
-        let mut objs = self.objs.write().unwrap();
-        objs.remove(&obj_id);
     }
 }
 
 mod asserter {
     use super::StringAtomList;
     use super::StringAtom;
-    use super::ObjectRegistrySend;
 
     const fn assert_send_const<T: Send>() {}
     const _: () = assert_send_const::<StringAtomList>(); 
     const _: () = assert_send_const::<StringAtom>();
-    const _: () = assert_send_const::<ObjectRegistrySend<()>>();
 }
