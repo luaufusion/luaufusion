@@ -126,7 +126,7 @@ pub(crate) enum ValueArgs {
 
 pub(crate) struct OtherProxyBridges {
     #[cfg(feature = "deno")]
-    pub v8: V8IsolateManager,
+    pub v8: Option<V8IsolateManager>,
 }
 
 impl ValueArgs {
@@ -150,9 +150,12 @@ impl ValueArgs {
             },
             #[cfg(feature = "deno")]
             ValueArgs::V8(v) => {
+                let Some(v8) = &ol.v8 else {
+                    return Err(mluau::Error::external("No V8 isolate manager available for proxying V8 values to Lua"));
+                };
                 let mut arr = mluau::MultiValue::with_capacity(v.len());
                 for val in v {
-                    arr.push_back(val.proxy_to_lua(lua, &ol.v8)?);
+                    arr.push_back(val.proxy_to_lua(lua, v8)?);
                 }
                 Ok(arr)
             },

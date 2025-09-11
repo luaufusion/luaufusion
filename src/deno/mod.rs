@@ -5,8 +5,10 @@ pub(crate) mod base64_ops;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::rc::Rc;
+use std::sync::Arc;
 use mlua_scheduler::LuaSchedulerAsyncUserData;
 
 //use deno_core::error::{CoreError, CoreErrorKind};
@@ -29,6 +31,7 @@ pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
 const MAX_REFS: usize = 500;
 const MIN_HEAP_LIMIT: usize = 10 * 1024 * 1024; // 10MB
+const V8_MIN_STACK_SIZE: usize = 1024 * 1024 * 15; // 15MB minimum memory
 
 /// Stores a pointer to a Rust struct and a V8 weak reference (with finalizer) to ensure the Rust struct is dropped when V8 garbage collects the associated object.
 struct Finalizer<T> {
@@ -444,6 +447,10 @@ impl V8IsolateManagerInner {
         }
     }
 
+    pub fn thread_safe_handle(&mut self) -> deno_core::v8::IsolateHandle {
+        self.deno.v8_isolate().thread_safe_handle()
+    }
+
     fn create_obj_template<'s>(scope: &mut v8::HandleScope<'s, ()>) -> v8::Local<'s, v8::ObjectTemplate> {
         let template = v8::ObjectTemplate::new(scope);
         // Reserve space for the pointer to the Rust struct.
@@ -472,24 +479,100 @@ pub(crate) enum V8IsolateManagerMessage {
 
 /// Internal manager for a single V8 isolate with a minimal Deno runtime.
 #[derive(Clone)]
-pub struct V8IsolateManager {
-    tx: tokio::sync::mpsc::UnboundedSender<V8IsolateManagerMessage>,
+pub enum V8IsolateManager {
+    Threaded {
+        tx: tokio::sync::mpsc::UnboundedSender<V8IsolateManagerMessage>,
+        threadsafe_handle: deno_core::v8::IsolateHandle,
+        thread_handle: Arc<std::thread::JoinHandle<Result<(), Box<dyn std::any::Any + Send + 'static>>>>
+    },
+    Local {
+        tx: tokio::sync::mpsc::UnboundedSender<V8IsolateManagerMessage>,
+        threadsafe_handle: deno_core::v8::IsolateHandle,
+    }
 }
 
 impl Drop for V8IsolateManager {
     fn drop(&mut self) {
-        let _ = self.tx.send(V8IsolateManagerMessage::Shutdown);
+        let _ = match self.terminate() {
+            Ok(_) => {},
+            Err(e) => {
+                eprintln!("Failed to send shutdown message to V8 isolate manager: {}", e);
+            }
+        }; 
     }
 }
 
-impl V8IsolateManager {
-    // Create a new isolate manager and spawn its task
-    pub fn new() -> (Self, tokio::sync::mpsc::UnboundedReceiver<V8IsolateManagerMessage>) {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+pub struct V8IsolateManagerThreadData {
+    pub stack_size: usize,
+    pub heap_limit: usize,
+    pub id: String,
+}
 
-        (Self {
-            tx
-        }, rx)
+impl V8IsolateManager {
+    /// Create a new isolate manager and spawn its task
+    /// 
+    /// Safety note: it is unsafe to create multiple isolates on the same thread
+    /// As such, V8IsolateManager will create its own thread
+    pub async fn new(
+        thread_opts: V8IsolateManagerThreadData,
+        cancellation_token: CancellationToken,
+        bridge: LuaProxyBridge,
+    ) -> Result<Self, Error> {
+        let thread_stack_size = thread_opts.stack_size.max(V8_MIN_STACK_SIZE);
+        let heap_limit = thread_opts.heap_limit;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        
+        let (th_tx, th_rx) = tokio::sync::oneshot::channel();
+        let tjh = std::thread::Builder::new()
+        .stack_size(thread_stack_size)
+        .name(thread_opts.id)
+        .spawn(move || {
+            let ct_ref = cancellation_token.clone();
+            let res = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build_local(tokio::runtime::LocalOptions::default())
+                    .expect("Failed to create tokio runtime");
+
+                rt.block_on(async move {
+                    let mut inner = V8IsolateManagerInner::new(bridge, heap_limit);
+                    let _ = th_tx.send(inner.thread_safe_handle());
+                    Self::run(inner, rx, cancellation_token).await;
+                });
+            }));
+
+            ct_ref.cancel();
+            res 
+        })?;
+        
+        let handle = th_rx.await?;
+
+        Ok(Self::Threaded {
+            tx,
+            threadsafe_handle: handle,
+            thread_handle: Arc::new(tjh)
+        })
+    }
+
+    /// Create a new isolate manager and spawn its task
+    /// 
+    /// Safety note: it is unsafe to create multiple isolates on the same thread
+    pub fn new_local(
+        mut inner: V8IsolateManagerInner,
+        cancellation_token: CancellationToken,
+    ) -> Self {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                
+        let handle = inner.thread_safe_handle();
+
+        tokio::task::spawn_local(async move {
+            let _ = Self::run(inner, rx, cancellation_token).await;
+        });
+
+        Self::Local {
+            tx,
+            threadsafe_handle: handle,
+        }
     }
 
     /// Run the isolate manager task
@@ -497,11 +580,11 @@ impl V8IsolateManager {
     /// This must be called for anything to work
     /// 
     /// Returns the inner isolate manager for any pool cleanup etc. after shutdown
-    pub(crate) async fn run(
+    async fn run(
         mut inner: V8IsolateManagerInner, 
         mut rx: tokio::sync::mpsc::UnboundedReceiver<V8IsolateManagerMessage>, 
         shutdown_token: CancellationToken,
-    ) -> V8IsolateManagerInner {
+    ) {
         let (err_tx, err_rx) = tokio::sync::watch::channel(None);
 
         // Async futures unordered queue for code execution
@@ -703,16 +786,30 @@ impl V8IsolateManager {
             }
         }
 
-        shutdown_token.cancel();
+        if !inner.thread_safe_handle().is_execution_terminating() {
+            inner.thread_safe_handle().terminate_execution();
+        }
 
-        inner // Return the inner isolate manager for any pool cleanup etc.
+        shutdown_token.cancel();
+    }
+
+    /// Sends a message to the isolate manager to subscribe to error events
+    pub(crate) fn send(&self, msg: V8IsolateManagerMessage) -> Result<(), Error> {
+        match self {
+            V8IsolateManager::Threaded { tx, .. } => {
+                tx.send(msg).map_err(|_| "Failed to send message to isolate manager".to_string().into())
+            }
+            V8IsolateManager::Local { tx, .. } => {
+                tx.send(msg).map_err(|_| "Failed to send message to isolate manager".to_string().into())
+            }
+        }
     }
 
     /// Returns a watch receiver for errors from the isolates event loop
     pub async fn err_subscribe(&self) -> Result<tokio::sync::watch::Receiver<Option<deno_core::error::CoreError>>, Error> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let msg = V8IsolateManagerMessage::ErrSubscribe { resp: tx };
-        self.tx.send(msg).map_err(|_| "Failed to send ErrSubscribe message".to_string())?;
+        self.send(msg)?;
         let rx = rx.await.map_err(|_| "Failed to receive ErrSubscribe response".to_string())?;
         Ok(rx)
     }
@@ -720,9 +817,13 @@ impl V8IsolateManager {
     pub(crate) async fn eval(&self, code: &str, args: Vec<ProxiedLuaValue>) -> Result<ProxiedV8Value, Error> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let msg = V8IsolateManagerMessage::CodeExec { code: code.to_string(), args, resp: tx };
-        self.tx.send(msg).map_err(|_| "Failed to send CodeExec message".to_string())?;
+        self.send(msg)?;
         let value = rx.await.map_err(|_| "Failed to receive CodeExec response".to_string())??;
         Ok(value)   
+    }
+
+    pub fn terminate(&self) -> Result<(), Error> {
+        self.send(V8IsolateManagerMessage::Shutdown)
     }
 }
 
