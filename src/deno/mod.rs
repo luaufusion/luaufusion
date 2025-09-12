@@ -172,8 +172,8 @@ pub struct FinalizerAttachments {
 }
 
 impl V8IsolateManagerInner {
-    // Internal, use proxy_to_v8_safe to ensure finalizers are also set
-    fn proxy_to_v8_impl(&mut self, value: ProxiedLuaValue) -> Result<v8::Global<v8::Value>, Error> {
+    /// Proxy a ProxiedLuaValue to a V8 value
+    pub fn proxy_to_v8_impl(&mut self, value: ProxiedLuaValue) -> Result<v8::Global<v8::Value>, Error> {
         let v8_ctx = self.deno.main_context();
         let isolate = self.deno.v8_isolate();
 
@@ -192,6 +192,7 @@ impl V8IsolateManagerInner {
         v8_value
     }
 
+    // Internal implementation to convert a ProxiedLuaValue to a V8 value
     fn proxy_to_v8<'s>(
         scope: &mut v8::HandleScope<'s>, 
         common_state: &CommonState,

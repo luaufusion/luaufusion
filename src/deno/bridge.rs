@@ -142,6 +142,17 @@ impl ProxiedV8Value {
             //
             // For now, we just proxy directly to an object ID
             let func = v8::Local::<v8::Function>::try_from(value).map_err(|_| "Failed to convert to function")?;
+
+            // Look for __funcObj 
+            let func_obj_key = v8::String::new(scope, "__funcObj").ok_or("Failed to create __funcObj string")?;
+            let func_obj_val = func.get(scope, func_obj_key.into());
+            if let Some(func_obj_val) = func_obj_val {
+                if func_obj_val.is_big_int() {
+                    let func_id = func_obj_val.to_big_int(scope).ok_or("Failed to convert __funcObj to int32")?.i64_value().0;
+                    return Ok(Self::SrcFunction(ObjectRegistryID::from_i64(func_id)));
+                }
+            }
+
             let global_func = v8::Global::new(scope, func);
             let func_id = plc.func_registry.add(global_func)
                 .ok_or("Failed to register function: too many function references")?;
