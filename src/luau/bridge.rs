@@ -122,9 +122,7 @@ impl ProxiedLuaValue {
     /// Convert a proxied Lua value back to a Lua value
     /// 
     /// This may fail if the Lua state is no longer valid
-    /// 
-    /// Use `to_parallel_lua_value` to convert to a Luau value in another Luau VM (parallel Luau)
-    pub(crate) fn to_lua_value(&self, lua: &mluau::Lua, plc: &ProxyLuaClient, depth: usize) -> mluau::Result<mluau::Value> {
+    pub fn to_lua_value(&self, lua: &mluau::Lua, plc: &ProxyLuaClient, depth: usize) -> mluau::Result<mluau::Value> {
         match self {
             ProxiedLuaValue::Nil => Ok(mluau::Value::Nil),
             ProxiedLuaValue::Boolean(b) => Ok(mluau::Value::Boolean(*b)),
@@ -258,7 +256,7 @@ impl<T: ProxyBridge> LuaBridge<T> {
                                 let mut mv = mluau::MultiValue::with_capacity(args.len());
                                 let mut err = None;
                                 for arg in args {
-                                    match bridge.to_lua_value(&lua, arg, 0) {
+                                    match bridge.to_source_lua_value(&lua, arg, &plc, 0) {
                                         Ok(v) => {
                                             mv.push_back(v);
                                         },
@@ -318,7 +316,7 @@ impl<T: ProxyBridge> LuaBridge<T> {
                                 let Some(lua) = plc.weak_lua.try_upgrade() else {
                                     return Err("Lua state has been dropped".into());
                                 };
-                                let key_val = bridge.to_lua_value(&lua, key, 0)
+                                let key_val = bridge.to_source_lua_value(&lua, key, &plc, 0)
                                     .map_err(|e| format!("Failed to convert key to Lua value: {}", e))?;
                                 let val = userdata.get::<mluau::Value>(key_val)
                                     .map_err(|e| format!("Failed to index UserData: {}", e))?;
@@ -392,9 +390,7 @@ impl<T: ProxyBridge> LuaBridge<T> {
 }
 
 mod asserter {
-    use super::LuaBridge;
-
-    const fn assert_send_const<T: Send>() {}
+    //const fn assert_send_const<T: Send>() {}
     //const _: () = assert_send_const::<LuaBridge<crate::deno::bridge::V8ProxyBridge>>(); 
     //const _: () = assert_send_const::<LuaBridge<crate::base::quickjs::bridge::QuickJSProxyBridge>>();
 }

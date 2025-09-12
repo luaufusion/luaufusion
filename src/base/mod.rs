@@ -1,5 +1,7 @@
 use std::{cell::RefCell, collections::{HashMap, HashSet}, rc::Rc, sync::{Arc, Mutex}};
 
+use crate::luau::bridge::ProxyLuaClient;
+
 pub const MAX_INTERN_SIZE: usize = 1024 * 512; // 512 KB
 pub const MAX_OBJECT_REGISTRY_SIZE: usize = 1024; // 1024 objects
 
@@ -158,7 +160,7 @@ pub trait ProxyBridge: Send + Sync + Clone {
     type ValueType: Send + Sync;
 
     /// Convert a value from the foreign language to a proxied value
-    fn to_lua_value(&self, lua: &mluau::Lua, value: Self::ValueType, depth: usize) -> Result<mluau::Value, Error>;
+    fn to_source_lua_value(&self, lua: &mluau::Lua, value: Self::ValueType, plc: &ProxyLuaClient, depth: usize) -> Result<mluau::Value, Error>;
 }
 
 mod asserter {

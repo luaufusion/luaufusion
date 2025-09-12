@@ -10,7 +10,7 @@ use futures_util::StreamExt;
 //use mluau::serde::de;
 use tokio_util::sync::CancellationToken;
 
-use crate::luau::bridge::{LuaBridge, ProxiedLuaValue};
+use crate::luau::bridge::{LuaBridge, ProxiedLuaValue, ProxyLuaClient};
 
 use crate::base::{ObjectRegistry, ObjectRegistryID, ProxyBridge, StringAtom, StringAtomList};
 use crate::deno::V8IsolateManagerInner;
@@ -40,10 +40,13 @@ pub enum ProxiedV8Value {
     Array(Vec<ProxiedV8Value>),
     Function(ObjectRegistryID), // Function ID in the function registry
     Promise(ObjectRegistryID), // Promise ID in the function registry
+
+    // Source-owned stuff
+    SrcFunction(ObjectRegistryID), // Function ID in the source lua's function registry
 }
 
 impl ProxiedV8Value {
-    pub(crate) fn proxy_to_lua(self, lua: &mluau::Lua, bridge: &V8IsolateManager, depth: usize) -> Result<mluau::Value, mluau::Error> {
+    pub(crate) fn proxy_to_lua(self, lua: &mluau::Lua, bridge: &V8IsolateManager, plc: &ProxyLuaClient, depth: usize) -> Result<mluau::Value, mluau::Error> {
         if depth > MAX_PROXY_DEPTH {
             return Err(mluau::Error::external("Maximum proxy depth exceeded"));
         }
@@ -62,7 +65,7 @@ impl ProxiedV8Value {
             ProxiedV8Value::Array(elems) => {
                 let tbl = lua.create_table_with_capacity(elems.len(), 0)?;
                 for elem in elems {
-                    tbl.raw_push(elem.proxy_to_lua(lua, bridge, depth + 1)?)?;
+                    tbl.raw_push(elem.proxy_to_lua(lua, bridge, plc, depth + 1)?)?;
                 }
                 Ok(mluau::Value::Table(tbl))
             },
@@ -78,6 +81,11 @@ impl ProxiedV8Value {
                     }
                 }
             }*/
+            ProxiedV8Value::SrcFunction(func_id) => {
+                let func = plc.func_registry.get(func_id)
+                    .ok_or_else(|| mluau::Error::external(format!("Function ID {} not found in registry", func_id)))?;
+                Ok(mluau::Value::Function(func))
+            }
             _ => Err(mluau::Error::external("Unsupported V8 value type for proxying to Lua")),
         }
     }
@@ -546,7 +554,7 @@ impl V8IsolateManager {
 impl ProxyBridge for V8IsolateManager {
     type ValueType = ProxiedV8Value;
 
-    fn to_lua_value(&self, lua: &mluau::Lua, value: Self::ValueType, depth: usize) -> Result<mluau::Value, Error> {
-        Ok(value.proxy_to_lua(lua, self, depth).map_err(|e| e.to_string())?)
+    fn to_source_lua_value(&self, lua: &mluau::Lua, value: Self::ValueType, plc: &ProxyLuaClient, depth: usize) -> Result<mluau::Value, Error> {
+        Ok(value.proxy_to_lua(lua, self, plc, depth).map_err(|e| e.to_string())?)
     }
 }
