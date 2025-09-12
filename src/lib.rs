@@ -1,14 +1,14 @@
 pub mod base;
-
-#[cfg(feature = "rquickjs")]
-pub mod rquickjs;
+pub mod luau;
+pub mod parallelluau;
 #[cfg(feature = "deno")]
 pub mod deno;
 
-pub mod parallelluau;
+pub const MAX_PROXY_DEPTH: usize = 10;
 
-use mluau::LuaSerdeExt;
+//use mluau::LuaSerdeExt;
 
+/*
 #[allow(async_fn_in_trait)]
 pub trait LuaProxySerdeExt {
     async fn from_proxied_value<T: serde::de::DeserializeOwned>(&self, value: mluau::Value) -> mluau::Result<T>;
@@ -32,4 +32,4 @@ impl LuaProxySerdeExt for mluau::Lua {
 
         self.from_value(value)
     }
-}
+}*/

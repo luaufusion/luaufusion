@@ -1,12 +1,4 @@
-pub mod luau;
-#[cfg(feature = "deno")]
-pub mod deno;
-
-use std::{cell::RefCell, collections::{HashMap, HashSet}, fmt::Display, rc::Rc, sync::{Arc, Mutex}};
-
-#[cfg(feature = "deno")]
-use crate::deno::V8IsolateManager;
-use crate::{base::luau::ProxyLuaClient, deno::MAX_PROXY_DEPTH};
+use std::{cell::RefCell, collections::{HashMap, HashSet}, rc::Rc, sync::{Arc, Mutex}};
 
 pub const MAX_INTERN_SIZE: usize = 1024 * 512; // 512 KB
 pub const MAX_OBJECT_REGISTRY_SIZE: usize = 1024; // 1024 objects
@@ -15,7 +7,7 @@ pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
 #[derive(Clone)]
 /// A list of string atoms to avoid duplicating strings in memory
-pub(crate) struct StringAtomList {
+pub struct StringAtomList {
     atom_list: Arc<Mutex<(usize, HashSet<Arc<[u8]>>)>>,
 }
 
@@ -23,7 +15,7 @@ pub(crate) struct StringAtomList {
 ///
 /// Cheap to clone
 #[derive(Clone)]
-pub(crate) struct StringAtom {
+pub struct StringAtom {
     s: Arc<[u8]>,
 }
 
@@ -63,7 +55,7 @@ impl StringAtomList {
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 /// An ID for an object in the object registry
-pub(crate) struct ObjectRegistryID(i64);
+pub struct ObjectRegistryID(i64);
 
 impl ObjectRegistryID {
     pub fn get(&self) -> i64 {
@@ -101,7 +93,7 @@ impl std::ops::AddAssign<i32> for ObjectRegistryID {
 /// This struct maps objects to integer IDs for easy referencing
 /// 
 /// Use ObjectRegistrySend for thread safe version
-pub(crate) struct ObjectRegistry<T: Clone + PartialEq> {
+pub struct ObjectRegistry<T: Clone + PartialEq> {
     objs: Rc<RefCell<HashMap<ObjectRegistryID, (T, usize)>>>,  
 
     // If a obj ID is created, then removed, then the length may no longer
@@ -162,49 +154,11 @@ impl<T: Clone + PartialEq> ObjectRegistry<T> {
     }
 }
 
-pub(crate) enum ValueArgs {
-    Lua(Vec<luau::ProxiedLuaValue>),
-    #[cfg(feature = "deno")]
-    V8(Vec<deno::ProxiedV8Value>),
-}
+pub trait ProxyBridge: Send + Sync + Clone {
+    type ValueType: Send + Sync;
 
-pub(crate) struct OtherProxyBridges {
-    #[cfg(feature = "deno")]
-    pub v8: Option<V8IsolateManager>,
-}
-
-impl ValueArgs {
-    pub fn len(&self) -> usize {
-        match self {
-            ValueArgs::Lua(v) => v.len(),
-            #[cfg(feature = "deno")]
-            ValueArgs::V8(v) => v.len(),
-        }
-    }
-
-    /// Converts the ValueArgs to a mluau::MultiValue
-    pub fn to_lua_value(self, lua: &mluau::Lua, plc: &ProxyLuaClient, ol: &OtherProxyBridges) -> Result<mluau::MultiValue, mluau::Error> {
-        match self {
-            ValueArgs::Lua(v) => {
-                let mut arr = mluau::MultiValue::with_capacity(v.len());
-                for val in v {
-                    arr.push_back(val.to_lua_value(lua, plc, 0)?);
-                }
-                Ok(arr)
-            },
-            #[cfg(feature = "deno")]
-            ValueArgs::V8(v) => {
-                let Some(v8) = &ol.v8 else {
-                    return Err(mluau::Error::external("No V8 isolate manager available for proxying V8 values to Lua"));
-                };
-                let mut arr = mluau::MultiValue::with_capacity(v.len());
-                for val in v {
-                    arr.push_back(val.proxy_to_lua(lua, v8)?);
-                }
-                Ok(arr)
-            },
-        }
-    }
+    /// Convert a value from the foreign language to a proxied value
+    fn to_lua_value(&self, lua: &mluau::Lua, value: Self::ValueType, depth: usize) -> Result<mluau::Value, Error>;
 }
 
 mod asserter {

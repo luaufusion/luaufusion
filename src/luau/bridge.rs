@@ -1,11 +1,10 @@
-use futures_util::{stream::FuturesUnordered, StreamExt};
-use mlua_scheduler::LuaSchedulerAsync;
-use mlua_scheduler::LuaSchedulerAsyncUserData;
-use mluau::{LuaSerdeExt, WeakLua};
-use tokio::sync::{mpsc::{UnboundedReceiver, UnboundedSender}, oneshot::Sender};
-use crate::base::OtherProxyBridges;
-
-use super::{StringAtom, StringAtomList, MAX_PROXY_DEPTH, ObjectRegistry, ValueArgs, ObjectRegistryID};
+use crate::base::{ObjectRegistryID, ProxyBridge};
+use mluau::{LuaSerdeExt, ObjectLike};
+use tokio::sync::{mpsc::UnboundedSender, mpsc::UnboundedReceiver,  oneshot::Sender};
+use futures_util::stream::{FuturesUnordered, StreamExt};
+use crate::base::{StringAtom, StringAtomList, ObjectRegistry};
+use mluau::WeakLua;
+use crate::MAX_PROXY_DEPTH;
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
@@ -13,7 +12,7 @@ pub type Error = Box<dyn std::error::Error + Send + Sync>;
 /// The client side state for proxying Lua values
 /// 
 /// This struct is not thread safe and must be kept on the Lua side
-pub(crate) struct ProxyLuaClient {
+pub struct ProxyLuaClient {
     pub weak_lua: WeakLua,
     pub atom_list: StringAtomList,
     pub func_registry: ObjectRegistry<mluau::Function>,
@@ -23,7 +22,7 @@ pub(crate) struct ProxyLuaClient {
 }
 
 /// A Lua value that can now be easily proxied to another language
-pub(crate) enum ProxiedLuaValue {
+pub enum ProxiedLuaValue {
     Nil,
     Boolean(bool),
     Integer(i64),
@@ -42,7 +41,7 @@ impl ProxiedLuaValue {
     /// Convert a Lua value to a proxied Lua value
     /// 
     /// This may fail if the Lua state is no longer valid or if the maximum proxy depth is exceeded
-    pub(crate) fn from_lua_value(value: mluau::Value, plc: &ProxyLuaClient, depth: usize) -> Result<Self, Error> {
+    pub fn from_lua_value(value: mluau::Value, plc: &ProxyLuaClient, depth: usize) -> Result<Self, Error> {
         if depth > MAX_PROXY_DEPTH {
             return Err(format!("Maximum proxy depth of {} exceeded", MAX_PROXY_DEPTH).into());
         }
@@ -178,148 +177,20 @@ impl ProxiedLuaValue {
             }
         }
     }
-
-    /// Convert a proxied Lua value to a parallel Lua value
-    /// 
-    /// This may fail if the Lua state is no longer valid
-    pub(crate) fn to_parallel_lua_value(
-        &self, 
-        lua: &mluau::Lua, 
-        bridge: &LuaProxyBridge, 
-        src_plc: &ProxyLuaClient,
-        depth: usize
-    ) -> mluau::Result<mluau::Value> {
-        match self {
-            ProxiedLuaValue::Nil => Ok(mluau::Value::Nil),
-            ProxiedLuaValue::Boolean(b) => Ok(mluau::Value::Boolean(*b)),
-            ProxiedLuaValue::Integer(i) => Ok(mluau::Value::Integer(*i)),
-            ProxiedLuaValue::Number(n) => Ok(mluau::Value::Number(*n)),
-            ProxiedLuaValue::String(s) => {
-                let s = lua.create_string(s.as_bytes())?;
-                Ok(mluau::Value::String(s))
-            }
-            ProxiedLuaValue::Table(entries) => {
-                let table = lua.create_table()?;
-                for (k, v) in entries {
-                    let lua_k = k.to_parallel_lua_value(lua, bridge, src_plc, depth + 1)?;
-                    let lua_v = v.to_parallel_lua_value(lua, bridge, src_plc, depth + 1)?;
-                    table.raw_set(lua_k, lua_v)?;
-                }
-                Ok(mluau::Value::Table(table))
-            }
-            ProxiedLuaValue::Array(elements) => {
-                let table = lua.create_table_with_capacity(elements.len(), 0)?;
-                for (i, v) in elements.iter().enumerate() {
-                    let lua_v = v.to_parallel_lua_value(lua, bridge, src_plc, depth + 1)?;
-                    table.raw_set(i + 1, lua_v)?; // Lua arrays are 1-based
-                }
-                table.set_metatable(Some(lua.array_metatable()))?;
-                Ok(mluau::Value::Table(table))
-            }
-            ProxiedLuaValue::Function(func_id) => {
-                let bridge_ref = bridge.clone();
-                let src_plc_ref = src_plc.clone();
-                let func_id = *func_id;
-                struct FunctionIdDtorProxy {
-                    bridge: LuaProxyBridge,
-                    obj_id: ObjectRegistryID,
-                }
-
-                impl mluau::UserData for FunctionIdDtorProxy {}
-                impl Drop for FunctionIdDtorProxy {
-                    fn drop(&mut self) {
-                        self.bridge.request_drop_object(ObjectRegistryType::Function, self.obj_id);
-                    }
-                }
-                let dtor = lua.create_userdata(FunctionIdDtorProxy { bridge: bridge_ref.clone(), obj_id: func_id })?;
-                let func = lua.create_scheduler_async_function(move |lua, args: mluau::MultiValue| {
-                    let bridge = bridge_ref.clone();
-                    let src_plc = src_plc_ref.clone();
-                    let _dtor = dtor.clone(); // dtor gets moved into the async block to keep it alive
-                    async move {
-                        let mut proxied_args = Vec::with_capacity(args.len());
-                        for v in args {
-                            let pv = ProxiedLuaValue::from_lua_value(v, &src_plc, 0)
-                                .map_err(|e| mluau::Error::external(format!("Failed to convert argument to proxied Lua value: {}", e)))?;
-                            proxied_args.push(pv);
-                        }
-
-                        let ret = bridge.call_function(func_id,ValueArgs::Lua(proxied_args)).await
-                            .map_err(|e| mluau::Error::external(format!("Failed to call proxied Lua function: {}", e)))?;
-
-                        let mut lua_rets = mluau::MultiValue::with_capacity(ret.len());
-                        for v in ret {
-                            let lv = v.to_parallel_lua_value(&lua, &bridge, &src_plc, 0)
-                                .map_err(|e| mluau::Error::external(format!("Failed to convert return value to Lua value: {}", e)))?;
-                            lua_rets.push_back(lv);
-                        }
-
-                        Ok(lua_rets)
-                    }
-                })?;
-
-                Ok(mluau::Value::Function(func))
-            }
-            ProxiedLuaValue::Buffer(buf_id) => {
-                pub struct ProxiedBuffer {
-                    bridge: LuaProxyBridge,
-                    src_plc: ProxyLuaClient,
-                    buffer_id: ObjectRegistryID,
-                }
-
-                impl mluau::UserData for ProxiedBuffer {
-                    fn add_methods<M: mluau::UserDataMethods<Self>>(methods: &mut M) {
-                        methods.add_scheduler_async_method("read", |lua, this, ()| {
-                            let bridge = this.bridge.clone();
-                            let buffer_id = this.buffer_id;
-                            async move {
-                                let data = bridge.read_buffer(buffer_id).await
-                                    .map_err(|e| mluau::Error::external(format!("Failed to read proxied buffer: {}", e)))?;
-                                let buf = lua.create_buffer(data)?;
-                                Ok(buf)
-                            }
-                        });
-                    }
-                }
-
-                impl Drop for ProxiedBuffer {
-                    fn drop(&mut self) {
-                        self.bridge.request_drop_object(ObjectRegistryType::Buffer, self.buffer_id);
-                    }
-                }
-
-                let b = lua.create_userdata(ProxiedBuffer { bridge: bridge.clone(), src_plc: src_plc.clone(), buffer_id: *buf_id })?;
-                Ok(mluau::Value::UserData(b))
-            },
-            ProxiedLuaValue::Vector((x, y, z)) => {
-                Ok(mluau::Value::Vector(mluau::Vector::new(*x, *y, *z)))
-            }
-            _ => Err(mluau::Error::external("Cannot convert this ProxiedLuaValue to a parallel Lua value")),
-            /*ProxiedLuaValue::UserData(ud_id) => {
-                let ud = plc.userdata_registry.get(*ud_id)
-                    .ok_or_else(|| mluau::Error::external(format!("UserData ID {} not found in registry", ud_id)))?;
-                Ok(mluau::Value::UserData(ud))
-            }
-            ProxiedLuaValue::Thread(th_id) => {
-                let th = plc.thread_registry.get(*th_id)
-                    .ok_or_else(|| mluau::Error::external(format!("Thread ID {} not found in registry", th_id)))?;
-                Ok(mluau::Value::Thread(th))
-            }*/
-        }
-    }
 }
 
-pub(crate) enum ObjectRegistryType {
+pub enum ObjectRegistryType {
     Function,
     UserData,
     Buffer,
     Thread,
 }
 
-pub(crate) enum LuaProxyBridgeMessage {
+/// Messages sent to the Lua proxy bridge
+pub enum LuaBridgeMessage<T: ProxyBridge> {
     CallFunction {
         func_id: ObjectRegistryID,
-        args: ValueArgs,
+        args: Vec<T::ValueType>,
         resp: Sender<Result<Vec<ProxiedLuaValue>, Error>>,
     },
     ReadBuffer {
@@ -330,24 +201,29 @@ pub(crate) enum LuaProxyBridgeMessage {
         obj_type: ObjectRegistryType,
         obj_id: ObjectRegistryID,
     },
+    IndexUserData {
+        obj_id: ObjectRegistryID,
+        key: T::ValueType,
+        resp: Sender<Result<ProxiedLuaValue, Error>>,
+    },
     Shutdown,
 }
 
-/// Thread safe proxy bridge between Luau and another language
-pub struct LuaProxyBridge {
-    x: UnboundedSender<LuaProxyBridgeMessage>,
+/// Thread safe proxy bridge between Luau and another language's proxy bridge
+pub struct LuaBridge<T: ProxyBridge> {
+    x: UnboundedSender<LuaBridgeMessage<T>>,
     drop: bool,
 }
 
-impl Drop for LuaProxyBridge {
+impl<T: ProxyBridge> Drop for LuaBridge<T> {
     fn drop(&mut self) {
         if self.drop {
-            let _ = self.x.send(LuaProxyBridgeMessage::Shutdown);
+            let _ = self.x.send(LuaBridgeMessage::Shutdown);
         }
     }
 }
 
-impl Clone for LuaProxyBridge {
+impl<T: ProxyBridge> Clone for LuaBridge<T> {
     fn clone(&self) -> Self {
         Self {
             x: self.x.clone(),
@@ -356,17 +232,15 @@ impl Clone for LuaProxyBridge {
     }
 }
 
-impl LuaProxyBridge {
-    // TODO: Implement actual 'server' impl. For now, this is client only
-    
+impl<T: ProxyBridge> LuaBridge<T> {
     /// Creates a new Lua proxy bridge
-    pub(crate) async fn run(plc: ProxyLuaClient, ol: OtherProxyBridges, mut rx: UnboundedReceiver<LuaProxyBridgeMessage>) {
+    pub async fn run(plc: ProxyLuaClient, bridge: T, mut rx: UnboundedReceiver<LuaBridgeMessage<T>>) {
         let mut func_call_queue = FuturesUnordered::new();
         loop {
             tokio::select! {
                 Some(msg) = rx.recv() => {
                     match msg {
-                        LuaProxyBridgeMessage::CallFunction { func_id, args, resp } => {
+                        LuaBridgeMessage::CallFunction { func_id, args, resp } => {
                             let func = match plc.func_registry.get(func_id) {
                                 Some(f) => f,
                                 None => {
@@ -380,12 +254,27 @@ impl LuaProxyBridge {
                                 continue;
                             };
 
-                            let mv = match args.to_lua_value(&lua, &plc, &ol) {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    let _ = resp.send(Err(format!("Failed to convert arguments to Lua values: {}", e).into()));
+                            let mv = {
+                                let mut mv = mluau::MultiValue::with_capacity(args.len());
+                                let mut err = None;
+                                for arg in args {
+                                    match bridge.to_lua_value(&lua, arg, 0) {
+                                        Ok(v) => {
+                                            mv.push_back(v);
+                                        },
+                                        Err(e) => {
+                                            err = Some(e);
+                                            break;
+                                        }
+                                    }
+                                }
+
+                                if let Some(e) = err {
+                                    let _ = resp.send(Err(format!("Failed to convert argument to Lua value: {}", e).into()));
                                     continue;
                                 }
+
+                                mv
                             };
 
                             let th = match lua.create_thread(func) {
@@ -403,7 +292,7 @@ impl LuaProxyBridge {
                                 (result, resp)
                             });
                         }
-                        LuaProxyBridgeMessage::ReadBuffer { buffer_id, resp } => {
+                        LuaBridgeMessage::ReadBuffer { buffer_id, resp } => {
                             let result = (|| {
                                 let buffer = plc.buffer_registry.get(buffer_id)
                                     .ok_or_else(|| format!("Buffer ID {} not found in registry", buffer_id))?;
@@ -411,7 +300,7 @@ impl LuaProxyBridge {
                             })();
                             let _ = resp.send(result);
                         }
-                        LuaProxyBridgeMessage::DropObject { obj_type, obj_id } => {
+                        LuaBridgeMessage::DropObject { obj_type, obj_id } => {
                             match obj_type {
                                 ObjectRegistryType::Function => { plc.func_registry.remove(obj_id); /* Just drop reference */ }
                                 ObjectRegistryType::UserData => { plc.userdata_registry.remove(obj_id); /* Just drop reference */ }
@@ -419,8 +308,23 @@ impl LuaProxyBridge {
                                 ObjectRegistryType::Thread => { plc.thread_registry.remove(obj_id); /* Just drop reference */ }
                             }
                         }
-                        LuaProxyBridgeMessage::Shutdown => {
+                        LuaBridgeMessage::Shutdown => {
                             break;
+                        }
+                        LuaBridgeMessage::IndexUserData { obj_id, key, resp } => {
+                            let result = (|| {
+                                let userdata = plc.userdata_registry.get(obj_id)
+                                    .ok_or_else(|| format!("UserData ID {} not found in registry", obj_id))?;
+                                let Some(lua) = plc.weak_lua.try_upgrade() else {
+                                    return Err("Lua state has been dropped".into());
+                                };
+                                let key_val = bridge.to_lua_value(&lua, key, 0)
+                                    .map_err(|e| format!("Failed to convert key to Lua value: {}", e))?;
+                                let val = userdata.get::<mluau::Value>(key_val)
+                                    .map_err(|e| format!("Failed to index UserData: {}", e))?;
+                                ProxiedLuaValue::from_lua_value(val, &plc, 0)
+                            })();
+                            let _ = resp.send(result);
                         }
                     }
                 }
@@ -465,32 +369,32 @@ impl LuaProxyBridge {
         }
     }
 
-    pub(crate) async fn call_function(&self, func_id: ObjectRegistryID, args: ValueArgs) -> Result<Vec<ProxiedLuaValue>, Error> {
+    /// Calls a Lua function by its ID with the given arguments, returning the results
+    pub async fn call_function(&self, func_id: ObjectRegistryID, args: Vec<T::ValueType>) -> Result<Vec<ProxiedLuaValue>, Error> {
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-        self.x.send(LuaProxyBridgeMessage::CallFunction { func_id, args, resp: resp_tx })
+        self.x.send(LuaBridgeMessage::CallFunction { func_id, args, resp: resp_tx })
             .map_err(|e| format!("Failed to send CallFunction message: {}", e))?;
         resp_rx.await.map_err(|e| format!("Failed to receive CallFunction response: {}", e))?
     }
 
     /// Reads the contents of a Lua buffer by its ID
-    pub(crate) async fn read_buffer(&self, buffer_id: ObjectRegistryID) -> Result<Vec<u8>, Error> {
+    pub async fn read_buffer(&self, buffer_id: ObjectRegistryID) -> Result<Vec<u8>, Error> {
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-        self.x.send(LuaProxyBridgeMessage::ReadBuffer { buffer_id, resp: resp_tx })
+        self.x.send(LuaBridgeMessage::ReadBuffer { buffer_id, resp: resp_tx })
             .map_err(|e| format!("Failed to send ReadBuffer message: {}", e))?;
         resp_rx.await.map_err(|e| format!("Failed to receive ReadBuffer response: {}", e))?
     }
 
     /// Requests that an object be dropped from the registry
-    pub(crate) fn request_drop_object(&self, obj_type: ObjectRegistryType, obj_id: ObjectRegistryID) {
-        let _ = self.x.send(LuaProxyBridgeMessage::DropObject { obj_type, obj_id });
+    pub fn request_drop_object(&self, obj_type: ObjectRegistryType, obj_id: ObjectRegistryID) {
+        let _ = self.x.send(LuaBridgeMessage::DropObject { obj_type, obj_id });
     }
 }
 
 mod asserter {
-    use super::ProxiedLuaValue;
-    use super::LuaProxyBridge;
+    use super::LuaBridge;
 
     const fn assert_send_const<T: Send>() {}
-    const _: () = assert_send_const::<ProxiedLuaValue>(); 
-    const _: () = assert_send_const::<LuaProxyBridge>();
+    //const _: () = assert_send_const::<LuaBridge<crate::deno::bridge::V8ProxyBridge>>(); 
+    //const _: () = assert_send_const::<LuaBridge<crate::base::quickjs::bridge::QuickJSProxyBridge>>();
 }
