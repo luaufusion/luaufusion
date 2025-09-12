@@ -25,7 +25,7 @@ use crate::base::luau::{LuaProxyBridge, ObjectRegistryType, ProxiedLuaValue};
 use crate::base::ValueArgs;
 use crate::deno::extension::ExtensionTrait;
 
-use crate::base::{StringAtomList, ObjectRegistry, deno::{ProxiedV8Value, ProxyV8Client}};
+use crate::base::{StringAtomList, ObjectRegistry, deno::{ProxiedV8Value, ProxyV8Client}, ObjectRegistryID};
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
@@ -172,7 +172,7 @@ pub struct V8IsolateManagerInner {
 
 #[derive(Clone)]
 pub struct FinalizerAttachments {
-    func_ids: FinalizerList<i32>,
+    func_ids: FinalizerList<ObjectRegistryID>,
 }
 
 pub const MAX_PROXY_DEPTH: usize = 10;
@@ -268,7 +268,7 @@ impl V8IsolateManagerInner {
                 let obj = local_template.new_instance(scope).ok_or("Failed to create V8 object")?;
                 obj.set_internal_field(0, external.into());
 
-                let func_id_val = v8::Integer::new(scope, func_id);
+                let func_id_val = v8::BigInt::new_from_i64(scope, func_id.get());
                 let func_id_key = v8::String::new(scope, "__funcId").ok_or("Failed to create function ID string")?;
                 obj.set(scope, func_id_key.into(), func_id_val.into());
                                 
@@ -471,7 +471,7 @@ pub(crate) enum V8IsolateManagerMessage {
         resp: tokio::sync::oneshot::Sender<Result<ProxiedV8Value, Error>>,
     },
     GetObjectProperty {
-        obj_id: i32,
+        obj_id: ObjectRegistryID,
         key: ProxiedLuaValue,
         resp: tokio::sync::oneshot::Sender<Result<ProxiedV8Value, Error>>,
     },
@@ -479,7 +479,7 @@ pub(crate) enum V8IsolateManagerMessage {
 
 /// Internal manager for a single V8 isolate with a minimal Deno runtime.
 #[derive(Clone)]
-pub enum V8IsolateManager {
+pub(crate) enum V8IsolateManager {
     Threaded {
         tx: tokio::sync::mpsc::UnboundedSender<V8IsolateManagerMessage>,
         threadsafe_handle: deno_core::v8::IsolateHandle,
@@ -488,6 +488,10 @@ pub enum V8IsolateManager {
     Local {
         tx: tokio::sync::mpsc::UnboundedSender<V8IsolateManagerMessage>,
         threadsafe_handle: deno_core::v8::IsolateHandle,
+    },
+    Process {
+        cmd: Vec<String>,
+        tx: tokio::sync::mpsc::UnboundedSender<V8IsolateManagerMessage>,
     }
 }
 
@@ -802,6 +806,9 @@ impl V8IsolateManager {
             V8IsolateManager::Local { tx, .. } => {
                 tx.send(msg).map_err(|_| "Failed to send message to isolate manager".to_string().into())
             }
+            V8IsolateManager::Process { tx, .. } => {
+                tx.send(msg).map_err(|_| "Failed to send message to isolate process manager".to_string().into())
+            }
         }
     }
 
@@ -876,7 +883,7 @@ impl V8IsolateManager {
 fn __luadispatch(
     #[state] state: &CommonState,
     scope: &mut v8::HandleScope,
-    func_id: i32,
+    #[bigint] func_id: i64,
     args: v8::Local<v8::Array>,
 ) -> Result<i32, deno_error::JsErrorBox> {
     let mut args_proxied = Vec::with_capacity(args.length() as usize);
@@ -895,7 +902,7 @@ fn __luadispatch(
     let bridge = state.bridge.clone();
     funcs.insert(run_id, FunctionRunState::Created {
         fut: Box::pin(async move { 
-            bridge.call_function(func_id, ValueArgs::V8(args_proxied)).await
+            bridge.call_function(ObjectRegistryID::from_i64(func_id), ValueArgs::V8(args_proxied)).await
         })
     });
     Ok(run_id)

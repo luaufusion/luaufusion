@@ -22,6 +22,7 @@ deno_error = { version = "0.7", optional = true }
 deno_console = { version = "0.214", optional = true }
 thiserror = { version = "2", optional = true }
 base64-simd = { version = "0.8", optional = true }
+ipc-channel = { version = "0.20", features = ["async"] }
 
 [features]
 default = ["rquickjs", "deno"]

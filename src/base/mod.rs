@@ -2,7 +2,7 @@ pub mod luau;
 #[cfg(feature = "deno")]
 pub mod deno;
 
-use std::{cell::RefCell, collections::{HashMap, HashSet}, rc::Rc, sync::{Arc, Mutex, RwLock}};
+use std::{cell::RefCell, collections::{HashMap, HashSet}, fmt::Display, rc::Rc, sync::{Arc, Mutex}};
 
 #[cfg(feature = "deno")]
 use crate::deno::V8IsolateManager;
@@ -61,6 +61,40 @@ impl StringAtomList {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+/// An ID for an object in the object registry
+pub(crate) struct ObjectRegistryID(i64);
+
+impl ObjectRegistryID {
+    pub fn get(&self) -> i64 {
+        self.0
+    }
+
+    pub fn from_i64(id: i64) -> Self {
+        Self(id)
+    }
+}
+
+impl std::fmt::Display for ObjectRegistryID {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::ops::Add<i32> for ObjectRegistryID {
+    type Output = Self;
+
+    fn add(self, rhs: i32) -> Self::Output {
+        ObjectRegistryID(self.0 + rhs as i64)
+    }
+}
+
+impl std::ops::AddAssign<i32> for ObjectRegistryID {
+    fn add_assign(&mut self, rhs: i32) {
+        self.0 += rhs as i64;
+    }
+}
+
 #[derive(Clone)]
 /// A list of objects that can be called from another language
 /// 
@@ -68,7 +102,12 @@ impl StringAtomList {
 /// 
 /// Use ObjectRegistrySend for thread safe version
 pub(crate) struct ObjectRegistry<T: Clone + PartialEq> {
-    objs: Rc<RefCell<HashMap<i32, (T, usize)>>>,   
+    objs: Rc<RefCell<HashMap<ObjectRegistryID, (T, usize)>>>,  
+
+    // If a obj ID is created, then removed, then the length may no longer
+    // be reliable for ID generation / may lead to objects being overwritten
+    // or no longer existing
+    current_id: Rc<RefCell<ObjectRegistryID>>, 
 }
 
 impl<T: Clone + PartialEq> ObjectRegistry<T> {
@@ -76,13 +115,14 @@ impl<T: Clone + PartialEq> ObjectRegistry<T> {
     pub fn new() -> Self {
         Self {
             objs: Rc::new(RefCell::new(HashMap::new())),
+            current_id: Rc::new(RefCell::new(ObjectRegistryID(0))),
         }
     }
 
     /// Registers a new object and returns its ID
     /// 
     /// This will try to reuse existing objects and return their ID if found
-    pub fn add(&self, obj: T) -> Option<i32> {
+    pub fn add(&self, obj: T) -> Option<ObjectRegistryID> {
         let mut objs = self.objs.borrow_mut();
         for (id, (f, count)) in objs.iter_mut() {
             if f == &obj {
@@ -90,7 +130,11 @@ impl<T: Clone + PartialEq> ObjectRegistry<T> {
                 return Some(*id);
             }
         }
-        let obj_id = objs.len() as i32 + 1;
+        let obj_id = {
+            let mut id = self.current_id.borrow_mut();
+            *id += 1;
+            *id
+        };
         if objs.len() >= MAX_OBJECT_REGISTRY_SIZE {
             return None;
         }
@@ -99,13 +143,13 @@ impl<T: Clone + PartialEq> ObjectRegistry<T> {
     }
 
     /// Gets a object by its ID
-    pub fn get(&self, obj_id: i32) -> Option<T> {
+    pub fn get(&self, obj_id: ObjectRegistryID) -> Option<T> {
         let objs = self.objs.borrow();
         objs.get(&obj_id).cloned().map(|(obj, _)| obj)
     }
 
     /// Remove a object by its ID
-    pub fn remove(&self, obj_id: i32) {
+    pub fn remove(&self, obj_id: ObjectRegistryID) {
         let mut objs = self.objs.borrow_mut();
         if let Some((_, count)) = objs.get_mut(&obj_id) {
             if *count > 1 {

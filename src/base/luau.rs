@@ -5,7 +5,7 @@ use mluau::{LuaSerdeExt, WeakLua};
 use tokio::sync::{mpsc::{UnboundedReceiver, UnboundedSender}, oneshot::Sender};
 use crate::base::OtherProxyBridges;
 
-use super::{StringAtom, StringAtomList, MAX_PROXY_DEPTH, ObjectRegistry, ValueArgs};
+use super::{StringAtom, StringAtomList, MAX_PROXY_DEPTH, ObjectRegistry, ValueArgs, ObjectRegistryID};
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
@@ -31,11 +31,11 @@ pub(crate) enum ProxiedLuaValue {
     String(StringAtom), // To avoid large amounts of copying, we store strings in a separate atom list
     Table(Vec<(ProxiedLuaValue, ProxiedLuaValue)>),
     Array(Vec<ProxiedLuaValue>),
-    Function(i32), // Function ID in the function registry
-    UserData(i32), // UserData ID in the userdata registry
+    Function(ObjectRegistryID), // Function ID in the function registry
+    UserData(ObjectRegistryID), // UserData ID in the userdata registry
     Vector((f32, f32, f32)),
-    Buffer(i32), // Buffer ID in the buffer registry
-    Thread(i32), // Thread ID in the thread registry
+    Buffer(ObjectRegistryID), // Buffer ID in the buffer registry
+    Thread(ObjectRegistryID), // Thread ID in the thread registry
 }
 
 impl ProxiedLuaValue {
@@ -222,7 +222,7 @@ impl ProxiedLuaValue {
                 let func_id = *func_id;
                 struct FunctionIdDtorProxy {
                     bridge: LuaProxyBridge,
-                    obj_id: i32,
+                    obj_id: ObjectRegistryID,
                 }
 
                 impl mluau::UserData for FunctionIdDtorProxy {}
@@ -264,7 +264,7 @@ impl ProxiedLuaValue {
                 pub struct ProxiedBuffer {
                     bridge: LuaProxyBridge,
                     src_plc: ProxyLuaClient,
-                    buffer_id: i32,
+                    buffer_id: ObjectRegistryID,
                 }
 
                 impl mluau::UserData for ProxiedBuffer {
@@ -318,17 +318,17 @@ pub(crate) enum ObjectRegistryType {
 
 pub(crate) enum LuaProxyBridgeMessage {
     CallFunction {
-        func_id: i32,
+        func_id: ObjectRegistryID,
         args: ValueArgs,
         resp: Sender<Result<Vec<ProxiedLuaValue>, Error>>,
     },
     ReadBuffer {
-        buffer_id: i32,
+        buffer_id: ObjectRegistryID,
         resp: Sender<Result<Vec<u8>, Error>>,
     },
     DropObject {
         obj_type: ObjectRegistryType,
-        obj_id: i32,
+        obj_id: ObjectRegistryID,
     },
     Shutdown,
 }
@@ -465,7 +465,7 @@ impl LuaProxyBridge {
         }
     }
 
-    pub(crate) async fn call_function(&self, func_id: i32, args: ValueArgs) -> Result<Vec<ProxiedLuaValue>, Error> {
+    pub(crate) async fn call_function(&self, func_id: ObjectRegistryID, args: ValueArgs) -> Result<Vec<ProxiedLuaValue>, Error> {
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
         self.x.send(LuaProxyBridgeMessage::CallFunction { func_id, args, resp: resp_tx })
             .map_err(|e| format!("Failed to send CallFunction message: {}", e))?;
@@ -473,7 +473,7 @@ impl LuaProxyBridge {
     }
 
     /// Reads the contents of a Lua buffer by its ID
-    pub(crate) async fn read_buffer(&self, buffer_id: i32) -> Result<Vec<u8>, Error> {
+    pub(crate) async fn read_buffer(&self, buffer_id: ObjectRegistryID) -> Result<Vec<u8>, Error> {
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
         self.x.send(LuaProxyBridgeMessage::ReadBuffer { buffer_id, resp: resp_tx })
             .map_err(|e| format!("Failed to send ReadBuffer message: {}", e))?;
@@ -481,7 +481,7 @@ impl LuaProxyBridge {
     }
 
     /// Requests that an object be dropped from the registry
-    pub(crate) fn request_drop_object(&self, obj_type: ObjectRegistryType, obj_id: i32) {
+    pub(crate) fn request_drop_object(&self, obj_type: ObjectRegistryType, obj_id: ObjectRegistryID) {
         let _ = self.x.send(LuaProxyBridgeMessage::DropObject { obj_type, obj_id });
     }
 }

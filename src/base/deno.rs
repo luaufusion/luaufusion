@@ -1,6 +1,12 @@
-use super::{ObjectRegistry, StringAtom, StringAtomList};
+use super::{ObjectRegistry, StringAtom, StringAtomList, ObjectRegistryID};
 use crate::deno::{Error, V8IsolateManager, MAX_PROXY_DEPTH};
 use deno_core::v8;
+
+pub(crate) enum V8ObjRegistryType {
+    Object,
+    Function,
+    Promise,
+}
 
 /// A V8 value that can now be easily proxied to Luau
 pub(crate) enum ProxiedV8Value {
@@ -11,10 +17,10 @@ pub(crate) enum ProxiedV8Value {
     Number(f64),
     String(StringAtom), // To avoid large amounts of copying, we store strings in a separate atom list
     Buffer(Vec<u8>), // Binary data
-    Object(i32), // Object ID in the map registry
+    Object(ObjectRegistryID), // Object ID in the map registry
     Array(Vec<ProxiedV8Value>),
-    Function(i32), // Function ID in the function registry
-    Promise(i32), // Promise ID in the function registry
+    Function(ObjectRegistryID), // Function ID in the function registry
+    Promise(ObjectRegistryID), // Promise ID in the function registry
 }
 
 impl ProxiedV8Value {
@@ -37,6 +43,18 @@ impl ProxiedV8Value {
                 }
                 Ok(mluau::Value::Table(tbl))
             },
+            /*ProxiedV8Value::Object(obj_id) => {
+                struct V8ProxiedObject {
+                    obj_id: i32,
+                    bridge: V8IsolateManager,
+                }
+
+                impl Drop for V8ProxiedObject {
+                    fn drop(&mut self) {
+                        //self.bridge.(self.obj_id);
+                    }
+                }
+            }*/
             _ => Err(mluau::Error::external("Unsupported V8 value type for proxying to Lua")),
         }
     }
