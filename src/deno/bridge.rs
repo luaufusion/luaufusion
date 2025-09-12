@@ -46,7 +46,7 @@ pub enum ProxiedV8Value {
 }
 
 impl ProxiedV8Value {
-    pub(crate) fn proxy_to_lua(self, lua: &mluau::Lua, bridge: &V8IsolateManager, plc: &ProxyLuaClient, depth: usize) -> Result<mluau::Value, mluau::Error> {
+    pub(crate) fn proxy_to_src_lua(self, lua: &mluau::Lua, bridge: &V8IsolateManager, plc: &ProxyLuaClient, depth: usize) -> Result<mluau::Value, mluau::Error> {
         if depth > MAX_PROXY_DEPTH {
             return Err(mluau::Error::external("Maximum proxy depth exceeded"));
         }
@@ -65,7 +65,7 @@ impl ProxiedV8Value {
             ProxiedV8Value::Array(elems) => {
                 let tbl = lua.create_table_with_capacity(elems.len(), 0)?;
                 for elem in elems {
-                    tbl.raw_push(elem.proxy_to_lua(lua, bridge, plc, depth + 1)?)?;
+                    tbl.raw_push(elem.proxy_to_src_lua(lua, bridge, plc, depth + 1)?)?;
                 }
                 Ok(mluau::Value::Table(tbl))
             },
@@ -566,6 +566,6 @@ impl ProxyBridge for V8IsolateManager {
     type ValueType = ProxiedV8Value;
 
     fn to_source_lua_value(&self, lua: &mluau::Lua, value: Self::ValueType, plc: &ProxyLuaClient, depth: usize) -> Result<mluau::Value, Error> {
-        Ok(value.proxy_to_lua(lua, self, plc, depth).map_err(|e| e.to_string())?)
+        Ok(value.proxy_to_src_lua(lua, self, plc, depth).map_err(|e| e.to_string())?)
     }
 }

@@ -20,7 +20,7 @@ pub enum ParallelLuaProxiedValue {
 impl ParallelLuaProxiedValue {
     /// Convert a proxied parallel Lua value to a Lua value
     /// on the source Lua state (not the proxied one)
-    pub fn to_lua_value(
+    pub fn to_src_lua_value(
         &self, 
         lua: &mluau::Lua, 
         bridge: &ParallelLuaProxyBridge, 
@@ -39,8 +39,8 @@ impl ParallelLuaProxiedValue {
             ParallelLuaProxiedValue::Table(entries) => {
                 let table = lua.create_table()?;
                 for (k, v) in entries {
-                    let lua_k = k.to_lua_value(lua, bridge, plc, depth + 1)?;
-                    let lua_v = v.to_lua_value(lua, bridge, plc, depth + 1)?;
+                    let lua_k = k.to_src_lua_value(lua, bridge, plc, depth + 1)?;
+                    let lua_v = v.to_src_lua_value(lua, bridge, plc, depth + 1)?;
                     table.raw_set(lua_k, lua_v)?;
                 }
                 Ok(mluau::Value::Table(table))
@@ -48,7 +48,7 @@ impl ParallelLuaProxiedValue {
             ParallelLuaProxiedValue::Array(elements) => {
                 let table = lua.create_table_with_capacity(elements.len(), 0)?;
                 for (i, v) in elements.iter().enumerate() {
-                    let lua_v = v.to_lua_value(lua, bridge, plc, depth + 1)?;
+                    let lua_v = v.to_src_lua_value(lua, bridge, plc, depth + 1)?;
                     table.raw_set(i + 1, lua_v)?; // Lua arrays are 1-based
                 }
                 table.set_metatable(Some(lua.array_metatable()))?;
@@ -88,6 +88,6 @@ impl ProxyBridge for ParallelLuaProxyBridge {
     type ValueType = ParallelLuaProxiedValue;
     
     fn to_source_lua_value(&self, lua: &mluau::Lua, value: Self::ValueType, plc: &ProxyLuaClient, depth: usize) -> Result<mluau::Value, crate::base::Error> {
-        return Ok(value.to_lua_value(lua, self, plc, depth).map_err(|x| x.to_string())?)
+        return Ok(value.to_src_lua_value(lua, self, plc, depth).map_err(|x| x.to_string())?)
     }
 }
