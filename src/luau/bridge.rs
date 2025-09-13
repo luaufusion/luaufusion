@@ -124,7 +124,7 @@ impl ProxiedLuaValue {
     /// This may fail if the Lua state is no longer valid
     /// 
     /// Not used directly in the bridge, but useful for testing
-    pub fn convert_to_lua_value(&self, lua: &mluau::Lua, plc: &ProxyLuaClient, depth: usize) -> mluau::Result<mluau::Value> {
+    pub fn convert_to_lua_value(&self, lua: &mluau::Lua, plc: &ProxyLuaClient) -> mluau::Result<mluau::Value> {
         match self {
             ProxiedLuaValue::Nil => Ok(mluau::Value::Nil),
             ProxiedLuaValue::Boolean(b) => Ok(mluau::Value::Boolean(*b)),
@@ -137,8 +137,8 @@ impl ProxiedLuaValue {
             ProxiedLuaValue::Table(entries) => {
                 let table = lua.create_table()?;
                 for (k, v) in entries {
-                    let lua_k = k.convert_to_lua_value(lua, plc, depth + 1)?;
-                    let lua_v = v.convert_to_lua_value(lua, plc, depth + 1)?;
+                    let lua_k = k.convert_to_lua_value(lua, plc)?;
+                    let lua_v = v.convert_to_lua_value(lua, plc)?;
                     table.raw_set(lua_k, lua_v)?;
                 }
                 Ok(mluau::Value::Table(table))
@@ -146,7 +146,7 @@ impl ProxiedLuaValue {
             ProxiedLuaValue::Array(elements) => {
                 let table = lua.create_table_with_capacity(elements.len(), 0)?;
                 for (i, v) in elements.iter().enumerate() {
-                    let lua_v = v.convert_to_lua_value(lua, plc, depth + 1)?;
+                    let lua_v = v.convert_to_lua_value(lua, plc)?;
                     table.raw_set(i + 1, lua_v)?; // Lua arrays are 1-based
                 }
                 table.set_metatable(Some(lua.array_metatable()))?;

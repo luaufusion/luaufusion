@@ -1,6 +1,8 @@
+pub mod concurrency;
+
 use std::{cell::RefCell, collections::{HashMap, HashSet}, rc::Rc, sync::{Arc, Mutex}};
 
-use crate::luau::bridge::ProxyLuaClient;
+use crate::luau::bridge::{ProxiedLuaValue, ProxyLuaClient};
 
 pub const MAX_INTERN_SIZE: usize = 1024 * 512; // 512 KB
 pub const MAX_OBJECT_REGISTRY_SIZE: usize = 1024; // 1024 objects
@@ -156,11 +158,15 @@ impl<T: Clone + PartialEq> ObjectRegistry<T> {
     }
 }
 
+#[allow(async_fn_in_trait)]
 pub trait ProxyBridge: Send + Sync + Clone {
     type ValueType: Send + Sync;
 
     /// Convert a value from the foreign language to a proxied value
     fn to_source_lua_value(&self, lua: &mluau::Lua, value: Self::ValueType, plc: &ProxyLuaClient, depth: usize) -> Result<mluau::Value, Error>;
+
+    /// Evaluates code (string) from the source Luau to the foreign language
+    async fn eval_from_source(&self, code: &str, args: Vec<ProxiedLuaValue>) -> Result<Self::ValueType, Error>;
 }
 
 mod asserter {

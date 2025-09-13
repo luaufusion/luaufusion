@@ -568,4 +568,8 @@ impl ProxyBridge for V8IsolateManager {
     fn to_source_lua_value(&self, lua: &mluau::Lua, value: Self::ValueType, plc: &ProxyLuaClient, depth: usize) -> Result<mluau::Value, Error> {
         Ok(value.proxy_to_src_lua(lua, self, plc, depth).map_err(|e| e.to_string())?)
     }
+
+    async fn eval_from_source(&self, code: &str, args: Vec<ProxiedLuaValue>) -> Result<Self::ValueType, crate::base::Error> {
+        self.eval(code, args).await
+    }
 }

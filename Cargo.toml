@@ -7,7 +7,7 @@ edition = "2024"
 mlua_scheduler = { git = "https://github.com/mluau/scheduler", version = "1.0.0" }
 mluau = { git = "https://github.com/mluau/mluau", version = "0.11.2", features = ["serde"] }
 
-tokio = "1.47.1"
+tokio = { version = "1.47.1", features = ["full", "process"] }
 tokio-util = "0.7"
 futures-util = "0.3"
 rand = "0.9"
@@ -20,7 +20,8 @@ deno_error = { version = "0.7", optional = true }
 deno_console = { version = "0.214", optional = true }
 thiserror = { version = "2", optional = true }
 base64-simd = { version = "0.8", optional = true }
-ipc-channel = { version = "0.20", features = ["async"] }
+remoc = { version = "0.18", features = [] }
+tempfile = "3"
 
 [features]
 default = ["deno"]

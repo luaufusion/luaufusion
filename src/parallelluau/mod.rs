@@ -90,4 +90,8 @@ impl ProxyBridge for ParallelLuaProxyBridge {
     fn to_source_lua_value(&self, lua: &mluau::Lua, value: Self::ValueType, plc: &ProxyLuaClient, depth: usize) -> Result<mluau::Value, crate::base::Error> {
         return Ok(value.to_src_lua_value(lua, self, plc, depth).map_err(|x| x.to_string())?)
     }
+
+    async fn eval_from_source(&self, _code: &str, _args: Vec<crate::luau::bridge::ProxiedLuaValue>) -> Result<Self::ValueType, crate::base::Error> {
+        Err("Not implemented".into())
+    }
 }
