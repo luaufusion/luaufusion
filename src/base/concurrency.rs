@@ -275,6 +275,9 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
                 return Err("Timed out waiting for process to connect".into());
             }
             res = unix_listener.accept() => res?,
+            _ = proc_handle.wait() => {
+                return Err("Process exited before connecting".into());
+            }
         };
         let addr_pathname = match addr.as_pathname() {
             Some(p) => p.to_owned(),
