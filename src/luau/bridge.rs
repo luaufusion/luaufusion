@@ -15,6 +15,7 @@ pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub struct ProxyLuaClient {
     pub weak_lua: WeakLua,
     pub atom_list: StringAtomList,
+    pub table_registry: ObjectRegistry<mluau::Table>,
     pub func_registry: ObjectRegistry<mluau::Function>,
     pub thread_registry: ObjectRegistry<mluau::Thread>,
     pub userdata_registry: ObjectRegistry<mluau::AnyUserData>,
@@ -28,7 +29,7 @@ pub enum ProxiedLuaValue {
     Integer(i64),
     Number(f64),
     String(StringAtom), // To avoid large amounts of copying, we store strings in a separate atom list
-    Table(Vec<(ProxiedLuaValue, ProxiedLuaValue)>),
+    Table(ObjectRegistryID), // Table ID in the table registry
     Array(Vec<ProxiedLuaValue>),
     Function(ObjectRegistryID), // Function ID in the function registry
     UserData(ObjectRegistryID), // UserData ID in the userdata registry
@@ -70,18 +71,10 @@ impl ProxiedLuaValue {
                     return Ok(ProxiedLuaValue::Array(elements));
                 }
 
-                let mut entries = Vec::new();
-                t.for_each(|k, v| {
-                    let pk = ProxiedLuaValue::from_lua_value(k, plc, depth + 1)
-                        .map_err(|e| mluau::Error::external(format!("Failed to convert table key: {}", e)))?;
-                    let pv = ProxiedLuaValue::from_lua_value(v, plc, depth + 1)
-                        .map_err(|e| mluau::Error::external(format!("Failed to convert table value: {}", e)))?;
-                    entries.push((pk, pv));
-                    Ok(())
-                })
-                .map_err(|e| format!("Failed to iterate table: {}", e))?;
+                let table_id = plc.table_registry.add(t)
+                    .ok_or_else(|| "Table registry is full".to_string())?;
 
-                ProxiedLuaValue::Table(entries)
+                ProxiedLuaValue::Table(table_id)
             }
             mluau::Value::Function(f) => {
                 let func_id = plc.func_registry.add(f)
@@ -135,12 +128,8 @@ impl ProxiedLuaValue {
                 Ok(mluau::Value::String(s))
             }
             ProxiedLuaValue::Table(entries) => {
-                let table = lua.create_table()?;
-                for (k, v) in entries {
-                    let lua_k = k.convert_to_lua_value(lua, plc)?;
-                    let lua_v = v.convert_to_lua_value(lua, plc)?;
-                    table.raw_set(lua_k, lua_v)?;
-                }
+                let table = plc.table_registry.get(*entries)
+                    .ok_or_else(|| mluau::Error::external(format!("Table ID {} not found in registry", entries)))?;
                 Ok(mluau::Value::Table(table))
             }
             ProxiedLuaValue::Array(elements) => {
@@ -180,6 +169,7 @@ impl ProxiedLuaValue {
 }
 
 pub enum ObjectRegistryType {
+    Table,
     Function,
     UserData,
     Buffer,
@@ -302,6 +292,7 @@ impl<T: ProxyBridge> LuaBridge<T> {
                         }
                         LuaBridgeMessage::DropObject { obj_type, obj_id } => {
                             match obj_type {
+                                ObjectRegistryType::Table => { plc.table_registry.remove(obj_id); /* Just drop reference */ }
                                 ObjectRegistryType::Function => { plc.func_registry.remove(obj_id); /* Just drop reference */ }
                                 ObjectRegistryType::UserData => { plc.userdata_registry.remove(obj_id); /* Just drop reference */ }
                                 ObjectRegistryType::Buffer => { plc.buffer_registry.remove(obj_id); /* Just drop reference */ }

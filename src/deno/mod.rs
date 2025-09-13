@@ -3,7 +3,6 @@
 pub mod bridge;
 
 use crate::deno::bridge::V8IsolateManager;
-use crate::MAX_PROXY_DEPTH;
 
 pub(crate) mod extension;
 pub(crate) mod base64_ops;
@@ -18,7 +17,7 @@ use deno_core::v8::CreateParams;
 use deno_core::{op2, v8, Extension, OpState};
 use tokio_util::sync::CancellationToken;
 
-use crate::luau::bridge::{LuaBridge, ObjectRegistryType, ProxiedLuaValue};
+use crate::luau::bridge::{LuaBridge, ProxiedLuaValue};
 use crate::deno::extension::ExtensionTrait;
 
 use crate::base::{StringAtomList, ObjectRegistry, ObjectRegistryID};
@@ -171,199 +170,7 @@ pub struct FinalizerAttachments {
     func_ids: FinalizerList<ObjectRegistryID>,
 }
 
-impl V8IsolateManagerInner {
-    /// Proxy a ProxiedLuaValue to a V8 value
-    pub fn proxy_to_v8_impl(&mut self, value: ProxiedLuaValue) -> Result<v8::Global<v8::Value>, Error> {
-        let v8_ctx = self.deno.main_context();
-        let isolate = self.deno.v8_isolate();
-
-        let v8_value = {
-            let mut scope = v8::HandleScope::new(isolate);
-            let v8_ctx = v8::Local::new(&mut scope, v8_ctx);
-            let scope = &mut v8::ContextScope::new(&mut scope, v8_ctx);
-            match Self::proxy_to_v8(scope, &self.common_state, value, 0) {
-                Ok(v) => Ok(v8::Global::new(scope, v)),
-                Err(e) => Err(e),
-            }
-        };
-
-        println!("Proxied Lua value to V8");
-        
-        v8_value
-    }
-
-    // Internal implementation to convert a ProxiedLuaValue to a V8 value
-    fn proxy_to_v8<'s>(
-        scope: &mut v8::HandleScope<'s>, 
-        common_state: &CommonState,
-        value: ProxiedLuaValue,
-        depth: usize,
-    ) -> Result<v8::Local<'s, v8::Value>, Error> {
-        if depth > MAX_PROXY_DEPTH {
-            return Err("Maximum proxy depth exceeded".into());
-        }
-
-        let v8_value: v8::Local<v8::Value> = match value {
-            ProxiedLuaValue::Nil => v8::null(scope).into(),
-            ProxiedLuaValue::Boolean(b) => v8::Boolean::new(scope, b).into(),
-            ProxiedLuaValue::Integer(i) => {
-                if i >= i32::MIN as i64 && i <= i32::MAX as i64 {
-                    v8::Integer::new(scope, i as i32).into()
-                } else {
-                    v8::Number::new(scope, i as f64).into()
-                }
-            },
-            ProxiedLuaValue::Number(n) => v8::Number::new(scope, n).into(),
-            ProxiedLuaValue::Vector((x,y,z)) => {
-                let arr = v8::Array::new(scope, 3);
-                let x = v8::Number::new(scope, x as f64);
-                let y = v8::Number::new(scope, y as f64);
-                let z = v8::Number::new(scope, z as f64);
-                arr.set_index(scope, 0, x.into());
-                arr.set_index(scope, 1, y.into());
-                arr.set_index(scope, 2, z.into());
-                arr.into()
-            },
-            ProxiedLuaValue::String(atom) => {
-                let atom_bytes = atom.to_bytes();
-                let s = std::str::from_utf8(&atom_bytes).map_err(|e| format!("Failed to convert string atom to UTF-8: {}", e))?;
-                v8::String::new(scope, s).ok_or("Failed to create V8 string")?.into()
-            }
-            ProxiedLuaValue::Array(elems) => {
-                if elems.len() > i32::MAX as usize {
-                    return Err("Array too large to proxy to V8".into());
-                }
-                let arr = v8::Array::new(scope, elems.len() as i32);
-                for (i, elem) in elems.into_iter().enumerate() {
-                    let v8_elem = Self::proxy_to_v8(scope, common_state, elem, depth + 1)?;
-                    arr.set_index(scope, i as u32, v8_elem);
-                }
-                arr.into()
-            }
-            ProxiedLuaValue::Table(elems) => {
-                let obj = v8::Object::new(scope);
-                for (k, v) in elems {
-                    let k = Self::proxy_to_v8(scope, common_state, k, depth + 1)?;
-                    let v = Self::proxy_to_v8(scope, common_state, v, depth + 1)?;
-                    obj.set(scope, k, v);
-                }
-                obj.into()
-            }
-            ProxiedLuaValue::Function(func_id) => {
-                let obj_template = common_state.obj_template.clone();
-                
-                let local_template = v8::Local::new(scope, (*obj_template).clone());
-                
-                let bridge_ref = common_state.bridge.clone();
-                let external = common_state.finalizer_attachments.func_ids.add(scope, func_id, Some(Box::new(move || {
-                    bridge_ref.request_drop_object(ObjectRegistryType::Function, func_id);
-                })))
-                    .ok_or("Maximum number of function references reached")?;
-
-                let obj = local_template.new_instance(scope).ok_or("Failed to create V8 object")?;
-                obj.set_internal_field(0, external.into());
-
-                let func_id_val = v8::BigInt::new_from_i64(scope, func_id.get());
-                let func_id_key = v8::String::new(scope, "__funcId").ok_or("Failed to create function ID string")?;
-                obj.set(scope, func_id_key.into(), func_id_val.into());
-                                
-                let code = r#"
-                    (function(dataToCapture) {
-                        let func = async function(...args) {
-                            let funcId = dataToCapture.__funcId;
-                            console.log("Calling Lua function with ID", funcId);
-                            let runId = Deno.core.ops.__luadispatch(funcId, args);
-                            await Deno.core.ops.__luarun(runId);
-                            let ret = Deno.core.ops.__luaresult(runId);
-                            if (Array.isArray(ret) && ret.length <= 1) {
-                                return ret[0]; // Cast to single value due to lua multivalue things
-                            }
-                            return ret;
-                        };
-                        func.__funcObj = dataToCapture;
-                        return func;   
-                    })
-                "#;
-
-                let try_catch = &mut v8::TryCatch::new(scope);
-
-                let source = v8::String::new(try_catch, code).unwrap();
-                let script = match v8::Script::compile(try_catch, source, None) {
-                    Some(s) => s,
-                    None => {
-                        if try_catch.has_caught() {
-                            let exception = try_catch.exception().unwrap();
-                            let exception_string = exception.to_rust_string_lossy(try_catch);
-                            return Err(format!("Failed to compile function proxy script: {}", exception_string).into());
-                        }
-                        return Err("Failed to compile function proxy script".into())
-                    },
-                };
-                let result = script.run(try_catch).unwrap();
-                let creator_fn: v8::Local<v8::Function> = result.try_into().unwrap();
-                let global = try_catch.get_current_context().global(try_catch);
-                let result = match creator_fn.call(try_catch, global.into(), &[obj.into()]) {
-                    Some(r) => r,
-                    None => {
-                        if try_catch.has_caught() {
-                            let exception = try_catch.exception().unwrap();
-                            let exception_string = exception.to_rust_string_lossy(try_catch);
-                            return Err(format!("Failed to run function proxy script: {}", exception_string).into());
-                        }
-                        return Err("Failed to run function proxy script".into())
-                    },
-                };
-                let final_closure: v8::Local<v8::Function> = result.try_into().unwrap();
-
-                final_closure.into()
-            }
-            ProxiedLuaValue::Thread(thread_id) => {
-                let obj_template = common_state.obj_template.clone();
-                
-                let local_template = v8::Local::new(scope, (*obj_template).clone());
-                
-                let bridge_ref = common_state.bridge.clone();
-                let external = common_state.finalizer_attachments.func_ids.add(scope, thread_id, Some(Box::new(move || {
-                    bridge_ref.request_drop_object(ObjectRegistryType::Thread, thread_id);
-                })))
-                    .ok_or("Maximum number of thread references reached")?;
-                let obj = local_template.new_instance(scope).ok_or("Failed to create V8 object")?;
-                obj.set_internal_field(0, external.into());
-                obj.into()
-            }
-            ProxiedLuaValue::UserData(ud_id) => {
-                let obj_template = common_state.obj_template.clone();
-                
-                let local_template = v8::Local::new(scope, (*obj_template).clone());
-                
-                let bridge_ref = common_state.bridge.clone();
-                let external = common_state.finalizer_attachments.func_ids.add(scope, ud_id, Some(Box::new(move || {
-                    bridge_ref.request_drop_object(ObjectRegistryType::UserData, ud_id);
-                })))
-                    .ok_or("Maximum number of userdata references reached")?;
-                let obj = local_template.new_instance(scope).ok_or("Failed to create V8 object")?;
-                obj.set_internal_field(0, external.into());
-                obj.into()
-            }
-            ProxiedLuaValue::Buffer(buf_id) => {
-                let obj_template = common_state.obj_template.clone();
-                
-                let local_template = v8::Local::new(scope, (*obj_template).clone());
-                
-                let bridge_ref = common_state.bridge.clone();
-                let external = common_state.finalizer_attachments.func_ids.add(scope, buf_id, Some(Box::new(move || {
-                    bridge_ref.request_drop_object(ObjectRegistryType::Buffer, buf_id);
-                })))
-                    .ok_or("Maximum number of buffer references reached")?;
-                let obj = local_template.new_instance(scope).ok_or("Failed to create V8 object")?;
-                obj.set_internal_field(0, external.into());
-                obj.into()
-            }
-        };
-
-        Ok(v8_value)
-    }
-    
+impl V8IsolateManagerInner {    
     pub fn new(bridge: LuaBridge<V8IsolateManager>, heap_limit: usize) -> Self {
         let heap_limit = heap_limit.max(MIN_HEAP_LIMIT);
 
