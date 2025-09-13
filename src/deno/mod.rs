@@ -2,7 +2,7 @@
 
 pub mod bridge;
 
-use crate::deno::bridge::V8IsolateManager;
+use crate::deno::bridge::{BridgeVals, V8IsolateManager};
 
 pub(crate) mod extension;
 pub(crate) mod base64_ops;
@@ -150,7 +150,8 @@ pub struct CommonState {
     bridge: LuaBridge<V8IsolateManager>,
     obj_template: Rc<v8::Global<v8::ObjectTemplate>>,
     finalizer_attachments: FinalizerAttachments,
-    proxy_client: ProxyV8Client
+    proxy_client: ProxyV8Client,
+    bridge_vals: Rc<BridgeVals>
 }
 
 /// Internal manager for a single V8 isolate with a minimal Deno runtime.
@@ -223,6 +224,12 @@ impl V8IsolateManagerInner {
             v8::Global::new(scope, template)
         });
 
+        let bridge_vals = {
+            let isolate = deno.v8_isolate();
+            let scope = &mut v8::HandleScope::new(isolate);
+            BridgeVals::new(scope)
+        };
+
         let func_ids = FinalizerList::default();
 
         let common_state = CommonState {
@@ -238,6 +245,7 @@ impl V8IsolateManagerInner {
                 obj_registry: ObjectRegistry::new(),
                 promise_registry: ObjectRegistry::new(),
             },
+            bridge_vals: Rc::new(bridge_vals)
         };
 
         deno.op_state().borrow_mut().put(common_state.clone());
@@ -273,7 +281,7 @@ fn __luadispatch(
     let mut args_proxied = Vec::with_capacity(args.length() as usize);
     for i in 0..args.length() {
         let arg = args.get_index(scope, i).ok_or_else(|| deno_error::JsErrorBox::generic(format!("Failed to get argument {}", i)))?;
-        match ProxiedV8Value::proxy_from_v8(scope, arg, &state.proxy_client, 0) {
+        match ProxiedV8Value::proxy_from_v8(scope, arg, &state, 0) {
             Ok(v) => args_proxied.push(v),
             Err(e) => {
                 return Err(deno_error::JsErrorBox::generic(format!("Failed to convert argument {}: {}", i, e)));

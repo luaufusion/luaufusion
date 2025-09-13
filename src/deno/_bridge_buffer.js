@@ -3,7 +3,7 @@
         __luaid: dataToCapture.__luaid,
         __luatype: dataToCapture.__luatype,
         __obj: dataToCapture, // Keep reference to the original object to avoid GC
-        // TODO: implement thread methods
+        // TODO: implement buffer methods
     }
     return obj;   
 })

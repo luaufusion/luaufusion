@@ -1,6 +1,6 @@
 (function(dataToCapture) {
     let func = async function(...args) {
-        let funcId = dataToCapture.__funcId;
+        let funcId = dataToCapture.__luaid;
         console.log("Calling Lua function with ID", funcId);
         let runId = Deno.core.ops.__luadispatch(funcId, args);
         await Deno.core.ops.__luarun(runId);
@@ -10,7 +10,8 @@
         }
         return ret;
     };
-    func.__funcId = dataToCapture.__funcId;
+    func.__luaid = dataToCapture.__luaid;
+    func.__luatype = dataToCapture.__luatype;
     func.__obj = dataToCapture; // Keep reference to the original object to avoid GC
     return func;   
 })

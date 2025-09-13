@@ -168,6 +168,7 @@ impl ProxiedLuaValue {
     }
 }
 
+#[derive(Clone, Copy)]
 pub enum ObjectRegistryType {
     Table,
     Function,
