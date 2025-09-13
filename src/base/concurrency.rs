@@ -233,9 +233,7 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
             generate_random_alphanumeric_string(16)
         };
         let uds_path = tempfile::NamedTempFile::with_suffix(format!("ce{rand_str}.sock"))?;
-        let unix_listener = tokio::net::UnixListener::bind(
-            std::env::temp_dir().join(format!("concurrent_executor_{rand_str}.sock"))
-        )?;
+        let unix_listener = tokio::net::UnixListener::bind(uds_path.path())?;
 
         // Spawn the process here
         // Note that we do not touch stdout/stdin/stderr as the child process
