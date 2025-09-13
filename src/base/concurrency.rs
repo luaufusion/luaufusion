@@ -17,11 +17,14 @@ pub struct ProcessOpts {
     /// The process must then call ConcurrentExecutor::run_process_client to connect
     /// to the parent process
     pub cmd_argv: Vec<String>,
-    pub heap_limit: usize,
-    pub id: String,
+    pub mem_soft_limit: usize,
+    pub mem_hard_limit: usize,
     pub start_timeout: Duration
 }
 
+/// A oneshot sender that can be either local or process
+/// 
+/// This should be used in place of tokio oneshot/remoc directly
 pub enum OneshotSender<T> {
     Local {
         sender: tokio::sync::oneshot::Sender<T>,
@@ -88,6 +91,72 @@ impl<'de, T: Serialize + DeserializeOwned + Send + 'static> Deserialize<'de> for
     }
 }
 
+pub enum OneshotReceiver<T> {
+    Local {
+        receiver: tokio::sync::oneshot::Receiver<T>,
+    },
+    Process {
+        receiver: remoc::rch::oneshot::Receiver<T>,
+    },
+}
+
+impl<T: Serialize + DeserializeOwned + Send + 'static> OneshotReceiver<T> {
+    /// Creates a new local oneshot receiver
+    pub fn new_local(receiver: tokio::sync::oneshot::Receiver<T>) -> Self {
+        Self::Local { receiver }
+    }
+
+    /// Creates a new process oneshot receiver
+    pub fn new_process(receiver: remoc::rch::oneshot::Receiver<T>) -> Self {
+        Self::Process { receiver }
+    }
+
+    /// Receives a value from the oneshot receiver
+    pub async fn recv(self) -> Result<T, crate::base::Error> {
+        match self {
+            Self::Local { receiver } => {
+                match receiver.await {
+                    Ok(value) => Ok(value),
+                    Err(e) => Err(format!("Failed to receive value from local oneshot receiver: {}", e.to_string()).into()),
+                }
+            }
+            Self::Process { receiver } => {
+                match receiver.await {
+                    Ok(value) => Ok(value),
+                    Err(e) => Err(format!("Failed to receive value from process oneshot receiver: {}", e.to_string()).into()),
+                }
+            }
+        }
+    }
+}
+
+impl<T: Serialize + DeserializeOwned + Send + 'static> Serialize for OneshotReceiver<T> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Local { .. } => {
+                Err(serde::ser::Error::custom("Cannot serialize local oneshot receiver"))
+            }
+            Self::Process { receiver } => {
+                // Serialize as [0, receiver]
+                receiver.serialize(serializer)
+            }
+        }
+    }
+}
+
+impl<'de, T: Serialize + DeserializeOwned + Send + 'static> Deserialize<'de> for OneshotReceiver<T> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let receiver = remoc::rch::oneshot::Receiver::<T>::deserialize(deserializer)?;
+        Ok(Self::Process { receiver })
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(bound = "")]
 pub enum ProcessMessage<T: ConcurrentlyExecute> {
@@ -104,7 +173,6 @@ pub enum ProcessMessage<T: ConcurrentlyExecute> {
 pub enum Message<T: ConcurrentlyExecute> {
     Data {
         data: T::Message,
-        resp: Option<OneshotSender<T::Response>>,
     },
     Shutdown,
 }
@@ -112,12 +180,9 @@ pub enum Message<T: ConcurrentlyExecute> {
 #[allow(async_fn_in_trait)]
 /// Trait for types that can be executed concurrently
 pub trait ConcurrentlyExecute: Send + Sync + Clone + Sized + 'static {
-    type State;
     type Message: Serialize + for<'a> Deserialize<'a> + Send + Sync + 'static;
-    type Response: Serialize + for<'a> Deserialize<'a> + Send + Sync + 'static;
 
     async fn run(
-        state: Self::State, 
         rx: UnboundedReceiver<Message<Self>>, 
     );
 }
@@ -189,14 +254,13 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
     /// 
     /// Asserts that it is being used in a local tokio runtime or LocalSet
     pub async fn new_local(
-        state: T::State,
         cs_state: ConcurrentExecutorState<T>,
     ) -> Result<Self, crate::base::Error> {
         let permit = cs_state.sema.clone().acquire_owned().await?;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         
         tokio::task::spawn_local(async move {
-            T::run(state, rx).await;
+            T::run(rx).await;
         });
 
         Ok(Self::Local {
@@ -255,17 +319,18 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
                 uds_path.path().to_str().ok_or("Failed to convert UDS path to str")?,
             ),
             (
-                "CONCURRENT_EXECUTOR_ID",
-                opts.id.as_str(),
+                "CONCURRENT_EXECUTOR_MEM_SOFT_LIMIT",
+                &opts.mem_soft_limit.to_string(),
             ),
             (
-                "CONCURRENT_EXECUTOR_HEAP_LIMIT",
-                &opts.heap_limit.to_string(),
+                "CONCURRENT_EXECUTOR_MEM_HARD_LIMIT",
+                &opts.mem_hard_limit.to_string(),
             ),
         ];
         let mut cmd = tokio::process::Command::new(exe);
         cmd.args(args);
         cmd.envs(env);
+        cmd.kill_on_drop(true);
         let mut proc_handle = cmd.spawn()?;
         
         // Wait for a connection
@@ -276,6 +341,7 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
             }
             res = unix_listener.accept() => res?,
             _ = proc_handle.wait() => {
+                cs_state.cancel_token.cancel();
                 return Err("Process exited before connecting".into());
             }
         };
@@ -329,6 +395,120 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
         })
     }
 
+    /// Starts up a process client
+    /// The process should have first setup a tokio localruntime first
+    pub async fn run_process_client() {
+        struct CgroupWithDtor {
+            _cgroup: cgroups_rs::fs::Cgroup,
+        }
+
+        impl Drop for CgroupWithDtor {
+            fn drop(&mut self) {
+                match self._cgroup.delete() {
+                    Ok(_) => {},
+                    Err(e) => {
+                        eprintln!("Failed to delete cgroup: {}", e);
+                    }
+                };
+            }
+        }
+
+        let mem_soft_limit: i64 = std::env::var("CONCURRENT_EXECUTOR_MEM_SOFT_LIMIT")
+            .unwrap_or_else(|_| "0".to_string())
+            .parse()
+            .expect("Failed to parse CONCURRENT_EXECUTOR_MEM_SOFT_LIMIT");
+        let mem_hard_limit: i64 = std::env::var("CONCURRENT_EXECUTOR_MEM_HARD_LIMIT")
+            .unwrap_or_else(|_| "0".to_string())
+            .parse()
+            .expect("Failed to parse CONCURRENT_EXECUTOR_MEM_HARD_LIMIT");
+        
+        let mut _guard = None;
+        if mem_hard_limit > 0 || mem_soft_limit > 0 {
+            // Create a cgroup and set memory limits
+            let cg = cgroups_rs::fs::cgroup_builder::CgroupBuilder::new(&format!("ce-{}-{}", std::process::id(), rand::random::<u64>()))
+            .memory()
+                .memory_soft_limit(mem_soft_limit)
+                .memory_hard_limit(mem_hard_limit)
+            .done()
+            .build(Box::new(cgroups_rs::fs::hierarchies::V2::new()))
+            .expect("Failed to create cgroup");
+            assert!(cg.exists());
+            cg.add_task(cgroups_rs::CgroupPid::from(std::process::id() as u64))
+                .expect("Failed to add process to cgroup");
+            _guard = Some(CgroupWithDtor { _cgroup: cg });
+        }
+
+        let uds_path = std::env::var("CONCURRENT_EXECUTOR_UDS_PATH").expect("CONCURRENT_EXECUTOR_UDS_PATH not set");
+        let stream = tokio::net::UnixStream::connect(uds_path).await.expect("Failed to connect to UDS path");
+
+        let (reader, writer) = stream.into_split();
+        let (conn, _tx, rx) = remoc::Connect::io_buffered::<tokio::net::unix::OwnedReadHalf, tokio::net::unix::OwnedWriteHalf, ProcessMessage<T>, ProcessMessage<T>, remoc::codec::Postbag>(
+            remoc::Cfg::compact(), 
+            reader, 
+            writer, 
+            100
+        )
+            .await
+            .expect("Failed to create remoc connection");
+
+        let cancel_token = CancellationToken::new();
+        let c_token = cancel_token.clone();
+        let fut = async move { 
+            tokio::select! {
+                _ = c_token.cancelled() => {}
+                _ = conn => {
+                }
+            }
+        };
+        tokio::task::spawn(fut);
+
+        let mut message_rx: Option<remoc::rch::mpsc::Receiver<ProcessMessage<T>>> = None;
+
+        let mut rx = rx;
+        while let Some(msg) = rx.recv().await.expect("Failed to receive message from parent process") {
+            match msg {
+                ProcessMessage::LoadMpsc { recv } => {
+                    message_rx = Some(recv);
+                    break;
+                }
+                _ => {
+                    panic!("Received unexpected message before LoadMpsc");
+                }
+            }
+        }
+
+        let mut message_rx = message_rx.expect("Did not receive LoadMpsc message");
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        // Start up the run function as a task
+        tokio::task::spawn_local(T::run(rx));
+
+        loop {
+            tokio::select! {
+                msg = message_rx.recv() => {
+                    let Ok(msg) = msg else {
+                        panic!("Failed to receive message from parent process");
+                    };
+                    let Some(msg) = msg else {
+                        continue;
+                    };
+                    match msg {
+                        ProcessMessage::Message { data } => {
+                            let _ = tx.send(data);
+                            //tokio::task::yield_now().await;
+                        }
+                        ProcessMessage::LoadMpsc { .. } => {
+                            panic!("Received unexpected LoadMpsc message");
+                        }
+                    }
+                }
+                _ = cancel_token.cancelled() => {
+                    break;
+                }
+            }
+        }
+    }
+
     /// Gets the state of the executor
     pub fn get_state(&self) -> &ConcurrentExecutorState<T> {
         match self {
@@ -341,10 +521,10 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
     pub async fn fire(&self, msg: T::Message) -> Result<(), crate::base::Error> {
         match self {
             Self::Local { message_tx, .. } => {
-                message_tx.send(Message::Data { data: msg, resp: None })?;
+                message_tx.send(Message::Data { data: msg })?;
             }
             Self::Process { message_tx, .. } => {
-                match message_tx.send(ProcessMessage::Message { data: Message::Data { data: msg, resp: None }}).await {
+                match message_tx.send(ProcessMessage::Message { data: Message::Data { data: msg }}).await {
                     Ok(_) => {},
                     Err(e) => {
                         return Err(format!("Failed to send message to process executor: {}", e.to_string()).into());
@@ -355,30 +535,51 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
         Ok(())
     }
 
-    /// Sends a message to the executor
-    pub async fn send(&self, msg: T::Message) -> Result<T::Response, crate::base::Error> {
+    /// Creates a new oneshot sender/receiver pair
+    /// according to the type of executor
+    /// 
+    /// This should replace all use of tokio::sync::oneshot::channel function
+    pub fn create_oneshot<U: Serialize + DeserializeOwned + Send + 'static>(&self) -> (OneshotSender<U>, OneshotReceiver<U>) {
         match self {
-            Self::Local { message_tx, .. } => {
-                let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-                let oneshot = OneshotSender::new_local(resp_tx);
-                message_tx.send(Message::Data { data: msg, resp: Some(oneshot) })?;
-                let resp = resp_rx.await.map_err(|e| format!("Failed to receive response from local executor: {}", e.to_string()))?;
-                Ok(resp)
+            Self::Local { .. } => {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                (OneshotSender::new_local(tx), OneshotReceiver::new_local(rx))
             }
-            Self::Process { message_tx, .. } => {
-                let (resp_tx, resp_rx) = remoc::rch::oneshot::channel();
-                let oneshot = OneshotSender::new_process(resp_tx);
-                match message_tx.send(ProcessMessage::Message { data: Message::Data { data: msg, resp: Some(oneshot) }}).await {
-                    Ok(_) => {
-                        let resp = resp_rx.await.map_err(|e| format!("Failed to receive response from process executor: {}", e.to_string()))?;
-                        Ok(resp)
-                    },
-                    Err(e) => {
-                        return Err(format!("Failed to send message to process executor: {}", e.to_string()).into());
+            Self::Process { .. } => {
+                let (tx, rx) = remoc::rch::oneshot::channel();
+                (OneshotSender::new_process(tx), OneshotReceiver::new_process(rx))
+            }
+        }
+    }
+
+    /// Waits for the executor to finish executing(?)
+    pub async fn wait(&self) -> Result<(), crate::base::Error> {
+        match self {
+            Self::Local { .. } => {
+                // Local executors run in the background, so we just wait for the cancel token
+                self.get_state().cancel_token.cancelled().await;
+            }
+            Self::Process { proc_handle, is_local_tokio, .. } => {
+                let proc_handle = proc_handle.clone();
+                let cancel_token = self.get_state().cancel_token.clone();
+                let fut = async move {
+                    let mut r = proc_handle.write().await;
+                    tokio::select! {
+                        _ = cancel_token.cancelled() => {}
+                        _ = r.wait() => {
+                            // Cancel the token
+                            cancel_token.cancel();
+                        }
                     }
+                };
+                if *is_local_tokio {
+                    tokio::task::spawn_local(fut).await?;
+                } else {
+                    tokio::task::spawn(fut).await?;
                 }
             }
         }
+        Ok(())
     }
 
     /// Shuts down the executor
@@ -392,7 +593,7 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
                 let _ = message_tx.send(ProcessMessage::Message { data: Message::Shutdown });
                 // Give some time for the process to exit gracefully
                 let proc_handle = proc_handle.clone();
-                let cancel_token = self.get_state().cancel_token.clone();
+                self.get_state().cancel_token.cancel();
                 let fut = async move {
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     // If the process is still running, kill it
@@ -402,8 +603,6 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
                             eprintln!("Failed to kill process: {}", e);
                         }
                     };    
-                    // Set cancel token
-                    cancel_token.cancel();            
                 };
                 if *is_local_tokio {
                     tokio::task::spawn_local(fut);
