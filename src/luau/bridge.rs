@@ -1,8 +1,8 @@
 use crate::base::{ObjectRegistryID, ProxyBridge};
-use mluau::{LuaSerdeExt, ObjectLike};
+use mluau::ObjectLike;
 use tokio::sync::{mpsc::UnboundedSender, mpsc::UnboundedReceiver,  oneshot::Sender};
 use futures_util::stream::{FuturesUnordered, StreamExt};
-use crate::base::{StringAtom, StringAtomList, ObjectRegistry};
+use crate::base::ObjectRegistry;
 use mluau::WeakLua;
 use crate::MAX_PROXY_DEPTH;
 
@@ -14,7 +14,6 @@ pub type Error = Box<dyn std::error::Error + Send + Sync>;
 /// This struct is not thread safe and must be kept on the Lua side
 pub struct ProxyLuaClient {
     pub weak_lua: WeakLua,
-    pub atom_list: StringAtomList,
     pub table_registry: ObjectRegistry<mluau::Table>,
     pub func_registry: ObjectRegistry<mluau::Function>,
     pub thread_registry: ObjectRegistry<mluau::Thread>,
@@ -28,9 +27,8 @@ pub enum ProxiedLuaValue {
     Boolean(bool),
     Integer(i64),
     Number(f64),
-    String(StringAtom), // To avoid large amounts of copying, we store strings in a separate atom list
+    String(String),
     Table(ObjectRegistryID), // Table ID in the table registry
-    Array(Vec<ProxiedLuaValue>),
     Function(ObjectRegistryID), // Function ID in the function registry
     UserData(ObjectRegistryID), // UserData ID in the userdata registry
     Vector((f32, f32, f32)),
@@ -52,25 +50,12 @@ impl ProxiedLuaValue {
             mluau::Value::Boolean(b) => ProxiedLuaValue::Boolean(b),
             mluau::Value::Integer(i) => ProxiedLuaValue::Integer(i),
             mluau::Value::Number(n) => ProxiedLuaValue::Number(n),
-            mluau::Value::String(s) => ProxiedLuaValue::String(plc.atom_list.get(s.as_bytes().as_ref())),
+            mluau::Value::String(s) => {
+                let s = s.to_str()
+                    .map_err(|e| format!("Failed to convert Lua string to Rust string: {}", e))?;
+                ProxiedLuaValue::String(s.to_string())
+            },
             mluau::Value::Table(t) => {
-                let Some(lua) = t.weak_lua().try_upgrade() else {
-                    return Err("Table's Lua state has been dropped".into());
-                };
-
-                if t.metatable() == Some(lua.array_metatable()) {
-                    let length = t.raw_len();
-                    let mut elements = Vec::with_capacity(length);
-                    for i in 0..length {
-                        let v = t.raw_get(i + 1)
-                            .map_err(|e| format!("Failed to get array element {}: {}", i, e))?;
-                        let pv = ProxiedLuaValue::from_lua_value(v, plc, depth + 1)
-                            .map_err(|e| format!("Failed to convert array element {}: {}", i, e))?;
-                        elements.push(pv);
-                    }
-                    return Ok(ProxiedLuaValue::Array(elements));
-                }
-
                 let table_id = plc.table_registry.add(t)
                     .ok_or_else(|| "Table registry is full".to_string())?;
 
@@ -99,13 +84,8 @@ impl ProxiedLuaValue {
             }
             mluau::Value::Error(e) => return Err(format!("Cannot proxy Lua error value: {}", e).into()),
             mluau::Value::Other(r) => {
-                let Some(lua) = plc.weak_lua.try_upgrade() else {
-                    return Err("Lua state has been dropped".into());
-                };
                 let s = format!("unknown({r:?})");
-                let s = lua.create_string(&s)
-                    .map_err(|e| format!("Failed to create string for unknown value: {}", e))?;
-                ProxiedLuaValue::String(plc.atom_list.get(s.as_bytes().as_ref()))
+                ProxiedLuaValue::String(s)
             },
         };
 
@@ -130,15 +110,6 @@ impl ProxiedLuaValue {
             ProxiedLuaValue::Table(entries) => {
                 let table = plc.table_registry.get(*entries)
                     .ok_or_else(|| mluau::Error::external(format!("Table ID {} not found in registry", entries)))?;
-                Ok(mluau::Value::Table(table))
-            }
-            ProxiedLuaValue::Array(elements) => {
-                let table = lua.create_table_with_capacity(elements.len(), 0)?;
-                for (i, v) in elements.iter().enumerate() {
-                    let lua_v = v.convert_to_lua_value(lua, plc)?;
-                    table.raw_set(i + 1, lua_v)?; // Lua arrays are 1-based
-                }
-                table.set_metatable(Some(lua.array_metatable()))?;
                 Ok(mluau::Value::Table(table))
             }
             ProxiedLuaValue::Function(func_id) => {

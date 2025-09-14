@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 use crate::luau::bridge::{LuaBridge, ProxiedLuaValue};
 use crate::deno::extension::ExtensionTrait;
 
-use crate::base::{StringAtomList, ObjectRegistry, ObjectRegistryID};
+use crate::base::{ObjectRegistry, ObjectRegistryID};
 use bridge::{ProxiedV8Value, ProxyV8Client};
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -240,7 +240,6 @@ impl V8IsolateManagerInner {
                 func_ids,
             },
             proxy_client: ProxyV8Client {
-                atom_list: StringAtomList::new(),
                 func_registry: ObjectRegistry::new(),
                 obj_registry: ObjectRegistry::new(),
                 promise_registry: ObjectRegistry::new(),

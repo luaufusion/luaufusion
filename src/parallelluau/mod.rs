@@ -1,18 +1,15 @@
-use mluau::LuaSerdeExt;
-
-use crate::{base::{ObjectRegistryID, ProxyBridge, StringAtom}, luau::bridge::ProxyLuaClient};
+use crate::{base::{ObjectRegistryID, ProxyBridge}, luau::bridge::ProxyLuaClient};
 
 pub enum ParallelLuaProxiedValue {
     Nil,
     Boolean(bool),
     Integer(i64),
     Number(f64),
-    String(StringAtom), // To avoid large amounts of copying, we store strings in a separate atom list
-    Table(Vec<(ParallelLuaProxiedValue, ParallelLuaProxiedValue)>),
-    Array(Vec<ParallelLuaProxiedValue>),
+    String(String), // To avoid large amounts of copying, we store strings in a separate atom list
+    Vector((f32, f32, f32)),
     SrcFunction(ObjectRegistryID), // Function ID in the source lua's function registry
     SrcUserData(ObjectRegistryID), // UserData ID in the source lua's userdata registry
-    Vector((f32, f32, f32)),
+    SrcTable(ObjectRegistryID), // Table ID in the source lua's table registry
     SrcBuffer(ObjectRegistryID), // Buffer ID in the source lua's buffer registry
     SrcThread(ObjectRegistryID), // Thread ID in the source lua's thread registry
 }
@@ -23,9 +20,9 @@ impl ParallelLuaProxiedValue {
     pub fn to_src_lua_value(
         &self, 
         lua: &mluau::Lua, 
-        bridge: &ParallelLuaProxyBridge, 
+        _bridge: &ParallelLuaProxyBridge, 
         plc: &ProxyLuaClient,
-        depth: usize
+        _depth: usize
     ) -> mluau::Result<mluau::Value> {
         match self {
             ParallelLuaProxiedValue::Nil => Ok(mluau::Value::Nil),
@@ -36,22 +33,9 @@ impl ParallelLuaProxiedValue {
                 let s = lua.create_string(s.as_bytes())?;
                 Ok(mluau::Value::String(s))
             }
-            ParallelLuaProxiedValue::Table(entries) => {
-                let table = lua.create_table()?;
-                for (k, v) in entries {
-                    let lua_k = k.to_src_lua_value(lua, bridge, plc, depth + 1)?;
-                    let lua_v = v.to_src_lua_value(lua, bridge, plc, depth + 1)?;
-                    table.raw_set(lua_k, lua_v)?;
-                }
-                Ok(mluau::Value::Table(table))
-            }
-            ParallelLuaProxiedValue::Array(elements) => {
-                let table = lua.create_table_with_capacity(elements.len(), 0)?;
-                for (i, v) in elements.iter().enumerate() {
-                    let lua_v = v.to_src_lua_value(lua, bridge, plc, depth + 1)?;
-                    table.raw_set(i + 1, lua_v)?; // Lua arrays are 1-based
-                }
-                table.set_metatable(Some(lua.array_metatable()))?;
+            ParallelLuaProxiedValue::SrcTable(table_id) => {
+                let table = plc.table_registry.get(*table_id)
+                    .ok_or_else(|| mluau::Error::external(format!("Table ID {} not found in registry", table_id)))?;
                 Ok(mluau::Value::Table(table))
             }
             ParallelLuaProxiedValue::SrcFunction(func_id) => {

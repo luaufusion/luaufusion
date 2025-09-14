@@ -1,6 +1,6 @@
-pub mod concurrency;
+use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
-use std::{cell::RefCell, collections::{HashMap, HashSet}, rc::Rc, sync::{Arc, Mutex}};
+use serde::{Deserialize, Serialize};
 
 use crate::luau::bridge::{ProxiedLuaValue, ProxyLuaClient};
 
@@ -9,55 +9,7 @@ pub const MAX_OBJECT_REGISTRY_SIZE: usize = 1024; // 1024 objects
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
-#[derive(Clone)]
-/// A list of string atoms to avoid duplicating strings in memory
-pub struct StringAtomList {
-    atom_list: Arc<Mutex<(usize, HashSet<Arc<[u8]>>)>>,
-}
-
-/// A string atom that references a string in the atom list
-///
-/// Cheap to clone
-#[derive(Clone)]
-pub struct StringAtom {
-    s: Arc<[u8]>,
-}
-
-impl StringAtom {
-    pub fn to_bytes(self) -> Arc<[u8]> {
-        self.s
-    }
-
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.s
-    }
-}
-
-impl StringAtomList {
-    pub fn new() -> Self {
-        Self {
-            atom_list: Arc::new(Mutex::default()),
-        }
-    }
-
-    /// Gets a string atom for the given mluau string
-    pub fn get(&self, s: &[u8]) -> StringAtom {
-        let mut atom_list = self.atom_list.lock().unwrap();
-
-        if !atom_list.1.contains(s) {
-            if atom_list.0 + s.len() > MAX_INTERN_SIZE {
-                return StringAtom { s: s.to_vec().into() };
-            }
-
-            atom_list.1.insert(s.to_vec().into());
-            atom_list.0 += s.len();
-        }
-        let s = atom_list.1.get(s).unwrap().clone();
-        StringAtom { s }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 /// An ID for an object in the object registry
 pub struct ObjectRegistryID(i64);
 
@@ -167,13 +119,4 @@ pub trait ProxyBridge: Send + Sync + Clone {
 
     /// Evaluates code (string) from the source Luau to the foreign language
     async fn eval_from_source(&self, code: &str, args: Vec<ProxiedLuaValue>) -> Result<Self::ValueType, Error>;
-}
-
-mod asserter {
-    use super::StringAtomList;
-    use super::StringAtom;
-
-    const fn assert_send_const<T: Send>() {}
-    const _: () = assert_send_const::<StringAtomList>(); 
-    const _: () = assert_send_const::<StringAtom>();
 }

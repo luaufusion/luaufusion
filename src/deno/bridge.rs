@@ -5,6 +5,7 @@ use std::sync::Arc;
 use deno_core::v8;
 use futures_util::stream::FuturesUnordered;
 use futures_util::StreamExt;
+use serde::{Deserialize, Serialize};
 //use deno_core::{op2, OpState};
 //use deno_error::JsErrorBox;
 //use mluau::serde::de;
@@ -12,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::luau::bridge::{LuaBridge, ObjectRegistryType, ProxiedLuaValue, ProxyLuaClient};
 
-use crate::base::{ObjectRegistry, ObjectRegistryID, ProxyBridge, StringAtom, StringAtomList};
+use crate::base::{ObjectRegistry, ObjectRegistryID, ProxyBridge};
 use crate::deno::{CommonState, V8IsolateManagerInner};
 use super::Error;
 
@@ -59,6 +60,7 @@ impl BridgeVals {
     }
 }
 
+#[derive(Clone, Copy, Serialize, Deserialize)]
 pub enum V8ObjRegistryType {
     Object,
     Function,
@@ -66,13 +68,14 @@ pub enum V8ObjRegistryType {
 }
 
 /// A V8 value that can now be easily proxied to Luau
+#[derive(Serialize, Deserialize)]
 pub enum ProxiedV8Value {
     Nil,
     Undefined,
     Boolean(bool),
     Integer(i32),
     Number(f64),
-    String(StringAtom), // To avoid large amounts of copying, we store strings in a separate atom list
+    String(String),
     Buffer(Vec<u8>), // Binary data
     Object(ObjectRegistryID), // Object ID in the map registry
     Array(Vec<ProxiedV8Value>),
@@ -252,7 +255,7 @@ impl ProxiedV8Value {
             return Ok(Self::Number(n));
         } else if value.is_string() {
             let s = value.to_string(scope).ok_or("Failed to convert to string")?;
-            let sid = common_state.proxy_client.atom_list.get(s.to_rust_string_lossy(scope).as_bytes());
+            let sid = s.to_rust_string_lossy(scope);
             return Ok(Self::String(sid));
         } else if value.is_array() {
             let arr = value.to_object(scope).ok_or("Failed to convert to object")?;
@@ -433,20 +436,7 @@ impl V8IsolateManagerInner {
                 arr.into()
             },
             ProxiedLuaValue::String(atom) => {
-                let atom_bytes = atom.to_bytes();
-                let s = std::str::from_utf8(&atom_bytes).map_err(|e| format!("Failed to convert string atom to UTF-8: {}", e))?;
-                v8::String::new(scope, s).ok_or("Failed to create V8 string")?.into()
-            }
-            ProxiedLuaValue::Array(elems) => {
-                if elems.len() > i32::MAX as usize {
-                    return Err("Array too large to proxy to V8".into());
-                }
-                let arr = v8::Array::new(scope, elems.len() as i32);
-                for (i, elem) in elems.into_iter().enumerate() {
-                    let v8_elem = Self::proxy_to_v8(scope, common_state, elem, depth + 1)?;
-                    arr.set_index(scope, i as u32, v8_elem);
-                }
-                arr.into()
+                v8::String::new(scope, &atom).ok_or("Failed to create V8 string")?.into()
             }
             ProxiedLuaValue::Table(table_id) => {
                 Self::proxy_objreg_from_lua(scope, ObjectRegistryType::Table, table_id, common_state)?
@@ -474,7 +464,6 @@ impl V8IsolateManagerInner {
 /// 
 /// This struct is not thread safe and must be kept on the Lua side
 pub struct ProxyV8Client {
-    pub atom_list: StringAtomList,
     pub obj_registry: ObjectRegistry<v8::Global<v8::Object>>,
     pub func_registry: ObjectRegistry<v8::Global<v8::Function>>,
     pub promise_registry: ObjectRegistry<v8::Global<v8::Promise>>,
