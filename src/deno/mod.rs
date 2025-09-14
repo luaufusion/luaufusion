@@ -240,6 +240,7 @@ impl V8IsolateManagerInner {
                 func_ids,
             },
             proxy_client: ProxyV8Client {
+                array_registry: ObjectRegistry::new(),
                 func_registry: ObjectRegistry::new(),
                 obj_registry: ObjectRegistry::new(),
                 promise_registry: ObjectRegistry::new(),

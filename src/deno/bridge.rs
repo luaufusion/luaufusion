@@ -78,7 +78,7 @@ pub enum ProxiedV8Value {
     String(String),
     Buffer(Vec<u8>), // Binary data
     Object(ObjectRegistryID), // Object ID in the map registry
-    Array(Vec<ProxiedV8Value>),
+    Array(ObjectRegistryID), // Array ID in the array registry
     Function(ObjectRegistryID), // Function ID in the function registry
     Promise(ObjectRegistryID), // Promise ID in the function registry
 
@@ -91,7 +91,7 @@ pub enum ProxiedV8Value {
 }
 
 impl ProxiedV8Value {
-    pub(crate) fn proxy_to_src_lua(self, lua: &mluau::Lua, bridge: &V8IsolateManager, plc: &ProxyLuaClient, depth: usize) -> Result<mluau::Value, mluau::Error> {
+    pub(crate) fn proxy_to_src_lua(self, lua: &mluau::Lua, _bridge: &V8IsolateManager, plc: &ProxyLuaClient, depth: usize) -> Result<mluau::Value, mluau::Error> {
         if depth > MAX_PROXY_DEPTH {
             return Err(mluau::Error::external("Maximum proxy depth exceeded"));
         }
@@ -107,13 +107,10 @@ impl ProxiedV8Value {
             ProxiedV8Value::Buffer(buf) => {
                 lua.create_buffer(buf).map(mluau::Value::Buffer)
             },
-            ProxiedV8Value::Array(elems) => {
-                let tbl = lua.create_table_with_capacity(elems.len(), 0)?;
-                for elem in elems {
-                    tbl.raw_push(elem.proxy_to_src_lua(lua, bridge, plc, depth + 1)?)?;
-                }
+            /*ProxiedV8Value::Array(elems) => {
+                
                 Ok(mluau::Value::Table(tbl))
-            },
+            },*/
             /*ProxiedV8Value::Object(obj_id) => {
                 struct V8ProxiedObject {
                     obj_id: i32,
@@ -258,17 +255,11 @@ impl ProxiedV8Value {
             let sid = s.to_rust_string_lossy(scope);
             return Ok(Self::String(sid));
         } else if value.is_array() {
-            let arr = value.to_object(scope).ok_or("Failed to convert to object")?;
-            let length_str = v8::String::new(scope, "length").ok_or("Failed to create length string")?;
-            let length_val = arr.get(scope, length_str.into()).ok_or("Failed to get length property")?;
-            let length = length_val.to_uint32(scope).ok_or("Failed to convert length to uint32")?.value() as usize;
-            let mut elems = Vec::with_capacity(length);
-            for i in 0..length {
-                let elem = arr.get_index(scope, i as u32).ok_or(format!("Failed to get array element {}", i))?;
-                let lua_elem = Self::proxy_from_v8(scope, elem, common_state, depth + 1)?;
-                elems.push(lua_elem);
-            }
-            return Ok(Self::Array(elems));
+            let arr = v8::Local::<v8::Array>::try_from(value).map_err(|_| "Failed to convert to array")?;
+            let global_obj = v8::Global::new(scope, arr);
+            let obj_id = common_state.proxy_client.array_registry.add(global_obj)
+                .ok_or("Failed to register array: too many array references")?;
+            return Ok(Self::Array(obj_id));
         } else if value.is_array_buffer() {
             let ab = v8::Local::<v8::ArrayBuffer>::try_from(value).map_err(|_| "Failed to convert to ArrayBuffer")?;
             let bs = ab.get_backing_store();
@@ -464,6 +455,7 @@ impl V8IsolateManagerInner {
 /// 
 /// This struct is not thread safe and must be kept on the Lua side
 pub struct ProxyV8Client {
+    pub array_registry: ObjectRegistry<v8::Global<v8::Array>>,
     pub obj_registry: ObjectRegistry<v8::Global<v8::Object>>,
     pub func_registry: ObjectRegistry<v8::Global<v8::Function>>,
     pub promise_registry: ObjectRegistry<v8::Global<v8::Promise>>,
