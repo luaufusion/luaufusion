@@ -8,17 +8,21 @@ use crate::MAX_PROXY_DEPTH;
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
+/// Marker struct for Lua objects in the object registry
+#[derive(Clone, Copy)]
+pub struct LuaBridgeObject;
+
 #[derive(Clone)]
 /// The client side state for proxying Lua values
 /// 
 /// This struct is not thread safe and must be kept on the Lua side
 pub struct ProxyLuaClient {
     pub weak_lua: WeakLua,
-    pub table_registry: ObjectRegistry<mluau::Table>,
-    pub func_registry: ObjectRegistry<mluau::Function>,
-    pub thread_registry: ObjectRegistry<mluau::Thread>,
-    pub userdata_registry: ObjectRegistry<mluau::AnyUserData>,
-    pub buffer_registry: ObjectRegistry<mluau::Buffer>,
+    pub table_registry: ObjectRegistry<mluau::Table, LuaBridgeObject>,
+    pub func_registry: ObjectRegistry<mluau::Function, LuaBridgeObject>,
+    pub thread_registry: ObjectRegistry<mluau::Thread, LuaBridgeObject>,
+    pub userdata_registry: ObjectRegistry<mluau::AnyUserData, LuaBridgeObject>,
+    pub buffer_registry: ObjectRegistry<mluau::Buffer, LuaBridgeObject>,
 }
 
 /// A Lua value that can now be easily proxied to another language
@@ -28,12 +32,12 @@ pub enum ProxiedLuaValue {
     Integer(i64),
     Number(f64),
     String(String),
-    Table(ObjectRegistryID), // Table ID in the table registry
-    Function(ObjectRegistryID), // Function ID in the function registry
-    UserData(ObjectRegistryID), // UserData ID in the userdata registry
+    Table(ObjectRegistryID<LuaBridgeObject>), // Table ID in the table registry
+    Function(ObjectRegistryID<LuaBridgeObject>), // Function ID in the function registry
+    UserData(ObjectRegistryID<LuaBridgeObject>), // UserData ID in the userdata registry
     Vector((f32, f32, f32)),
-    Buffer(ObjectRegistryID), // Buffer ID in the buffer registry
-    Thread(ObjectRegistryID), // Thread ID in the thread registry
+    Buffer(ObjectRegistryID<LuaBridgeObject>), // Buffer ID in the buffer registry
+    Thread(ObjectRegistryID<LuaBridgeObject>), // Thread ID in the thread registry
 }
 
 impl ProxiedLuaValue {
@@ -151,20 +155,20 @@ pub enum ObjectRegistryType {
 /// Messages sent to the Lua proxy bridge
 pub enum LuaBridgeMessage<T: ProxyBridge> {
     CallFunction {
-        func_id: ObjectRegistryID,
+        func_id: ObjectRegistryID<LuaBridgeObject>,
         args: Vec<T::ValueType>,
         resp: Sender<Result<Vec<ProxiedLuaValue>, Error>>,
     },
     ReadBuffer {
-        buffer_id: ObjectRegistryID,
+        buffer_id: ObjectRegistryID<LuaBridgeObject>,
         resp: Sender<Result<Vec<u8>, Error>>,
     },
     DropObject {
         obj_type: ObjectRegistryType,
-        obj_id: ObjectRegistryID,
+        obj_id: ObjectRegistryID<LuaBridgeObject>,
     },
     IndexUserData {
-        obj_id: ObjectRegistryID,
+        obj_id: ObjectRegistryID<LuaBridgeObject>,
         key: T::ValueType,
         resp: Sender<Result<ProxiedLuaValue, Error>>,
     },
@@ -333,7 +337,7 @@ impl<T: ProxyBridge> LuaBridge<T> {
     }
 
     /// Calls a Lua function by its ID with the given arguments, returning the results
-    pub async fn call_function(&self, func_id: ObjectRegistryID, args: Vec<T::ValueType>) -> Result<Vec<ProxiedLuaValue>, Error> {
+    pub async fn call_function(&self, func_id: ObjectRegistryID<LuaBridgeObject>, args: Vec<T::ValueType>) -> Result<Vec<ProxiedLuaValue>, Error> {
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
         self.x.send(LuaBridgeMessage::CallFunction { func_id, args, resp: resp_tx })
             .map_err(|e| format!("Failed to send CallFunction message: {}", e))?;
@@ -341,7 +345,7 @@ impl<T: ProxyBridge> LuaBridge<T> {
     }
 
     /// Reads the contents of a Lua buffer by its ID
-    pub async fn read_buffer(&self, buffer_id: ObjectRegistryID) -> Result<Vec<u8>, Error> {
+    pub async fn read_buffer(&self, buffer_id: ObjectRegistryID<LuaBridgeObject>) -> Result<Vec<u8>, Error> {
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
         self.x.send(LuaBridgeMessage::ReadBuffer { buffer_id, resp: resp_tx })
             .map_err(|e| format!("Failed to send ReadBuffer message: {}", e))?;
@@ -349,7 +353,7 @@ impl<T: ProxyBridge> LuaBridge<T> {
     }
 
     /// Requests that an object be dropped from the registry
-    pub fn request_drop_object(&self, obj_type: ObjectRegistryType, obj_id: ObjectRegistryID) {
+    pub fn request_drop_object(&self, obj_type: ObjectRegistryType, obj_id: ObjectRegistryID<LuaBridgeObject>) {
         let _ = self.x.send(LuaBridgeMessage::DropObject { obj_type, obj_id });
     }
 }

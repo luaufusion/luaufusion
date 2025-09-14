@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 //use mluau::serde::de;
 use tokio_util::sync::CancellationToken;
 
-use crate::luau::bridge::{LuaBridge, ObjectRegistryType, ProxiedLuaValue, ProxyLuaClient};
+use crate::luau::bridge::{LuaBridge, LuaBridgeObject, ObjectRegistryType, ProxiedLuaValue, ProxyLuaClient};
 
 use crate::base::{ObjectRegistry, ObjectRegistryID, ProxyBridge};
 use crate::deno::{CommonState, V8IsolateManagerInner};
@@ -60,6 +60,10 @@ impl BridgeVals {
     }
 }
 
+/// Marker struct for V8 objects in the object registry
+#[derive(Clone, Copy)]
+pub struct V8BridgeObject;
+
 #[derive(Clone, Copy, Serialize, Deserialize)]
 pub enum V8ObjRegistryType {
     Object,
@@ -77,17 +81,17 @@ pub enum ProxiedV8Value {
     Number(f64),
     String(String),
     Buffer(Vec<u8>), // Binary data
-    Object(ObjectRegistryID), // Object ID in the map registry
-    Array(ObjectRegistryID), // Array ID in the array registry
-    Function(ObjectRegistryID), // Function ID in the function registry
-    Promise(ObjectRegistryID), // Promise ID in the function registry
+    Object(ObjectRegistryID<V8BridgeObject>), // Object ID in the map registry
+    Array(ObjectRegistryID<V8BridgeObject>), // Array ID in the array registry
+    Function(ObjectRegistryID<V8BridgeObject>), // Function ID in the function registry
+    Promise(ObjectRegistryID<V8BridgeObject>), // Promise ID in the function registry
 
     // Source-owned stuff
-    SrcFunction(ObjectRegistryID), // Function ID in the source lua's function registry
-    SrcTable(ObjectRegistryID), // Table ID in the source lua's table registry
-    SrcThread(ObjectRegistryID), // Thread ID in the source lua's thread registry
-    SrcBuffer(ObjectRegistryID), // Buffer ID in the source lua's buffer registry
-    SrcUserData(ObjectRegistryID), // Userdata ID in the source lua's userdata registry
+    SrcFunction(ObjectRegistryID<LuaBridgeObject>), // Function ID in the source lua's function registry
+    SrcTable(ObjectRegistryID<LuaBridgeObject>), // Table ID in the source lua's table registry
+    SrcThread(ObjectRegistryID<LuaBridgeObject>), // Thread ID in the source lua's thread registry
+    SrcBuffer(ObjectRegistryID<LuaBridgeObject>), // Buffer ID in the source lua's buffer registry
+    SrcUserData(ObjectRegistryID<LuaBridgeObject>), // Userdata ID in the source lua's userdata registry
 }
 
 impl ProxiedV8Value {
@@ -331,7 +335,7 @@ impl V8IsolateManagerInner {
     fn proxy_objreg_from_lua<'s>(
         scope: &mut v8::HandleScope<'s>,
         typ: ObjectRegistryType,
-        id: ObjectRegistryID,
+        id: ObjectRegistryID<LuaBridgeObject>,
         common_state: &CommonState
     ) -> Result<v8::Local<'s, v8::Value>, Error> {
         let code = match typ {
@@ -455,10 +459,10 @@ impl V8IsolateManagerInner {
 /// 
 /// This struct is not thread safe and must be kept on the Lua side
 pub struct ProxyV8Client {
-    pub array_registry: ObjectRegistry<v8::Global<v8::Array>>,
-    pub obj_registry: ObjectRegistry<v8::Global<v8::Object>>,
-    pub func_registry: ObjectRegistry<v8::Global<v8::Function>>,
-    pub promise_registry: ObjectRegistry<v8::Global<v8::Promise>>,
+    pub array_registry: ObjectRegistry<v8::Global<v8::Array>, V8BridgeObject>,
+    pub obj_registry: ObjectRegistry<v8::Global<v8::Object>, V8BridgeObject>,
+    pub func_registry: ObjectRegistry<v8::Global<v8::Function>, V8BridgeObject>,
+    pub promise_registry: ObjectRegistry<v8::Global<v8::Promise>, V8BridgeObject>,
 }
 
 
@@ -473,7 +477,7 @@ pub enum V8IsolateManagerMessage {
         resp: tokio::sync::oneshot::Sender<Result<ProxiedV8Value, Error>>,
     },
     GetObjectProperty {
-        obj_id: ObjectRegistryID,
+        obj_id: ObjectRegistryID<V8BridgeObject>,
         key: ProxiedLuaValue,
         resp: tokio::sync::oneshot::Sender<Result<ProxiedV8Value, Error>>,
     },

@@ -1,4 +1,7 @@
-use crate::{base::{ObjectRegistryID, ProxyBridge}, luau::bridge::ProxyLuaClient};
+use crate::{base::{ObjectRegistryID, ProxyBridge}, luau::bridge::{LuaBridgeObject, ProxyLuaClient}};
+
+#[derive(Clone, Copy)]
+pub struct ParallelLuaBridgeObject;
 
 pub enum ParallelLuaProxiedValue {
     Nil,
@@ -7,11 +10,11 @@ pub enum ParallelLuaProxiedValue {
     Number(f64),
     String(String), // To avoid large amounts of copying, we store strings in a separate atom list
     Vector((f32, f32, f32)),
-    SrcFunction(ObjectRegistryID), // Function ID in the source lua's function registry
-    SrcUserData(ObjectRegistryID), // UserData ID in the source lua's userdata registry
-    SrcTable(ObjectRegistryID), // Table ID in the source lua's table registry
-    SrcBuffer(ObjectRegistryID), // Buffer ID in the source lua's buffer registry
-    SrcThread(ObjectRegistryID), // Thread ID in the source lua's thread registry
+    SrcFunction(ObjectRegistryID<LuaBridgeObject>), // Function ID in the source lua's function registry
+    SrcUserData(ObjectRegistryID<LuaBridgeObject>), // UserData ID in the source lua's userdata registry
+    SrcTable(ObjectRegistryID<LuaBridgeObject>), // Table ID in the source lua's table registry
+    SrcBuffer(ObjectRegistryID<LuaBridgeObject>), // Buffer ID in the source lua's buffer registry
+    SrcThread(ObjectRegistryID<LuaBridgeObject>), // Thread ID in the source lua's thread registry
 }
 
 impl ParallelLuaProxiedValue {

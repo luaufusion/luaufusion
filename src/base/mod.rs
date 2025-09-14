@@ -1,6 +1,6 @@
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::luau::bridge::{ProxiedLuaValue, ProxyLuaClient};
 
@@ -9,37 +9,100 @@ pub const MAX_OBJECT_REGISTRY_SIZE: usize = 1024; // 1024 objects
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
+#[derive(Debug)]
 /// An ID for an object in the object registry
-pub struct ObjectRegistryID(i64);
+pub struct ObjectRegistryID<T> {
+    v: i64,
+    _marker: std::marker::PhantomData<T>,
+}
 
-impl ObjectRegistryID {
+impl<T> PartialEq for ObjectRegistryID<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.v == other.v
+    }
+}
+impl<T> Eq for ObjectRegistryID<T> {}
+
+impl<T> PartialOrd for ObjectRegistryID<T> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.v.partial_cmp(&other.v)
+    }
+}
+impl<T> Ord for ObjectRegistryID<T> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.v.cmp(&other.v)
+    }
+}
+impl<T> std::hash::Hash for ObjectRegistryID<T> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.v.hash(state);
+    }
+}
+impl<T> Clone for ObjectRegistryID<T> {
+    fn clone(&self) -> Self {
+        Self {
+            v: self.v,
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+impl<T> Copy for ObjectRegistryID<T> {}
+
+impl<T> serde::Serialize for ObjectRegistryID<T> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_i64(self.v)
+    }
+}
+
+impl<'de, T> Deserialize<'de> for ObjectRegistryID<T> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let v = i64::deserialize(deserializer)?;
+        Ok(Self {
+            v,
+            _marker: std::marker::PhantomData,
+        })
+    }
+}
+
+impl<T> ObjectRegistryID<T> {
     pub fn get(&self) -> i64 {
-        self.0
+        self.v
     }
 
     pub fn from_i64(id: i64) -> Self {
-        Self(id)
+        Self {
+            v: id,
+            _marker: std::marker::PhantomData,
+        }
     }
 }
 
-impl std::fmt::Display for ObjectRegistryID {
+impl<T> std::fmt::Display for ObjectRegistryID<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
+        write!(f, "{}", self.v)
     }
 }
 
-impl std::ops::Add<i32> for ObjectRegistryID {
+impl<T> std::ops::Add<i32> for ObjectRegistryID<T> {
     type Output = Self;
 
     fn add(self, rhs: i32) -> Self::Output {
-        ObjectRegistryID(self.0 + rhs as i64)
+        ObjectRegistryID {
+            v: self.v + rhs as i64,
+            _marker: std::marker::PhantomData,
+        }
     }
 }
 
-impl std::ops::AddAssign<i32> for ObjectRegistryID {
+impl<T> std::ops::AddAssign<i32> for ObjectRegistryID<T> {
     fn add_assign(&mut self, rhs: i32) {
-        self.0 += rhs as i64;
+        self.v += rhs as i64;
     }
 }
 
@@ -49,28 +112,28 @@ impl std::ops::AddAssign<i32> for ObjectRegistryID {
 /// This struct maps objects to integer IDs for easy referencing
 /// 
 /// Use ObjectRegistrySend for thread safe version
-pub struct ObjectRegistry<T: Clone + PartialEq> {
-    objs: Rc<RefCell<HashMap<ObjectRegistryID, (T, usize)>>>,  
+pub struct ObjectRegistry<T: Clone + PartialEq, U> {
+    objs: Rc<RefCell<HashMap<ObjectRegistryID<U>, (T, usize)>>>,  
 
     // If a obj ID is created, then removed, then the length may no longer
     // be reliable for ID generation / may lead to objects being overwritten
     // or no longer existing
-    current_id: Rc<RefCell<ObjectRegistryID>>, 
+    current_id: Rc<RefCell<ObjectRegistryID<U>>>, 
 }
 
-impl<T: Clone + PartialEq> ObjectRegistry<T> {
+impl<T: Clone + PartialEq, U> ObjectRegistry<T, U> {
     /// Creates a new object registry
     pub fn new() -> Self {
         Self {
             objs: Rc::new(RefCell::new(HashMap::new())),
-            current_id: Rc::new(RefCell::new(ObjectRegistryID(0))),
+            current_id: Rc::new(RefCell::new(ObjectRegistryID::from_i64(0))),
         }
     }
 
     /// Registers a new object and returns its ID
     /// 
     /// This will try to reuse existing objects and return their ID if found
-    pub fn add(&self, obj: T) -> Option<ObjectRegistryID> {
+    pub fn add(&self, obj: T) -> Option<ObjectRegistryID<U>> {
         let mut objs = self.objs.borrow_mut();
         for (id, (f, count)) in objs.iter_mut() {
             if f == &obj {
@@ -91,13 +154,13 @@ impl<T: Clone + PartialEq> ObjectRegistry<T> {
     }
 
     /// Gets a object by its ID
-    pub fn get(&self, obj_id: ObjectRegistryID) -> Option<T> {
+    pub fn get(&self, obj_id: ObjectRegistryID<U>) -> Option<T> {
         let objs = self.objs.borrow();
         objs.get(&obj_id).cloned().map(|(obj, _)| obj)
     }
 
     /// Remove a object by its ID
-    pub fn remove(&self, obj_id: ObjectRegistryID) {
+    pub fn remove(&self, obj_id: ObjectRegistryID<U>) {
         let mut objs = self.objs.borrow_mut();
         if let Some((_, count)) = objs.get_mut(&obj_id) {
             if *count > 1 {

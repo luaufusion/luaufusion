@@ -17,7 +17,7 @@ use deno_core::v8::CreateParams;
 use deno_core::{op2, v8, Extension, OpState};
 use tokio_util::sync::CancellationToken;
 
-use crate::luau::bridge::{LuaBridge, ProxiedLuaValue};
+use crate::luau::bridge::{LuaBridge, LuaBridgeObject, ProxiedLuaValue};
 use crate::deno::extension::ExtensionTrait;
 
 use crate::base::{ObjectRegistry, ObjectRegistryID};
@@ -168,7 +168,7 @@ pub struct V8IsolateManagerInner {
 
 #[derive(Clone)]
 pub struct FinalizerAttachments {
-    func_ids: FinalizerList<ObjectRegistryID>,
+    func_ids: FinalizerList<ObjectRegistryID<LuaBridgeObject>>,
 }
 
 impl V8IsolateManagerInner {    
