@@ -6,6 +6,7 @@ use crate::luau::bridge::{ProxiedLuaValue, ProxyLuaClient};
 
 pub const MAX_INTERN_SIZE: usize = 1024 * 512; // 512 KB
 pub const MAX_OBJECT_REGISTRY_SIZE: usize = 1024; // 1024 objects
+pub const MAX_BUFFER_SIZE: usize = 4096; // For now, 4096 bytes max buffer size
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 

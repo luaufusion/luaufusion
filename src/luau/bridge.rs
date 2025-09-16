@@ -1,5 +1,6 @@
 use crate::base::{ObjectRegistryID, ProxyBridge};
 use mluau::ObjectLike;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc::UnboundedSender, mpsc::UnboundedReceiver,  oneshot::Sender};
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use crate::base::ObjectRegistry;
@@ -18,6 +19,7 @@ pub struct LuaBridgeObject;
 /// This struct is not thread safe and must be kept on the Lua side
 pub struct ProxyLuaClient {
     pub weak_lua: WeakLua,
+    pub string_registry: ObjectRegistry<mluau::String, LuaBridgeObject>,
     pub table_registry: ObjectRegistry<mluau::Table, LuaBridgeObject>,
     pub func_registry: ObjectRegistry<mluau::Function, LuaBridgeObject>,
     pub thread_registry: ObjectRegistry<mluau::Thread, LuaBridgeObject>,
@@ -26,12 +28,13 @@ pub struct ProxyLuaClient {
 }
 
 /// A Lua value that can now be easily proxied to another language
+#[derive(Serialize, Deserialize)]
 pub enum ProxiedLuaValue {
     Nil,
     Boolean(bool),
     Integer(i64),
     Number(f64),
-    String(String),
+    String((ObjectRegistryID<LuaBridgeObject>, usize)), // String ID in the string registry
     Table(ObjectRegistryID<LuaBridgeObject>), // Table ID in the table registry
     Function(ObjectRegistryID<LuaBridgeObject>), // Function ID in the function registry
     UserData(ObjectRegistryID<LuaBridgeObject>), // UserData ID in the userdata registry
@@ -55,9 +58,10 @@ impl ProxiedLuaValue {
             mluau::Value::Integer(i) => ProxiedLuaValue::Integer(i),
             mluau::Value::Number(n) => ProxiedLuaValue::Number(n),
             mluau::Value::String(s) => {
-                let s = s.to_str()
-                    .map_err(|e| format!("Failed to convert Lua string to Rust string: {}", e))?;
-                ProxiedLuaValue::String(s.to_string())
+                let s_len = s.as_bytes().len();
+                let string_id = plc.string_registry.add(s)
+                    .ok_or_else(|| "String registry is full".to_string())?;
+                ProxiedLuaValue::String((string_id, s_len))
             },
             mluau::Value::Table(t) => {
                 let table_id = plc.table_registry.add(t)
@@ -89,7 +93,15 @@ impl ProxiedLuaValue {
             mluau::Value::Error(e) => return Err(format!("Cannot proxy Lua error value: {}", e).into()),
             mluau::Value::Other(r) => {
                 let s = format!("unknown({r:?})");
-                ProxiedLuaValue::String(s)
+                let s = plc.weak_lua.try_upgrade()
+                    .ok_or_else(|| "Lua state has been dropped".to_string())?
+                    .create_string(s.as_bytes())
+                    .map_err(|e| format!("Failed to create string for unknown Lua value: {}", e))?;
+                let s_len = s.as_bytes().len();
+                let string_id = plc.string_registry.add(s)
+                    .ok_or_else(|| "String registry is full".to_string())?;
+                
+                ProxiedLuaValue::String((string_id, s_len))
             },
         };
 
@@ -101,14 +113,15 @@ impl ProxiedLuaValue {
     /// This may fail if the Lua state is no longer valid
     /// 
     /// Not used directly in the bridge, but useful for testing
-    pub fn convert_to_lua_value(&self, lua: &mluau::Lua, plc: &ProxyLuaClient) -> mluau::Result<mluau::Value> {
+    pub fn convert_to_lua_value(&self, plc: &ProxyLuaClient) -> mluau::Result<mluau::Value> {
         match self {
             ProxiedLuaValue::Nil => Ok(mluau::Value::Nil),
             ProxiedLuaValue::Boolean(b) => Ok(mluau::Value::Boolean(*b)),
             ProxiedLuaValue::Integer(i) => Ok(mluau::Value::Integer(*i)),
             ProxiedLuaValue::Number(n) => Ok(mluau::Value::Number(*n)),
-            ProxiedLuaValue::String(s) => {
-                let s = lua.create_string(s.as_bytes())?;
+            ProxiedLuaValue::String((s, _len)) => {
+                let s = plc.string_registry.get(*s)
+                    .ok_or_else(|| mluau::Error::external(format!("String ID {} not found in registry", s)))?;
                 Ok(mluau::Value::String(s))
             }
             ProxiedLuaValue::Table(entries) => {
@@ -145,6 +158,7 @@ impl ProxiedLuaValue {
 
 #[derive(Clone, Copy)]
 pub enum ObjectRegistryType {
+    String,
     Table,
     Function,
     UserData,
@@ -268,6 +282,7 @@ impl<T: ProxyBridge> LuaBridge<T> {
                         }
                         LuaBridgeMessage::DropObject { obj_type, obj_id } => {
                             match obj_type {
+                                ObjectRegistryType::String => { plc.string_registry.remove(obj_id); /* Just drop reference */ }
                                 ObjectRegistryType::Table => { plc.table_registry.remove(obj_id); /* Just drop reference */ }
                                 ObjectRegistryType::Function => { plc.func_registry.remove(obj_id); /* Just drop reference */ }
                                 ObjectRegistryType::UserData => { plc.userdata_registry.remove(obj_id); /* Just drop reference */ }

@@ -14,11 +14,10 @@ use std::rc::Rc;
 
 //use deno_core::error::{CoreError, CoreErrorKind};
 use deno_core::v8::CreateParams;
-use deno_core::{op2, v8, Extension, OpState};
+use deno_core::{op2, v8, OpState};
 use tokio_util::sync::CancellationToken;
 
 use crate::luau::bridge::{LuaBridge, LuaBridgeObject, ProxiedLuaValue};
-use crate::deno::extension::ExtensionTrait;
 
 use crate::base::{ObjectRegistry, ObjectRegistryID};
 use bridge::{ProxiedV8Value, ProxyV8Client};
@@ -176,20 +175,7 @@ impl V8IsolateManagerInner {
         let heap_limit = heap_limit.max(MIN_HEAP_LIMIT);
 
         // TODO: Support snapshots maybe
-        let mut extensions = extension::all_extensions(false);
-
-        // Add the __luadispatch, __luarun and __luaresult ops
-        deno_core::extension!(
-            init_lua_op,
-            ops = [__luadispatch, __luarun, __luaresult],
-        );
-        impl ExtensionTrait<()> for init_lua_op {
-            fn init((): ()) -> Extension {
-                init_lua_op::init()
-            }
-        }
-
-        extensions.push(init_lua_op::build((), false));
+        let extensions = extension::all_extensions(false);
 
         let mut deno = deno_core::JsRuntime::new(deno_core::RuntimeOptions {
             create_params: Some(
@@ -225,8 +211,11 @@ impl V8IsolateManagerInner {
         });
 
         let bridge_vals = {
+            let main_ctx = deno.main_context();
             let isolate = deno.v8_isolate();
             let scope = &mut v8::HandleScope::new(isolate);
+            let main_ctx = v8::Local::new(scope, main_ctx);
+            let scope = &mut v8::ContextScope::new(scope, main_ctx);
             BridgeVals::new(scope)
         };
 
@@ -240,9 +229,11 @@ impl V8IsolateManagerInner {
                 func_ids,
             },
             proxy_client: ProxyV8Client {
+                string_registry: ObjectRegistry::new(),
                 array_registry: ObjectRegistry::new(),
                 func_registry: ObjectRegistry::new(),
                 obj_registry: ObjectRegistry::new(),
+                array_buffer_registry: ObjectRegistry::new(),
                 promise_registry: ObjectRegistry::new(),
             },
             bridge_vals: Rc::new(bridge_vals)
@@ -342,7 +333,7 @@ async fn __luarun(
 
 // OP to get the results of a function by func ID/run ID
 #[op2]
-fn __luaresult<'s>(
+fn __luaret<'s>(
     #[state] state: &CommonState,
     scope: &mut v8::HandleScope<'s>,
     run_id: i32,

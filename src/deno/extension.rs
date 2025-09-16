@@ -129,6 +129,26 @@ pub(crate) fn structuredclone_extensions(is_snapshot: bool) -> Vec<Extension> {
     vec![deno_structuredclone::build((), is_snapshot)]
 }
 
+extension!(
+    luau_bridge,
+    ops = [
+        super::__luadispatch,
+        super::__luarun,
+        super::__luaret,
+    ],
+    esm_entry_point = "ext:luau_bridge/cls.js",
+    esm = [ dir "src/deno/bridge", "cls.js" ],
+);
+impl ExtensionTrait<()> for luau_bridge {
+    fn init((): ()) -> Extension {
+        luau_bridge::init()
+    }
+}
+
+pub(crate) fn luau_bridge_extension(is_snapshot: bool) -> Vec<Extension> {
+    vec![deno_structuredclone::build((), is_snapshot)]
+}
+
 pub(crate) fn all_extensions(is_snapshot: bool) -> Vec<Extension> {
     let mut exts = vec![];
     exts.extend(console_extensions(is_snapshot));
@@ -136,6 +156,7 @@ pub(crate) fn all_extensions(is_snapshot: bool) -> Vec<Extension> {
     exts.extend(url_extensions(is_snapshot));
     exts.extend(b64_extensions(is_snapshot));
     exts.extend(structuredclone_extensions(is_snapshot));
+    exts.extend(luau_bridge_extension(is_snapshot));
     exts
 }
 
