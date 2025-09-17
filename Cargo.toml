@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 mlua_scheduler = { git = "https://github.com/mluau/scheduler", version = "1.0.0" }
 mluau = { git = "https://github.com/mluau/mluau", version = "0.11.2", features = ["serde"] }
+concurrentlyexec = { git = "https://github.com/mluau-quickjs-proxy/concurrentlyexecute" }
 
 tokio = { version = "1.47.1", features = ["full", "process"] }
 tokio-util = "0.7"

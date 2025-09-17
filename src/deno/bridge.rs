@@ -1,6 +1,6 @@
-use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
+use concurrentlyexec::{ConcurrentExecutor, ConcurrentExecutorState, ConcurrentlyExecute, MultiSender, OneshotSender, ProcessOpts};
 //use deno_core::error::{CoreError, CoreErrorKind};
 use deno_core::v8;
 use futures_util::stream::FuturesUnordered;
@@ -9,9 +9,8 @@ use serde::{Deserialize, Serialize};
 //use deno_core::{op2, OpState};
 //use deno_error::JsErrorBox;
 //use mluau::serde::de;
-use tokio_util::sync::CancellationToken;
 
-use crate::luau::bridge::{LuaBridge, LuaBridgeObject, ObjectRegistryType, ProxiedLuaValue, ProxyLuaClient};
+use crate::luau::bridge::{LuaBridgeMessage, LuaBridgeObject, LuaBridgeService, LuaBridgeServiceClient, ObjectRegistryType, ProxiedLuaValue, ProxyLuaClient};
 
 use crate::base::{ObjectRegistry, ObjectRegistryID, ProxyBridge};
 use crate::deno::{CommonState, V8IsolateManagerInner};
@@ -117,7 +116,7 @@ pub enum ProxiedV8Value {
 }
 
 impl ProxiedV8Value {
-    pub(crate) fn proxy_to_src_lua(self, _lua: &mluau::Lua, _bridge: &V8IsolateManager, plc: &ProxyLuaClient, depth: usize) -> Result<mluau::Value, mluau::Error> {
+    pub(crate) fn proxy_to_src_lua(self, _lua: &mluau::Lua, plc: &ProxyLuaClient, depth: usize) -> Result<mluau::Value, mluau::Error> {
         if depth > MAX_PROXY_DEPTH {
             return Err(mluau::Error::external("Maximum proxy depth exceeded"));
         }
@@ -430,222 +429,119 @@ pub struct ProxyV8Client {
     pub promise_registry: ObjectRegistry<v8::Global<v8::Promise>, V8BridgeObject>,
 }
 
-
+#[derive(Serialize, Deserialize)]
 pub enum V8IsolateManagerMessage {
-    Shutdown,
-    ErrSubscribe {
-        resp: tokio::sync::oneshot::Sender<tokio::sync::watch::Receiver<Option<deno_core::error::CoreError>>>,
-    },
     CodeExec {
         code: String,
         args: Vec<ProxiedLuaValue>,
-        resp: tokio::sync::oneshot::Sender<Result<ProxiedV8Value, Error>>,
+        resp: OneshotSender<Result<ProxiedV8Value, String>>,
     },
     GetObjectProperty {
         obj_id: ObjectRegistryID<V8BridgeObject>,
         key: ProxiedLuaValue,
-        resp: tokio::sync::oneshot::Sender<Result<ProxiedV8Value, Error>>,
+        resp: OneshotSender<Result<ProxiedV8Value, String>>,
     },
+    Shutdown,
 }
 
-/// Internal manager for a single V8 isolate with a minimal Deno runtime.
 #[derive(Clone)]
-pub enum V8IsolateManager {
-    Threaded {
-        tx: tokio::sync::mpsc::UnboundedSender<V8IsolateManagerMessage>,
-        threadsafe_handle: deno_core::v8::IsolateHandle,
-        thread_handle: Arc<std::thread::JoinHandle<Result<(), Box<dyn std::any::Any + Send + 'static>>>>
-    },
-    Local {
-        tx: tokio::sync::mpsc::UnboundedSender<V8IsolateManagerMessage>,
-        threadsafe_handle: deno_core::v8::IsolateHandle,
-    },
-    Process {
-        cmd: Vec<String>,
-        tx: tokio::sync::mpsc::UnboundedSender<V8IsolateManagerMessage>,
+pub struct V8IsolateManagerClient {}
+
+impl V8IsolateManagerClient {
+    fn compile_code(
+        inner: &mut V8IsolateManagerInner,
+        code: String,
+    ) -> Result<v8::Global<v8::Function>, Error> {
+        let func = {
+            let main_ctx = inner.deno.main_context();
+            let isolate = inner.deno.v8_isolate();
+            let mut scope = v8::HandleScope::new(isolate);
+            let main_ctx = v8::Global::new(&mut scope, main_ctx);
+            let main_ctx = v8::Local::new(&mut scope, main_ctx);
+            let context_scope = &mut v8::ContextScope::new(&mut scope, main_ctx);
+            let try_catch = &mut v8::TryCatch::new(context_scope);
+            let script = v8::String::new(try_catch, &code)
+                .and_then(|s| v8::Script::compile(try_catch, s, None))
+                .ok_or_else(|| {
+                    if try_catch.has_caught() {
+                        let exception = try_catch.exception().unwrap();
+                        let exception_string = exception.to_rust_string_lossy(try_catch);
+                        format!("Failed to compile script: {}", exception_string)
+                    } else {
+                        "Failed to compile script".to_string()
+                    }
+                })?;
+
+            // Convert and proxy
+            let local_func = match script.run(try_catch) {
+                Some(result) => {
+                    if result.is_function() {
+                        v8::Local::<v8::Function>::try_from(result)
+                        .map_err(|e| format!("Failed to convert script result to function: {}", e))?
+                    } else {
+                        return Err("Script did not return a function".to_string().into());
+                    }
+                },
+                None => {
+                    if try_catch.has_caught() {
+                        let exception = try_catch.exception().unwrap();
+                        let exception_string = exception.to_rust_string_lossy(try_catch);
+                        return Err(format!("Failed to run script: {}", exception_string).into());
+                    } else {
+                        return Err("Failed to run script".to_string().into())
+                    }
+                }
+            };
+
+            v8::Global::new(try_catch, local_func)
+        };
+
+        Ok(func)
     }
 }
 
-impl Drop for V8IsolateManager {
-    fn drop(&mut self) {
-        let _ = match self.terminate() {
-            Ok(_) => {},
-            Err(e) => {
-                eprintln!("Failed to send shutdown message to V8 isolate manager: {}", e);
-            }
-        }; 
-    }
-}
-
-pub struct V8IsolateManagerThreadData {
-    pub stack_size: usize,
+#[derive(Serialize, Deserialize)]
+pub struct V8BootstrapData {
     pub heap_limit: usize,
-    pub id: String,
+    pub messenger_tx: OneshotSender<MultiSender<V8IsolateManagerMessage>>,
+    pub lua_bridge_tx: MultiSender<LuaBridgeMessage<V8IsolateManagerServer>>
 }
 
-impl V8IsolateManager {
-    /// Create a new isolate manager and spawn its task
-    /// 
-    /// Safety note: it is unsafe to create multiple isolates on the same thread
-    /// As such, V8IsolateManager will create its own thread
-    pub async fn new(
-        thread_opts: V8IsolateManagerThreadData,
-        cancellation_token: CancellationToken,
-        bridge: LuaBridge<V8IsolateManager>,
-    ) -> Result<Self, Error> {
-        let thread_stack_size = thread_opts.stack_size.max(V8_MIN_STACK_SIZE);
-        let heap_limit = thread_opts.heap_limit;
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        
-        let (th_tx, th_rx) = tokio::sync::oneshot::channel();
-        let tjh = std::thread::Builder::new()
-        .stack_size(thread_stack_size)
-        .name(thread_opts.id)
-        .spawn(move || {
-            let ct_ref = cancellation_token.clone();
-            let res = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build_local(tokio::runtime::LocalOptions::default())
-                    .expect("Failed to create tokio runtime");
-
-                rt.block_on(async move {
-                    let mut inner = V8IsolateManagerInner::new(bridge, heap_limit);
-                    let _ = th_tx.send(inner.thread_safe_handle());
-                    Self::run(inner, rx, cancellation_token).await;
-                });
-            }));
-
-            ct_ref.cancel();
-            res 
-        })?;
-        
-        let handle = th_rx.await?;
-
-        Ok(Self::Threaded {
-            tx,
-            threadsafe_handle: handle,
-            thread_handle: Arc::new(tjh)
-        })
-    }
-
-    /// Create a new isolate manager and spawn its task
-    /// 
-    /// Safety note: it is unsafe to create multiple isolates on the same thread
-    pub fn new_local(
-        mut inner: V8IsolateManagerInner,
-        cancellation_token: CancellationToken,
-    ) -> Self {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-                
-        let handle = inner.thread_safe_handle();
-
-        tokio::task::spawn_local(async move {
-            let _ = Self::run(inner, rx, cancellation_token).await;
-        });
-
-        Self::Local {
-            tx,
-            threadsafe_handle: handle,
-        }
-    }
-
-    /// Run the isolate manager task
-    /// 
-    /// This must be called for anything to work
-    /// 
-    /// Returns the inner isolate manager for any pool cleanup etc. after shutdown
+impl ConcurrentlyExecute for V8IsolateManagerClient {
+    type BootstrapData = V8BootstrapData;
     async fn run(
-        mut inner: V8IsolateManagerInner, 
-        mut rx: tokio::sync::mpsc::UnboundedReceiver<V8IsolateManagerMessage>, 
-        shutdown_token: CancellationToken,
+        data: Self::BootstrapData,
+        client_ctx: concurrentlyexec::ClientContext
     ) {
-        let (err_tx, err_rx) = tokio::sync::watch::channel(None);
+        let (tx, mut rx) = client_ctx.multi();
+        data.messenger_tx.client(&client_ctx).send(tx).unwrap();
 
-        // Async futures unordered queue for code execution
+        let mut inner = V8IsolateManagerInner::new(
+            LuaBridgeServiceClient::new(client_ctx.clone(), data.lua_bridge_tx),
+            data.heap_limit,
+        );
+
         let mut code_exec_queue = FuturesUnordered::new();
 
         loop {
             tokio::select! {
-                Some(msg) = rx.recv() => {
-                    // Handle message
+                Ok(msg) = rx.recv() => {
                     match msg {
-                        V8IsolateManagerMessage::Shutdown => {
-                            // Terminate isolate
-                            break;
-                        }
-                        V8IsolateManagerMessage::ErrSubscribe { resp } => {
-                            let _ = resp.send(err_rx.clone());
-                        }
                         V8IsolateManagerMessage::CodeExec { code, args, resp } => {
-                            let func = {
-                                let main_ctx = inner.deno.main_context();
-                                let isolate = inner.deno.v8_isolate();
-                                let mut scope = v8::HandleScope::new(isolate);
-                                let main_ctx = v8::Global::new(&mut scope, main_ctx);
-                                let main_ctx = v8::Local::new(&mut scope, main_ctx);
-                                let context_scope = &mut v8::ContextScope::new(&mut scope, main_ctx);
-                                let try_catch = &mut v8::TryCatch::new(context_scope);
-                                let script = v8::String::new(try_catch, &code)
-                                    .and_then(|s| v8::Script::compile(try_catch, s, None))
-                                    .ok_or_else(|| {
-                                        if try_catch.has_caught() {
-                                            let exception = try_catch.exception().unwrap();
-                                            let exception_string = exception.to_rust_string_lossy(try_catch);
-                                            format!("Failed to compile script: {}", exception_string)
-                                        } else {
-                                            "Failed to compile script".to_string()
-                                        }
-                                    });
-
-                                let script = match script {
-                                    Ok(s) => s,
-                                    Err(e) => {
-                                        let _ = resp.send(Err(e.into()));
-                                        continue;
-                                    }
-                                };
-
-                                // Convert and proxy
-                                let local_func = match script.run(try_catch) {
-                                    Some(result) => {
-                                        if result.is_function() {
-                                            let v = v8::Local::<v8::Function>::try_from(result);
-                                            match v {
-                                                Ok(f) => f,
-                                                Err(_) => {
-                                                    let _ = resp.send(Err("Script did not return a function".to_string().into()));
-                                                    continue;
-                                                },
-                                            }
-                                        } else {
-                                            let _ = resp.send(Err("Script did not return a function".to_string().into()));
-                                            continue;
-                                        }
-                                    },
-                                    None => {
-                                        if try_catch.has_caught() {
-                                            let exception = try_catch.exception().unwrap();
-                                            let exception_string = exception.to_rust_string_lossy(try_catch);
-                                            let _ = resp.send(Err(format!("Failed to run script: {}", exception_string).into()));
-                                            continue;
-                                        } else {
-                                            let _ = resp.send(Err("Failed to run script".to_string().into()));
-                                            continue;
-                                        }
-                                    }
-                                };
-
-                                v8::Global::new(try_catch, local_func)
+                            let func = match Self::compile_code(&mut inner, code) {
+                                Ok(f) => f,
+                                Err(e) => {
+                                    let _ = resp.client(&client_ctx).send(Err(e.to_string()));
+                                    continue;
+                                }
                             };
-
                             // Call the function with args
                             // using denos' call_with_args
                             let args = args.into_iter().map(|v| inner.proxy_to_v8_impl(v)).collect::<Result<Vec<_>, _>>();
                             let args = match args {
                                 Ok(a) => a,
                                 Err(e) => {
-                                    let _ = resp.send(Err(e));
+                                    let _ = resp.client(&client_ctx).send(Err(e.to_string()));
                                     continue;
                                 }
                             };
@@ -655,72 +551,12 @@ impl V8IsolateManager {
                                 (result, resp)
                             });
                         },
-                        V8IsolateManagerMessage::GetObjectProperty { obj_id, key, resp } => {
-                            let obj = match inner.common_state.proxy_client.obj_registry.get(obj_id) {
-                                Some(v) => v,
-                                None => {
-                                    let _ = resp.send(Err("Object ID not found".into()));
-                                    continue;
-                                }
-                            };
-
-                            let key = match inner.proxy_to_v8_impl(key) {
-                                Ok(k) => k,
-                                Err(e) => {
-                                    let _ = resp.send(Err(e));
-                                    continue;
-                                }
-                            };
-
-                            {
-                                let main_ctx = inner.deno.main_context();
-                                let isolate = inner.deno.v8_isolate();
-                                let mut scope = v8::HandleScope::new(isolate);
-                                let main_ctx = v8::Local::new(&mut scope, main_ctx);
-                                let context_scope = &mut v8::ContextScope::new(&mut scope, main_ctx);
-                                let try_catch = &mut v8::TryCatch::new(context_scope);
-
-                                let local_obj = v8::Local::new(try_catch, obj);
-                                let local_key = v8::Local::new(try_catch, key);
-
-                                let result = local_obj.get(try_catch, local_key);
-                                let result = match result {
-                                    Some(v) => v,
-                                    None => {
-                                        if try_catch.has_caught() {
-                                            let exception = try_catch.exception().unwrap();
-                                            let exception_string = exception.to_rust_string_lossy(try_catch);
-                                            let _ = resp.send(Err(format!("Failed to get object property: {}", exception_string).into()));
-                                            continue;
-                                        } else {
-                                            let _ = resp.send(Err("Failed to get object property".into()));
-                                            continue;
-                                        }
-                                    }
-                                };
-
-                                // Convert to ProxiedV8Value
-                                match ProxiedV8Value::proxy_from_v8(try_catch, result, &inner.common_state, 0) {
-                                    Ok(v) => {
-                                        let _ = resp.send(Ok(v));
-                                    }
-                                    Err(e) => {
-                                        if try_catch.has_caught() {
-                                            let exception = try_catch.exception().unwrap();
-                                            let exception_string = exception.to_rust_string_lossy(try_catch);
-                                            let _ = resp.send(Err(format!("Failed to convert object property to ProxiedV8Value: {} ({})", exception_string, e).into()));
-                                            continue;
-                                        }
-                                        let _ = resp.send(Err(e.into()));
-                                    }
-                                };
-                            }
+                        V8IsolateManagerMessage::GetObjectProperty { obj_id: _, key: _, resp: _ } => {
+                        },
+                        V8IsolateManagerMessage::Shutdown => {
+                            break;
                         }
                     }
-                },
-                _ = inner.cancellation_token.cancelled() => {
-                    // Terminate isolate
-                    break;
                 }
                 Some((result, resp)) = code_exec_queue.next() => {
                     // A code execution future has completed
@@ -745,75 +581,93 @@ impl V8IsolateManager {
                         }
                         Err(e) => Err(format!("JavaScript execution error: {}", e).into()),
                     };
-                    let _ = resp.send(result.map_err(|e| e.into()));
-                }
-                res = inner.deno.run_event_loop(deno_core::PollEventLoopOptions::default()), if !code_exec_queue.is_empty() => {
-                    // Continue running
-                    match res {
-                        Ok(_) => {},
-                        Err(e) => {
-                            err_tx.send_replace(Some(e));
-                        }
-                    };
-
-                    tokio::task::yield_now().await; // Yield to allow other tasks to run
+                    let _ = resp.client(&client_ctx).send(result.map_err(|e| e.to_string()));
                 }
             }
         }
-
-        if !inner.thread_safe_handle().is_execution_terminating() {
-            inner.thread_safe_handle().terminate_execution();
-        }
-
-        shutdown_token.cancel();
-    }
-
-    /// Sends a message to the isolate manager to subscribe to error events
-    pub(crate) fn send(&self, msg: V8IsolateManagerMessage) -> Result<(), Error> {
-        match self {
-            V8IsolateManager::Threaded { tx, .. } => {
-                tx.send(msg).map_err(|_| "Failed to send message to isolate manager".to_string().into())
-            }
-            V8IsolateManager::Local { tx, .. } => {
-                tx.send(msg).map_err(|_| "Failed to send message to isolate manager".to_string().into())
-            }
-            V8IsolateManager::Process { tx, .. } => {
-                tx.send(msg).map_err(|_| "Failed to send message to isolate process manager".to_string().into())
-            }
-        }
-    }
-
-    /// Returns a watch receiver for errors from the isolates event loop
-    pub async fn err_subscribe(&self) -> Result<tokio::sync::watch::Receiver<Option<deno_core::error::CoreError>>, Error> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let msg = V8IsolateManagerMessage::ErrSubscribe { resp: tx };
-        self.send(msg)?;
-        let rx = rx.await.map_err(|_| "Failed to receive ErrSubscribe response".to_string())?;
-        Ok(rx)
-    }
-
-    /// Evaluates code in the isolate and returns the result as a ProxiedV8Value
-    pub async fn eval(&self, code: &str, args: Vec<ProxiedLuaValue>) -> Result<ProxiedV8Value, Error> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let msg = V8IsolateManagerMessage::CodeExec { code: code.to_string(), args, resp: tx };
-        self.send(msg)?;
-        let value = rx.await.map_err(|_| "Failed to receive CodeExec response".to_string())??;
-        Ok(value)   
-    }
-
-    pub fn terminate(&self) -> Result<(), Error> {
-        self.send(V8IsolateManagerMessage::Shutdown)
     }
 }
 
-impl ProxyBridge for V8IsolateManager {
-    type ValueType = ProxiedV8Value;
+#[derive(Clone)]
+pub struct V8IsolateManagerServer {
+    pub executor: Arc<ConcurrentExecutor<V8IsolateManagerClient>>,
+    pub messenger: Arc<MultiSender<V8IsolateManagerMessage>>,
+}
 
-    fn to_source_lua_value(&self, lua: &mluau::Lua, value: Self::ValueType, plc: &ProxyLuaClient, depth: usize) -> Result<mluau::Value, Error> {
-        Ok(value.proxy_to_src_lua(lua, self, plc, depth).map_err(|e| e.to_string())?)
+impl Drop for V8IsolateManagerServer {
+    fn drop(&mut self) {
+        let _ = self.messenger.server(self.executor.server_context()).send(V8IsolateManagerMessage::Shutdown);
+        let _ = self.executor.shutdown();
+    }
+}
+
+impl V8IsolateManagerServer {
+    pub async fn new(
+        cs_state: ConcurrentExecutorState<V8IsolateManagerClient>, 
+        heap_limit: usize, 
+        process_opts: ProcessOpts,
+        plc: ProxyLuaClient,
+    ) -> Result<Self, crate::base::Error> {
+        let (executor, (lua_bridge_rx, ms_rx)) = ConcurrentExecutor::new(
+            cs_state,
+            process_opts,
+            move |cei| {
+                let (tx, rx) = cei.create_multi();
+                let (msg_tx, msg_rx) = cei.create_oneshot();
+                (V8BootstrapData {
+                    heap_limit,
+                    messenger_tx: msg_tx,
+                    lua_bridge_tx: tx,
+                }, (rx, msg_rx))
+            }
+        ).await.map_err(|e| format!("Failed to create V8 isolate manager executor: {}", e))?;
+        let messenger = ms_rx.recv().await.map_err(|e| format!("Failed to receive messenger: {}", e))?;
+
+        let self_ret = Self { executor: Arc::new(executor), messenger: Arc::new(messenger) };
+        let self_ref = self_ret.clone();
+        tokio::task::spawn_local(async move {
+            let lua_bridge_service = LuaBridgeService::new(
+                self_ref,
+                lua_bridge_rx,
+            );
+            lua_bridge_service.run(plc).await;
+        });
+
+        Ok(self_ret)
     }
 
-    async fn eval_from_source(&self, code: &str, args: Vec<ProxiedLuaValue>) -> Result<Self::ValueType, crate::base::Error> {
-        self.eval(code, args).await
+    pub async fn exec_code(&self, code: String, args: Vec<ProxiedLuaValue>) -> Result<ProxiedV8Value, String> {
+        let (resp_tx, resp_rx) = self.executor.create_oneshot();
+        let msg = V8IsolateManagerMessage::CodeExec {
+            code,
+            args,
+            resp: resp_tx,
+        };
+        self.messenger.server(self.executor.server_context()).send(msg).map_err(|e| format!("Failed to send code exec message: {}", e))?;
+        resp_rx.recv().await.map_err(|e| format!("Failed to receive code exec response: {}", e))?
+    }
+
+    pub async fn shutdown(&self) {
+        let _ = self.messenger.server(self.executor.server_context()).send(V8IsolateManagerMessage::Shutdown);
+        let _ = self.executor.shutdown();
+    }
+}
+
+
+impl ProxyBridge for V8IsolateManagerServer {
+    type ValueType = ProxiedV8Value;
+    type ConcurrentlyExecuteClient = V8IsolateManagerClient;
+
+    fn get_executor(&self) -> Arc<ConcurrentExecutor<Self::ConcurrentlyExecuteClient>> {
+        self.executor.clone()
+    }
+
+    fn to_source_lua_value(&self, lua: &mluau::Lua, value: Self::ValueType, plc: &ProxyLuaClient, depth: usize) -> Result<mluau::Value, Error> {
+        Ok(value.proxy_to_src_lua(lua, plc, depth).map_err(|e| e.to_string())?)
+    }
+
+    async fn eval_from_source(&self, code: String, args: Vec<ProxiedLuaValue>) -> Result<Self::ValueType, crate::base::Error> {
+        self.exec_code(code, args).await
+            .map_err(|e| e.into())
     }
 }

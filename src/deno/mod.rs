@@ -2,7 +2,7 @@
 
 pub mod bridge;
 
-use crate::deno::bridge::{BridgeVals, V8IsolateManager};
+use crate::deno::bridge::{BridgeVals, V8IsolateManagerServer};
 
 pub(crate) mod extension;
 pub(crate) mod base64_ops;
@@ -17,7 +17,7 @@ use deno_core::v8::CreateParams;
 use deno_core::{op2, v8, OpState};
 use tokio_util::sync::CancellationToken;
 
-use crate::luau::bridge::{LuaBridge, LuaBridgeObject, ProxiedLuaValue};
+use crate::luau::bridge::{LuaBridgeServiceClient, LuaBridgeObject, ProxiedLuaValue};
 
 use crate::base::{ObjectRegistry, ObjectRegistryID};
 use bridge::{ProxiedV8Value, ProxyV8Client};
@@ -146,7 +146,7 @@ enum FunctionRunState {
 #[derive(Clone)]
 pub struct CommonState {
     list: Rc<RefCell<HashMap<i32, FunctionRunState>>>,
-    bridge: LuaBridge<V8IsolateManager>,
+    bridge: LuaBridgeServiceClient<V8IsolateManagerServer>,
     obj_template: Rc<v8::Global<v8::ObjectTemplate>>,
     finalizer_attachments: FinalizerAttachments,
     proxy_client: ProxyV8Client,
@@ -171,7 +171,7 @@ pub struct FinalizerAttachments {
 }
 
 impl V8IsolateManagerInner {    
-    pub fn new(bridge: LuaBridge<V8IsolateManager>, heap_limit: usize) -> Self {
+    pub fn new(bridge: LuaBridgeServiceClient<V8IsolateManagerServer>, heap_limit: usize) -> Self {
         let heap_limit = heap_limit.max(MIN_HEAP_LIMIT);
 
         // TODO: Support snapshots maybe
