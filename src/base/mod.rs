@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::luau::bridge::{ProxiedLuaValue, ProxyLuaClient};
 
 pub const MAX_INTERN_SIZE: usize = 1024 * 512; // 512 KB
-pub const MAX_OBJECT_REGISTRY_SIZE: usize = 1024; // 1024 objects
+pub const MAX_OBJECT_REGISTRY_SIZE: usize = 2048; // 2048 objects
 pub const MAX_BUFFER_SIZE: usize = 4096; // For now, 4096 bytes max buffer size
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -14,36 +14,36 @@ pub type Error = Box<dyn std::error::Error + Send + Sync>;
 #[derive(Debug)]
 /// An ID for an object in the object registry
 pub struct ObjectRegistryID<T> {
-    v: i64,
+    objid: i64, // Unique ID representing the object
     _marker: std::marker::PhantomData<T>,
 }
 
 impl<T> PartialEq for ObjectRegistryID<T> {
     fn eq(&self, other: &Self) -> bool {
-        self.v == other.v
+        self.objid == other.objid
     }
 }
 impl<T> Eq for ObjectRegistryID<T> {}
 
 impl<T> PartialOrd for ObjectRegistryID<T> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.v.partial_cmp(&other.v)
+        self.objid.partial_cmp(&other.objid)
     }
 }
 impl<T> Ord for ObjectRegistryID<T> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.v.cmp(&other.v)
+        self.objid.cmp(&other.objid)
     }
 }
 impl<T> std::hash::Hash for ObjectRegistryID<T> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.v.hash(state);
+        self.objid.hash(state);
     }
 }
 impl<T> Clone for ObjectRegistryID<T> {
     fn clone(&self) -> Self {
         Self {
-            v: self.v,
+            objid: self.objid,
             _marker: std::marker::PhantomData,
         }
     }
@@ -55,7 +55,7 @@ impl<T> serde::Serialize for ObjectRegistryID<T> {
     where
         S: serde::Serializer,
     {
-        serializer.serialize_i64(self.v)
+        serializer.serialize_i64(self.objid)
     }
 }
 
@@ -66,20 +66,20 @@ impl<'de, T> Deserialize<'de> for ObjectRegistryID<T> {
     {
         let v = i64::deserialize(deserializer)?;
         Ok(Self {
-            v,
+            objid: v,
             _marker: std::marker::PhantomData,
         })
     }
 }
 
 impl<T> ObjectRegistryID<T> {
-    pub fn get(&self) -> i64 {
-        self.v
+    pub fn objid(&self) -> i64 {
+        self.objid
     }
 
     pub fn from_i64(id: i64) -> Self {
         Self {
-            v: id,
+            objid: id,
             _marker: std::marker::PhantomData,
         }
     }
@@ -87,7 +87,7 @@ impl<T> ObjectRegistryID<T> {
 
 impl<T> std::fmt::Display for ObjectRegistryID<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.v)
+        write!(f, "{}", self.objid)
     }
 }
 
@@ -96,7 +96,7 @@ impl<T> std::ops::Add<i32> for ObjectRegistryID<T> {
 
     fn add(self, rhs: i32) -> Self::Output {
         ObjectRegistryID {
-            v: self.v + rhs as i64,
+            objid: self.objid + rhs as i64,
             _marker: std::marker::PhantomData,
         }
     }
@@ -104,7 +104,7 @@ impl<T> std::ops::Add<i32> for ObjectRegistryID<T> {
 
 impl<T> std::ops::AddAssign<i32> for ObjectRegistryID<T> {
     fn add_assign(&mut self, rhs: i32) {
-        self.v += rhs as i64;
+        self.objid += rhs as i64;
     }
 }
 

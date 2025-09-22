@@ -11,7 +11,6 @@ concurrentlyexec = { git = "https://github.com/mluau-quickjs-proxy/concurrentlye
 tokio = { version = "1.47.1", features = ["full", "process"] }
 tokio-util = "0.7"
 futures-util = "0.3"
-rand = "0.9"
 serde = "1"
 serde_json = "1"
 deno_core = { version = "0.355", features = [], default-features = false, optional = true }
@@ -21,9 +20,6 @@ deno_error = { version = "0.7", optional = true }
 deno_console = { version = "0.214", optional = true }
 thiserror = { version = "2", optional = true }
 base64-simd = { version = "0.8", optional = true }
-remoc = { version = "0.18", features = [] }
-tempfile = "3"
-cgroups-rs = "0.4"
 
 [features]
 default = ["deno"]

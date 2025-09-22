@@ -9,6 +9,29 @@ use crate::MAX_PROXY_DEPTH;
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
+pub fn obj_registry_type_to_i32(typ: ObjectRegistryType) -> i32 {
+    match typ {
+        ObjectRegistryType::String => 0,
+        ObjectRegistryType::Table => 1,
+        ObjectRegistryType::Function => 2,
+        ObjectRegistryType::UserData => 3,
+        ObjectRegistryType::Buffer => 4,
+        ObjectRegistryType::Thread => 5,
+    }
+}
+
+pub fn i32_to_obj_registry_type(val: i32) -> Option<ObjectRegistryType> {
+    match val {
+        0 => Some(ObjectRegistryType::String),
+        1 => Some(ObjectRegistryType::Table),
+        2 => Some(ObjectRegistryType::Function),
+        3 => Some(ObjectRegistryType::UserData),
+        4 => Some(ObjectRegistryType::Buffer),
+        5 => Some(ObjectRegistryType::Thread),
+        _ => None,
+    }
+}
+
 /// Marker struct for Lua objects in the object registry
 #[derive(Clone, Copy)]
 pub struct LuaBridgeObject;

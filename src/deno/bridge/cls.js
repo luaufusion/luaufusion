@@ -1,21 +1,33 @@
-import { __luadispatch, __luarun, __luaret } from "ext:core/ops";
+import { __dropluaobject, __luadispatch, __luarun, __luaret } from "ext:core/ops";
+
+// Enum for object registry types
+const objRegistryType = {
+    String: 0,
+    Table: 1,
+    Function: 2,
+    UserData: 3,
+    Buffer: 4,
+    Thread: 5
+}
+
+let __objcache = {}
+for (let key in objRegistryType) {
+    __objcache[objRegistryType[key]] = new Map();
+}
 
 // Lua object base class
 class LuaObject {
     #luaid
     #luatype
-    #obj // Keep reference to the original object to avoid GC if not a weak reference
 
     /**
      * 
      * @param {number} luaid The id of the type
      * @param {number} luatype The type of the type on the registry
-     * @param {any} obj The object with finalizer attached to it. Using null here creates a weak reference
      */
-    constructor(luaid, luatype, obj) {
+    constructor(luaid, luatype) {
         this.#luaid = luaid
         this.#luatype = luatype
-        this.#obj = obj
     }
 
     get luaid() {
@@ -26,25 +38,36 @@ class LuaObject {
         return this.#luatype
     }
 
-    get isweak() {
-        return !!this.#obj
+    /**
+     * Request the disposal of this object from Luau. Useful to ensure quicker cleanup of objects
+     * if you know you are done with them.
+     */
+    requestDisposal() {
+        // Request drop from Luau side
+        __dropluaobject(this.#luatype, this.#luaid);
+        // Remove from cache (if cached)
+        if (__objcache[this.#luatype]) {
+            __objcache[this.#luatype].delete(this.#luaid);
+        }
     }
 }
 
 // Represents a Luau string
 class LuaString extends LuaObject {
     #length
+    #stringCache = null // Cache the string once read
 
     /**
      * 
      * @param {number} luaid The id of the type
      * @param {number} luatype The type of the type on the registry
-     * @param {any} obj The object with finalizer attached to it. Using null here creates a weak reference
      * @param {number} length The length of the string
+     * @param {string|null} stringCache Optional cache of the string if already read
      */
-    constructor(luaid, luatype, obj, length) {
-        super(luaid, luatype, obj)
+    constructor(luaid, luatype, length, stringCache) {
+        super(luaid, luatype)
         this.#length = length
+        this.#stringCache = stringCache
     }
 
     /**
@@ -64,7 +87,14 @@ class LuaString extends LuaObject {
      * @returns {string} The contents of the string from Luau
      */
     async read() {
-        return await NOT_IMPLEMENTED.__luagetstr(this.luaid);
+        if(this.#stringCache !== null) return this.#stringCache; // Return cached value if already read
+        let s = await NOT_IMPLEMENTED.__luagetstr(this.luaid);
+        this.#stringCache = s;
+        return s;
+    }
+
+    __withNewObj(obj) {
+        return new LuaString(this.luaid, this.luatype, obj, this.#length, this.#stringCache);
     }
 }
 
@@ -118,15 +148,7 @@ class LuaThread extends LuaObject {} // TODO: Implement methods
 
 class LuaUserData extends LuaObject {} // TODO: Implement methods
 
-// Enum for object registry types
-const objRegistryType = {
-    String: 0,
-    Table: 1,
-    Function: 2,
-    UserData: 3,
-    Buffer: 4,
-    Thread: 5
-}
+let luaObjectCache = new WeakMap(); // Cache of LuaObject instances by luaid to avoid duplicates
 
 /**
  * Creates a Lua object from the provided data. Used internally by the Rust bridge code.
@@ -136,24 +158,55 @@ const createLuaObjectFromData = (data) => {
     if(!data) throw new Error("No data provided to createLuaObject");
     if(typeof data.luaid !== "number") throw new Error("Invalid luaid provided to createLuaObject");
     if(typeof data.luatype !== "number") throw new Error("Invalid luatype provided to createLuaObject"); 
-    if(data.obj === null || data.obj === undefined) throw new Error("Invalid obj provided to createLuaObject");
+
+    // Check cache first
 
     switch (data.luatype) {
         case objRegistryType.String:
             if(typeof data.length !== "number") {
                 throw new Error("Invalid length provided to createLuaObject for LuaString");
             }
-            return new LuaString(data.luaid, data.luatype, data.obj, data.length);
+            if (__objcache[data.luatype].has(data.luaid)) {
+                return __objcache[data.luatype].get(data.luaid);
+            }
+            let s = new LuaString(data.luaid, data.luatype, data.length);
+            __objcache[data.luatype].set(data.luaid, s);
+            return s;
         case objRegistryType.Table:
-            return new LuaTable(data.luaid, data.luatype, data.obj);
+            if (__objcache[data.luatype].has(data.luaid)) {
+                return __objcache[data.luatype].get(data.luaid);
+            }
+            let t = new LuaTable(data.luaid, data.luatype);
+            __objcache[data.luatype].set(data.luaid, t);
+            return t;
         case objRegistryType.Function:
-            return new LuaFunction(data.luaid, data.luatype, data.obj);
+            if (__objcache[data.luatype].has(data.luaid)) {
+                return __objcache[data.luatype].get(data.luaid);
+            }
+            let f = new LuaFunction(data.luaid, data.luatype);
+            __objcache[data.luatype].set(data.luaid, f);
+            return f
         case objRegistryType.UserData:
-            return new LuaUserData(data.luaid, data.luatype, data.obj);
+            if (__objcache[data.luatype].has(data.luaid)) {
+                return __objcache[data.luatype].get(data.luaid);
+            }
+            let u = new LuaUserData(data.luaid, data.luatype);
+            __objcache[data.luatype].set(data.luaid, u);
+            return u;
         case objRegistryType.Buffer:
-            return new LuaBuffer(data.luaid, data.luatype, data.obj);
+            if (__objcache[data.luatype].has(data.luaid)) {
+                return __objcache[data.luatype].get(data.luaid);
+            }
+            let b = new LuaBuffer(data.luaid, data.luatype);
+            __objcache[data.luatype].set(data.luaid, b);
+            return b
         case objRegistryType.Thread:
-            return new LuaThread(data.luaid, data.luatype, data.obj);
+            if (__objcache[data.luatype].has(data.luaid)) {
+                return __objcache[data.luatype].get(data.luaid);
+            }
+            let th = new LuaThread(data.luaid, data.luatype);
+            __objcache[data.luatype].set(data.luaid, th);
+            return th
         default:
             throw new Error(`Unknown luatype provided to createLuaObject: ${data.luatype}`);
     }

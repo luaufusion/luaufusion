@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use concurrentlyexec::{ConcurrentExecutor, ConcurrentExecutorState, ConcurrentlyExecute, MultiSender, OneshotSender, ProcessOpts};
@@ -10,7 +12,10 @@ use serde::{Deserialize, Serialize};
 //use deno_error::JsErrorBox;
 //use mluau::serde::de;
 
-use crate::luau::bridge::{LuaBridgeMessage, LuaBridgeObject, LuaBridgeService, LuaBridgeServiceClient, ObjectRegistryType, ProxiedLuaValue, ProxyLuaClient};
+use crate::luau::bridge::{
+    LuaBridgeMessage, LuaBridgeObject, LuaBridgeService, LuaBridgeServiceClient, ObjectRegistryType, ProxiedLuaValue, ProxyLuaClient,
+    obj_registry_type_to_i32, i32_to_obj_registry_type
+};
 
 use crate::base::{ObjectRegistry, ObjectRegistryID, ProxyBridge};
 use crate::deno::{CommonState, V8IsolateManagerInner};
@@ -20,29 +25,6 @@ use crate::MAX_PROXY_DEPTH;
 
 /// Minimum stack size for V8 isolates
 pub const V8_MIN_STACK_SIZE: usize = 1024 * 1024 * 15; // 15MB minimum memory
-
-fn obj_registry_type_to_i32(typ: ObjectRegistryType) -> i32 {
-    match typ {
-        ObjectRegistryType::String => 0,
-        ObjectRegistryType::Table => 1,
-        ObjectRegistryType::Function => 2,
-        ObjectRegistryType::UserData => 3,
-        ObjectRegistryType::Buffer => 4,
-        ObjectRegistryType::Thread => 5,
-    }
-}
-
-fn i32_to_obj_registry_type(val: i32) -> Option<ObjectRegistryType> {
-    match val {
-        0 => Some(ObjectRegistryType::String),
-        1 => Some(ObjectRegistryType::Table),
-        2 => Some(ObjectRegistryType::Function),
-        3 => Some(ObjectRegistryType::UserData),
-        4 => Some(ObjectRegistryType::Buffer),
-        5 => Some(ObjectRegistryType::Thread),
-        _ => None,
-    }
-}
 
 pub(crate) struct BridgeVals {
     type_field: v8::Global<v8::String>,
@@ -84,12 +66,147 @@ impl BridgeVals {
 #[derive(Clone, Copy)]
 pub struct V8BridgeObject;
 
-#[derive(Clone, Copy, Serialize, Deserialize)]
-pub enum V8ObjRegistryType {
-    Object,
-    Function,
-    Promise,
+/// The core struct encapsulating a V8 object being proxied *to* luau
+pub struct V8ObjectInner {
+    pub id: ObjectRegistryID<V8BridgeObject>,
+    pub typ: V8ObjectRegistryType,
+    pub bridge: V8IsolateManagerServer,
 }
+
+impl V8ObjectInner {
+    fn new(id: ObjectRegistryID<V8BridgeObject>, typ: V8ObjectRegistryType, bridge: V8IsolateManagerServer) -> Self {
+        Self {
+            id,
+            typ,
+            bridge,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct V8Object {
+    pub inner: Rc<RefCell<Option<V8ObjectInner>>>,
+}
+
+impl V8Object {
+    fn new(id: ObjectRegistryID<V8BridgeObject>, typ: V8ObjectRegistryType, bridge: V8IsolateManagerServer) -> Self {
+        Self {
+            inner: Rc::new(RefCell::new(Some(V8ObjectInner::new(id, typ, bridge)))),
+        }
+    }
+
+    fn get<R>(&self, func: impl FnOnce(&V8ObjectInner) -> R) -> Option<R> {
+        if let Some(inner) = self.inner.borrow().as_ref() {
+            func(inner).into()
+        } else {
+            None
+        }
+    }
+
+    fn get_bridge(&self) -> Option<V8IsolateManagerServer> {
+        self.get(|inner| inner.bridge.clone())
+    }
+}
+
+impl mluau::UserData for V8Object {
+    fn add_methods<M: mluau::UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("id", |_, this, ()| {
+            match this.inner.borrow().as_ref() {
+                Some(inner) => Ok(inner.id.objid()),
+                None => Err(mluau::Error::external("V8Object has already been dropped")),
+            }
+        });
+
+        methods.add_method("typestr", |_, this, ()| {
+            let typ = match this.inner.borrow().as_ref() {
+                Some(inner) => inner.typ,
+                None => return Err(mluau::Error::external("V8Object has already been dropped")),
+            };
+            let typ_str = match typ {
+                V8ObjectRegistryType::ArrayBuffer => "ArrayBuffer",
+                V8ObjectRegistryType::String => "String",
+                V8ObjectRegistryType::Object => "Object",
+                V8ObjectRegistryType::Array => "Array",
+                V8ObjectRegistryType::Function => "Function",
+                V8ObjectRegistryType::Promise => "Promise",
+            };
+            Ok(typ_str.to_string())
+        });
+
+        methods.add_method("type", |_, this, ()| {
+            let typ = match this.inner.borrow().as_ref() {
+                Some(inner) => inner.typ,
+                None => return Err(mluau::Error::external("V8Object has already been dropped")),
+            };
+            Ok(v8_obj_registry_type_to_i32(typ))
+        });
+
+        methods.add_method("requestdispose", |_, this, ()| {
+            if let Some(v) = this.inner.borrow_mut().take() {
+                let bridge = v.bridge;
+                bridge.request_drop_object(v.typ, v.id);
+            }
+            Ok(())
+        }); 
+    }
+}
+
+pub struct V8String {
+    pub obj: V8Object,
+    pub len: usize,
+}
+
+impl V8String {
+    fn new(id: ObjectRegistryID<V8BridgeObject>, len: usize, bridge: V8IsolateManagerServer) -> Self {
+        Self {
+            obj: V8Object::new(id, V8ObjectRegistryType::String, bridge),
+            len,
+        }
+    }
+}
+
+impl mluau::UserData for V8String {
+    fn add_methods<M: mluau::UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_meta_method(mluau::MetaMethod::Len, |_, this, ()| {
+            Ok(this.len)
+        });
+
+        methods.add_method("object", |_, this, ()| {
+            Ok(this.obj.clone())
+        });
+    }
+}
+
+macro_rules! impl_v8_obj_stub {
+    ($name:ident, $typ:expr) => {
+        pub struct $name {
+            pub obj: V8Object,
+        }
+
+        impl $name {
+            pub fn new(id: ObjectRegistryID<V8BridgeObject>, bridge: V8IsolateManagerServer) -> Self {
+                Self {
+                    obj: V8Object::new(id, $typ, bridge),
+                }
+            }
+        }
+
+        impl mluau::UserData for $name {
+            fn add_methods<M: mluau::UserDataMethods<Self>>(methods: &mut M) {
+                methods.add_method("object", |_, this, ()| {
+                    Ok(this.obj.clone())
+                });
+            }
+        }
+    };
+}
+
+// For now
+impl_v8_obj_stub!(V8ArrayBuffer, V8ObjectRegistryType::ArrayBuffer);
+impl_v8_obj_stub!(V8ObjectObj, V8ObjectRegistryType::Object);
+impl_v8_obj_stub!(V8Array, V8ObjectRegistryType::Array);
+impl_v8_obj_stub!(V8Function, V8ObjectRegistryType::Function);
+impl_v8_obj_stub!(V8Promise, V8ObjectRegistryType::Promise);
 
 /// A V8 value that can now be easily proxied to Luau
 #[derive(Serialize, Deserialize)]
@@ -116,7 +233,7 @@ pub enum ProxiedV8Value {
 }
 
 impl ProxiedV8Value {
-    pub(crate) fn proxy_to_src_lua(self, _lua: &mluau::Lua, plc: &ProxyLuaClient, depth: usize) -> Result<mluau::Value, mluau::Error> {
+    pub(crate) fn proxy_to_src_lua(self, lua: &mluau::Lua, plc: &ProxyLuaClient, bridge: &V8IsolateManagerServer, depth: usize) -> Result<mluau::Value, mluau::Error> {
         if depth > MAX_PROXY_DEPTH {
             return Err(mluau::Error::external("Maximum proxy depth exceeded"));
         }
@@ -126,6 +243,45 @@ impl ProxiedV8Value {
             ProxiedV8Value::Boolean(b) => Ok(mluau::Value::Boolean(b)),
             ProxiedV8Value::Integer(i) => Ok(mluau::Value::Integer(i as i64)),
             ProxiedV8Value::Number(n) => Ok(mluau::Value::Number(n)),
+
+            // v8 values (v8 values being proxied from v8 to lua)
+            ProxiedV8Value::ArrayBuffer(buf_id) => {
+                let ud = V8ArrayBuffer::new(buf_id, bridge.clone());
+                let ud = lua.create_userdata(ud)?;
+                Ok(mluau::Value::UserData(ud))
+            }
+            ProxiedV8Value::String((string_id, len)) => {
+                let ud = V8String::new(string_id, len, bridge.clone());
+                let ud = lua.create_userdata(ud)?;
+                Ok(mluau::Value::UserData(ud))
+            }
+            ProxiedV8Value::Object(obj_id) => {
+                let ud = V8ObjectObj::new(obj_id, bridge.clone());
+                let ud = lua.create_userdata(ud)?;
+                Ok(mluau::Value::UserData(ud))
+            }
+            ProxiedV8Value::Array(arr_id) => {
+                let ud = V8Array::new(arr_id, bridge.clone());
+                let ud = lua.create_userdata(ud)?;
+                Ok(mluau::Value::UserData(ud))
+            }
+            ProxiedV8Value::Function(func_id) => {
+                let ud = V8Function::new(func_id, bridge.clone());
+                let ud = lua.create_userdata(ud)?;
+                Ok(mluau::Value::UserData(ud))
+            }
+            ProxiedV8Value::Promise(promise_id) => {
+                let ud = V8Promise::new(promise_id, bridge.clone());
+                let ud = lua.create_userdata(ud)?;
+                Ok(mluau::Value::UserData(ud))
+            }
+
+            // Source-owned values (lua values being proxied back from v8 to lua)
+            ProxiedV8Value::SrcString(str_id) => {
+                let s = plc.string_registry.get(str_id)
+                    .ok_or_else(|| mluau::Error::external(format!("String ID {} not found in registry", str_id)))?;
+                Ok(mluau::Value::String(s))
+            }
             ProxiedV8Value::SrcFunction(func_id) => {
                 let func = plc.func_registry.get(func_id)
                     .ok_or_else(|| mluau::Error::external(format!("Function ID {} not found in registry", func_id)))?;
@@ -151,8 +307,6 @@ impl ProxiedV8Value {
                     .ok_or_else(|| mluau::Error::external(format!("Userdata ID {} not found in registry", ud_id)))?;
                 Ok(mluau::Value::UserData(userdata))
             }
-            // TODO: Support non-primitives
-            _ => Err(mluau::Error::external("Unsupported V8 value type for proxying to Lua")),
         }
     }
 
@@ -322,16 +476,9 @@ impl V8IsolateManagerInner {
         
         let local_template = v8::Local::new(scope, (*obj_template).clone());
         
-        let bridge_ref = common_state.bridge.clone();
-        let external = common_state.finalizer_attachments.func_ids.add(scope, id, Some(Box::new(move || {
-            bridge_ref.request_drop_object(typ, id);
-        })))
-            .ok_or("Maximum number of proxied references reached")?;
-
         let obj = local_template.new_instance(scope).ok_or("Failed to create V8 proxy object")?;
-        obj.set_internal_field(0, external.into());
 
-        let id_val = v8::BigInt::new_from_i64(scope, id.get());
+        let id_val = v8::BigInt::new_from_i64(scope, id.objid());
         obj.set(scope, oid_key.into(), id_val.into());
         let type_val = v8::Integer::new(scope, obj_registry_type_to_i32(typ));
         obj.set(scope, otype_key.into(), type_val.into());
@@ -416,6 +563,39 @@ impl V8IsolateManagerInner {
     }
 }
 
+#[derive(Clone, Copy, Serialize, Deserialize)]
+pub enum V8ObjectRegistryType {
+    ArrayBuffer,
+    String,
+    Object,
+    Array,
+    Function,
+    Promise,
+}
+
+pub fn v8_obj_registry_type_to_i32(typ: V8ObjectRegistryType) -> i32 {
+    match typ {
+        V8ObjectRegistryType::ArrayBuffer => 0,
+        V8ObjectRegistryType::String => 1,
+        V8ObjectRegistryType::Object => 2,
+        V8ObjectRegistryType::Array => 3,
+        V8ObjectRegistryType::Function => 4,
+        V8ObjectRegistryType::Promise => 5,
+    }
+}
+
+pub fn i32_to_v8_obj_registry_type(i: i32) -> Option<V8ObjectRegistryType> {
+    match i {
+        0 => Some(V8ObjectRegistryType::ArrayBuffer),
+        1 => Some(V8ObjectRegistryType::String),
+        2 => Some(V8ObjectRegistryType::Object),
+        3 => Some(V8ObjectRegistryType::Array),
+        4 => Some(V8ObjectRegistryType::Function),
+        5 => Some(V8ObjectRegistryType::Promise),
+        _ => None,
+    }
+}
+
 #[derive(Clone)]
 /// The client side state for proxying Lua values
 /// 
@@ -440,6 +620,10 @@ pub enum V8IsolateManagerMessage {
         obj_id: ObjectRegistryID<V8BridgeObject>,
         key: ProxiedLuaValue,
         resp: OneshotSender<Result<ProxiedV8Value, String>>,
+    },
+    DropObject {
+        obj_type: V8ObjectRegistryType,
+        obj_id: ObjectRegistryID<V8BridgeObject>,
     },
     Shutdown,
 }
@@ -556,7 +740,32 @@ impl ConcurrentlyExecute for V8IsolateManagerClient {
                         V8IsolateManagerMessage::Shutdown => {
                             break;
                         }
+                        V8IsolateManagerMessage::DropObject { obj_type, obj_id } => {
+                            match obj_type {
+                                V8ObjectRegistryType::ArrayBuffer => {
+                                    inner.common_state.proxy_client.array_buffer_registry.remove(obj_id);
+                                }
+                                V8ObjectRegistryType::String => {
+                                    inner.common_state.proxy_client.string_registry.remove(obj_id);
+                                }
+                                V8ObjectRegistryType::Array => {
+                                    inner.common_state.proxy_client.array_registry.remove(obj_id);
+                                }
+                                V8ObjectRegistryType::Object => {
+                                    inner.common_state.proxy_client.obj_registry.remove(obj_id);
+                                }
+                                V8ObjectRegistryType::Function => {
+                                    inner.common_state.proxy_client.func_registry.remove(obj_id);
+                                }
+                                V8ObjectRegistryType::Promise => {
+                                    inner.common_state.proxy_client.promise_registry.remove(obj_id);
+                                }
+                            }
+                        }
                     }
+                }
+                _ = inner.cancellation_token.cancelled() => {
+                    break;
                 }
                 Some((result, resp)) = code_exec_queue.next() => {
                     // A code execution future has completed
@@ -647,6 +856,14 @@ impl V8IsolateManagerServer {
         resp_rx.recv().await.map_err(|e| format!("Failed to receive code exec response: {}", e))?
     }
 
+    pub fn request_drop_object(&self, obj_type: V8ObjectRegistryType, obj_id: ObjectRegistryID<V8BridgeObject>) {
+        let msg = V8IsolateManagerMessage::DropObject {
+            obj_type,
+            obj_id,
+        };
+        let _ = self.messenger.server(self.executor.server_context()).send(msg);
+    }
+
     pub async fn shutdown(&self) {
         let _ = self.messenger.server(self.executor.server_context()).send(V8IsolateManagerMessage::Shutdown);
         let _ = self.executor.shutdown();
@@ -663,7 +880,7 @@ impl ProxyBridge for V8IsolateManagerServer {
     }
 
     fn to_source_lua_value(&self, lua: &mluau::Lua, value: Self::ValueType, plc: &ProxyLuaClient, depth: usize) -> Result<mluau::Value, Error> {
-        Ok(value.proxy_to_src_lua(lua, plc, depth).map_err(|e| e.to_string())?)
+        Ok(value.proxy_to_src_lua(lua, plc, self, depth).map_err(|e| e.to_string())?)
     }
 
     async fn eval_from_source(&self, code: String, args: Vec<ProxiedLuaValue>) -> Result<Self::ValueType, crate::base::Error> {

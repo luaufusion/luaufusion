@@ -8,7 +8,7 @@ pub(crate) mod extension;
 pub(crate) mod base64_ops;
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::rc::Rc;
 
@@ -17,120 +17,16 @@ use deno_core::v8::CreateParams;
 use deno_core::{op2, v8, OpState};
 use tokio_util::sync::CancellationToken;
 
-use crate::luau::bridge::{LuaBridgeServiceClient, LuaBridgeObject, ProxiedLuaValue};
+use crate::luau::bridge::{i32_to_obj_registry_type, LuaBridgeServiceClient, ProxiedLuaValue};
 
 use crate::base::{ObjectRegistry, ObjectRegistryID};
 use bridge::{ProxiedV8Value, ProxyV8Client};
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
-const MAX_REFS: usize = 500;
 const MIN_HEAP_LIMIT: usize = 10 * 1024 * 1024; // 10MB
 
-/// Stores a pointer to a Rust struct and a V8 weak reference (with finalizer) to ensure the Rust struct is dropped when V8 garbage collects the associated object.
-struct Finalizer<T> {
-    ptr: *mut T,
-    _weak: v8::Weak<v8::External>,
-    finalized: Rc<RefCell<bool>>,
-}
-
-impl<T: 'static> Finalizer<T> {
-    // Create a new Finalizer given scope and Rust struct
-    //
-    // Returns the V8 local `v8::External`
-    // and the Finalizer struct itself which contains a weak reference to the `v8::External` with finalizer
-    fn new<'s>(
-        scope: &mut v8::HandleScope<'s, ()>,
-        rust_obj: T,
-        ext_cb: Option<Box<dyn FnOnce()>>,
-    ) -> (*mut T, v8::Local<'s, v8::External>, Self) {
-        let ptr = Box::into_raw(Box::new(rust_obj));
-        let external = v8::External::new(scope, ptr as *mut std::ffi::c_void);
-        let global_external = v8::Global::new(scope, external);
-        
-        let finalized = Rc::new(RefCell::new(false));
-
-        let finalized_ref = finalized.clone();
-        let weak = v8::Weak::with_guaranteed_finalizer(scope, global_external, Box::new(move || {
-            // Finalizer callback when V8 garbage collects the object
-            if !*finalized_ref.borrow() {
-                *finalized_ref.borrow_mut() = true; // Mark as finalized before droping to avoid double free in Drop
-                println!("Finalized V8 external and dropped Rust object at {:p}", ptr);
-                unsafe {
-                    drop(Box::from_raw(ptr));
-                }
-
-                if let Some(cb) = ext_cb {
-                    cb();
-                }
-            }
-        }));
-
-        let finalizer = Self {
-            ptr,
-            _weak: weak,
-            finalized,
-        };
-
-        (ptr, external, finalizer)
-    }
-}
-
-impl<T> Drop for Finalizer<T> {
-    fn drop(&mut self) {
-        if !*self.finalized.borrow() {
-            unsafe {
-                drop(Box::from_raw(self.ptr));
-            }
-            *self.finalized.borrow_mut() = true;
-        }
-    }
-}
-
-pub struct FinalizerList<T> {
-    list: Rc<RefCell<Vec<Finalizer<T>>>>,
-    ptrs: Rc<RefCell<HashSet<usize>>>, // SAFETY: We store them as usizes to avoid improper use of T
-}
-
-impl<T: 'static> Default for FinalizerList<T> {
-    fn default() -> Self {
-        Self {
-            list: Rc::default(),
-            ptrs: Rc::default(),
-        }
-    }
-}
-
-impl<T: 'static> Clone for FinalizerList<T> {
-    fn clone(&self) -> Self {
-        Self {
-            list: self.list.clone(),
-            ptrs: self.ptrs.clone(),
-        }
-    }
-}
-
-impl<T: 'static> FinalizerList<T> {
-    pub fn add<'s>(&self, scope: &mut v8::HandleScope<'s, ()>, rust_obj: T, ext_cb: Option<Box<dyn FnOnce()>>) -> Option<v8::Local<'s, v8::External>> {
-        let (ptr, external, finalizer) = Finalizer::new(scope, rust_obj, ext_cb);
-        let mut list = self.list.borrow_mut();
-        if list.len() >= MAX_REFS {
-            return None;
-        }
-
-        list.push(finalizer);
-
-        self.ptrs.borrow_mut().insert(ptr as usize);
-
-        Some(external)
-    }
-
-    pub fn contains(&self, ptr: *mut T) -> bool {
-        let list = self.ptrs.borrow();
-        list.contains(&(ptr as usize))
-    }
-}
-
+    
 /// Stores a lua function state
 /// 
 /// This is used internally to track async function call states
@@ -148,9 +44,8 @@ pub struct CommonState {
     list: Rc<RefCell<HashMap<i32, FunctionRunState>>>,
     bridge: LuaBridgeServiceClient<V8IsolateManagerServer>,
     obj_template: Rc<v8::Global<v8::ObjectTemplate>>,
-    finalizer_attachments: FinalizerAttachments,
     proxy_client: ProxyV8Client,
-    bridge_vals: Rc<BridgeVals>
+    bridge_vals: Rc<BridgeVals>,
 }
 
 /// Internal manager for a single V8 isolate with a minimal Deno runtime.
@@ -163,11 +58,6 @@ pub struct V8IsolateManagerInner {
     deno: deno_core::JsRuntime,
     cancellation_token: CancellationToken,
     common_state: CommonState
-}
-
-#[derive(Clone)]
-pub struct FinalizerAttachments {
-    func_ids: FinalizerList<ObjectRegistryID<LuaBridgeObject>>,
 }
 
 impl V8IsolateManagerInner {    
@@ -219,15 +109,10 @@ impl V8IsolateManagerInner {
             BridgeVals::new(scope)
         };
 
-        let func_ids = FinalizerList::default();
-
         let common_state = CommonState {
             list: Rc::new(RefCell::new(HashMap::new())),
             obj_template,
             bridge,
-            finalizer_attachments: FinalizerAttachments {
-                func_ids,
-            },
             proxy_client: ProxyV8Client {
                 string_registry: ObjectRegistry::new(),
                 array_registry: ObjectRegistry::new(),
@@ -254,10 +139,21 @@ impl V8IsolateManagerInner {
 
     fn create_obj_template<'s>(scope: &mut v8::HandleScope<'s, ()>) -> v8::Local<'s, v8::ObjectTemplate> {
         let template = v8::ObjectTemplate::new(scope);
-        // Reserve space for the pointer to the Rust struct.
-        template.set_internal_field_count(1);
         
         template
+    }
+}
+
+// OP to request dropping an object by ID and type
+#[op2(fast)]
+fn __dropluaobject(
+    #[state] state: &CommonState,
+    typ: i32,
+    #[bigint] id: i64,
+) {
+    if let Some(typ) = i32_to_obj_registry_type(typ) {            
+        let id = ObjectRegistryID::from_i64(id);
+        state.bridge.request_drop_object(typ, id);
     }
 }
 
