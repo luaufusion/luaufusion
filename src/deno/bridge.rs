@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 //use mluau::serde::de;
 
 use crate::luau::bridge::{
-    LuaBridgeMessage, LuaBridgeObject, LuaBridgeService, LuaBridgeServiceClient, ObjectRegistryType, ProxiedLuaValue, ProxyLuaClient,
+    LuaBridgeMessage, LuaBridgeObject, LuaBridgeService, LuaBridgeServiceClient, ObjectRegistryType, ProxyLuaClient,
     obj_registry_type_to_i32, i32_to_obj_registry_type
 };
 
@@ -93,18 +93,6 @@ impl V8Object {
         Self {
             inner: Rc::new(RefCell::new(Some(V8ObjectInner::new(id, typ, bridge)))),
         }
-    }
-
-    fn get<R>(&self, func: impl FnOnce(&V8ObjectInner) -> R) -> Option<R> {
-        if let Some(inner) = self.inner.borrow().as_ref() {
-            func(inner).into()
-        } else {
-            None
-        }
-    }
-
-    fn get_bridge(&self) -> Option<V8IsolateManagerServer> {
-        self.get(|inner| inner.bridge.clone())
     }
 }
 
@@ -215,7 +203,9 @@ pub enum ProxiedV8Value {
     Undefined,
     Boolean(bool),
     Integer(i32),
+    BigInt(i64),
     Number(f64),
+    Vector((f32, f32, f32)), 
     ArrayBuffer(ObjectRegistryID<V8BridgeObject>), // Buffer ID in the buffer registry
     String((ObjectRegistryID<V8BridgeObject>, usize)), // String ID in the string registry, length
     Object(ObjectRegistryID<V8BridgeObject>), // Object ID in the map registry
@@ -224,25 +214,80 @@ pub enum ProxiedV8Value {
     Promise(ObjectRegistryID<V8BridgeObject>), // Promise ID in the function registry
 
     // Source-owned stuff
-    SrcFunction(ObjectRegistryID<LuaBridgeObject>), // Function ID in the source lua's function registry
-    SrcTable(ObjectRegistryID<LuaBridgeObject>), // Table ID in the source lua's table registry
-    SrcThread(ObjectRegistryID<LuaBridgeObject>), // Thread ID in the source lua's thread registry
-    SrcBuffer(ObjectRegistryID<LuaBridgeObject>), // Buffer ID in the source lua's buffer registry
-    SrcUserData(ObjectRegistryID<LuaBridgeObject>), // Userdata ID in the source lua's userdata registry
-    SrcString(ObjectRegistryID<LuaBridgeObject>), // String ID in the source lua's string registry
+    SourceOwnedObject((ObjectRegistryType, ObjectRegistryID<LuaBridgeObject>, Option<usize>)), // (Type, ID, <optional length>) of the source-owned object
 }
 
 impl ProxiedV8Value {
-    pub(crate) fn proxy_to_src_lua(self, lua: &mluau::Lua, plc: &ProxyLuaClient, bridge: &V8IsolateManagerServer, depth: usize) -> Result<mluau::Value, mluau::Error> {
-        if depth > MAX_PROXY_DEPTH {
-            return Err(mluau::Error::external("Maximum proxy depth exceeded"));
+    /// Proxies a Luau value to a ProxiedV8Value
+    pub(crate) fn proxy_from_src_lua(plc: &ProxyLuaClient, value: mluau::Value) -> Result<Self, Error> {
+        match value {
+            mluau::Value::Nil => Ok(ProxiedV8Value::Nil),
+            mluau::Value::LightUserData(s) => Ok(ProxiedV8Value::BigInt(s.0 as i64)),
+            mluau::Value::Boolean(b) => Ok(ProxiedV8Value::Boolean(b)),
+            mluau::Value::Integer(i) => Ok(ProxiedV8Value::BigInt(i)),
+            mluau::Value::Number(n) => Ok(ProxiedV8Value::Number(n)),
+            mluau::Value::String(s) => {
+                let s_len = s.as_bytes().len();
+                let string_id = plc.string_registry.add(s)
+                    .ok_or_else(|| "String registry is full".to_string())?;
+                Ok(ProxiedV8Value::SourceOwnedObject((ObjectRegistryType::String, string_id, Some(s_len))))
+            },
+            mluau::Value::Table(t) => {
+                let table_id = plc.table_registry.add(t)
+                    .ok_or_else(|| "Table registry is full".to_string())?;
+
+                Ok(ProxiedV8Value::SourceOwnedObject((ObjectRegistryType::Table, table_id, None)))
+            }
+            mluau::Value::Function(f) => {
+                let func_id = plc.func_registry.add(f)
+                    .ok_or_else(|| "Function registry is full".to_string())?;
+                Ok(ProxiedV8Value::SourceOwnedObject((ObjectRegistryType::Function, func_id, None)))
+            }
+            mluau::Value::UserData(ud) => {
+                let userdata_id = plc.userdata_registry.add(ud)
+                    .ok_or_else(|| "UserData registry is full".to_string())?;
+                Ok(ProxiedV8Value::SourceOwnedObject((ObjectRegistryType::UserData, userdata_id, None)))
+            }
+            mluau::Value::Vector(v) => Ok(ProxiedV8Value::Vector((v.x(), v.y(), v.z()))),
+            mluau::Value::Buffer(b) => {
+                let buffer_len = b.len();
+                let buffer_id = plc.buffer_registry.add(b)
+                    .ok_or_else(|| "Buffer registry is full".to_string())?;
+                Ok(ProxiedV8Value::SourceOwnedObject((ObjectRegistryType::Buffer, buffer_id, Some(buffer_len))))
+            }
+            mluau::Value::Thread(th) => {
+                let thread_id = plc.thread_registry.add(th)
+                    .ok_or_else(|| "Thread registry is full".to_string())?;
+                Ok(ProxiedV8Value::SourceOwnedObject((ObjectRegistryType::Thread, thread_id, None)))
+            }
+            mluau::Value::Error(e) => return Err(format!("Cannot proxy Lua error value: {}", e).into()),
+            mluau::Value::Other(r) => {
+                let s = format!("unknown({r:?})");
+                let s = plc.weak_lua.try_upgrade()
+                    .ok_or_else(|| "Lua state has been dropped".to_string())?
+                    .create_string(s.as_bytes())
+                    .map_err(|e| format!("Failed to create string for unknown Lua value: {}", e))?;
+                let s_len = s.as_bytes().len();
+                let string_id = plc.string_registry.add(s)
+                    .ok_or_else(|| "String registry is full".to_string())?;
+
+                Ok(ProxiedV8Value::SourceOwnedObject((ObjectRegistryType::String, string_id, Some(s_len))))
+            },
         }
-        
+    }
+
+    /// Proxy a ProxiedV8Value to a Luau value
+    pub(crate) fn proxy_to_src_lua(self, lua: &mluau::Lua, plc: &ProxyLuaClient, bridge: &V8IsolateManagerServer) -> Result<mluau::Value, mluau::Error> {
         match self {
             ProxiedV8Value::Nil | ProxiedV8Value::Undefined => Ok(mluau::Value::Nil),
             ProxiedV8Value::Boolean(b) => Ok(mluau::Value::Boolean(b)),
             ProxiedV8Value::Integer(i) => Ok(mluau::Value::Integer(i as i64)),
+            ProxiedV8Value::BigInt(i) => Ok(mluau::Value::Integer(i)),
             ProxiedV8Value::Number(n) => Ok(mluau::Value::Number(n)),
+            ProxiedV8Value::Vector((x,y,z)) => {
+                let vec = mluau::Vector::new(x, y, z);
+                Ok(mluau::Value::Vector(vec))
+            }
 
             // v8 values (v8 values being proxied from v8 to lua)
             ProxiedV8Value::ArrayBuffer(buf_id) => {
@@ -277,35 +322,39 @@ impl ProxiedV8Value {
             }
 
             // Source-owned values (lua values being proxied back from v8 to lua)
-            ProxiedV8Value::SrcString(str_id) => {
-                let s = plc.string_registry.get(str_id)
-                    .ok_or_else(|| mluau::Error::external(format!("String ID {} not found in registry", str_id)))?;
-                Ok(mluau::Value::String(s))
-            }
-            ProxiedV8Value::SrcFunction(func_id) => {
-                let func = plc.func_registry.get(func_id)
-                    .ok_or_else(|| mluau::Error::external(format!("Function ID {} not found in registry", func_id)))?;
-                Ok(mluau::Value::Function(func))
-            }
-            ProxiedV8Value::SrcTable(table_id) => {
-                let table = plc.table_registry.get(table_id)
-                    .ok_or_else(|| mluau::Error::external(format!("Table ID {} not found in registry", table_id)))?;
-                Ok(mluau::Value::Table(table))
-            }
-            ProxiedV8Value::SrcThread(thread_id) => {
-                let thread = plc.thread_registry.get(thread_id)
-                    .ok_or_else(|| mluau::Error::external(format!("Thread ID {} not found in registry", thread_id)))?;
-                Ok(mluau::Value::Thread(thread))
-            }
-            ProxiedV8Value::SrcBuffer(buf_id) => {
-                let buffer = plc.buffer_registry.get(buf_id)
-                    .ok_or_else(|| mluau::Error::external(format!("Buffer ID {} not found in registry", buf_id)))?;
-                Ok(mluau::Value::Buffer(buffer))
-            }
-            ProxiedV8Value::SrcUserData(ud_id) => {
-                let userdata = plc.userdata_registry.get(ud_id)
-                    .ok_or_else(|| mluau::Error::external(format!("Userdata ID {} not found in registry", ud_id)))?;
-                Ok(mluau::Value::UserData(userdata))
+            ProxiedV8Value::SourceOwnedObject((typ, id, _len)) => {
+                match typ {
+                    ObjectRegistryType::String => {
+                        let s = plc.string_registry.get(id)
+                            .ok_or_else(|| mluau::Error::external(format!("String ID {} not found in registry", id)))?;
+                        return Ok(mluau::Value::String(s));
+                    }
+                    ObjectRegistryType::Function => {
+                        let func = plc.func_registry.get(id)
+                            .ok_or_else(|| mluau::Error::external(format!("Function ID {} not found in registry", id)))?;
+                        return Ok(mluau::Value::Function(func));
+                    }
+                    ObjectRegistryType::Table => {
+                        let table = plc.table_registry.get(id)
+                            .ok_or_else(|| mluau::Error::external(format!("Table ID {} not found in registry", id)))?;
+                        return Ok(mluau::Value::Table(table));
+                    }
+                    ObjectRegistryType::Thread => {
+                        let thread = plc.thread_registry.get(id)
+                            .ok_or_else(|| mluau::Error::external(format!("Thread ID {} not found in registry", id)))?;
+                        return Ok(mluau::Value::Thread(thread));
+                    }
+                    ObjectRegistryType::Buffer => {
+                        let buffer = plc.buffer_registry.get(id)
+                            .ok_or_else(|| mluau::Error::external(format!("Buffer ID {} not found in registry", id)))?;
+                        return Ok(mluau::Value::Buffer(buffer));
+                    }
+                    ObjectRegistryType::UserData => {
+                        let userdata = plc.userdata_registry.get(id)
+                            .ok_or_else(|| mluau::Error::external(format!("Userdata ID {} not found in registry", id)))?;
+                        return Ok(mluau::Value::UserData(userdata));
+                    }
+                }
             }
         }
     }
@@ -342,26 +391,22 @@ impl ProxiedV8Value {
                         return Ok(None);
                     };
 
-                    match typ {
-                        ObjectRegistryType::Function => {
-                            return Ok(Some(Self::SrcFunction(ObjectRegistryID::from_i64(lua_id))));
+                    // Look for optional length field
+                    let len = {
+                        let len_key = v8::Local::new(scope, &common_state.bridge_vals.length_field);
+                        let len_val = obj.get(scope, len_key.into());
+                        if let Some(len_val) = len_val {
+                            if len_val.is_int32() {
+                                Some(len_val.to_int32(scope).ok_or("Failed to convert length to int32")?.value() as usize)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
                         }
-                        ObjectRegistryType::Table => {
-                            return Ok(Some(Self::SrcTable(ObjectRegistryID::from_i64(lua_id))));
-                        }
-                        ObjectRegistryType::Thread => {
-                            return Ok(Some(Self::SrcThread(ObjectRegistryID::from_i64(lua_id))));
-                        }
-                        ObjectRegistryType::Buffer => {
-                            return Ok(Some(Self::SrcBuffer(ObjectRegistryID::from_i64(lua_id))));
-                        }
-                        ObjectRegistryType::UserData => {
-                            return Ok(Some(Self::SrcUserData(ObjectRegistryID::from_i64(lua_id))));
-                        }
-                        ObjectRegistryType::String => {
-                            return Ok(Some(Self::SrcString(ObjectRegistryID::from_i64(lua_id))));
-                        }
-                    }
+                    };
+
+                    return Ok(Some(Self::SourceOwnedObject((typ, ObjectRegistryID::from_i64(lua_id), len))))
                 }
             }
         }
@@ -369,6 +414,7 @@ impl ProxiedV8Value {
         Ok(None)
     }
 
+    /// Given a v8 value, convert it to a ProxiedV8Value
     pub(crate) fn proxy_from_v8<'s>(
         scope: &mut v8::HandleScope<'s>, 
         value: v8::Local<'s, v8::Value>,
@@ -386,6 +432,20 @@ impl ProxiedV8Value {
         } else if value.is_boolean() {
             let b = value.to_boolean(scope).is_true();
             return Ok(Self::Boolean(b));
+        } else if value.is_big_int() {
+            let bi = value.to_big_int(scope).ok_or("Failed to convert to BigInt")?;
+            let (i, ok) = bi.i64_value();
+            if ok {
+                return Ok(Self::BigInt(i));
+            } else {
+                // Convert to an string instead
+                 let s = value.to_string(scope).ok_or("Failed to convert to string")?;
+                let s_len = s.length();
+                let global_str = v8::Global::new(scope, s);
+                let sid = common_state.proxy_client.string_registry.add(global_str)
+                    .ok_or("Failed to register string: too many string references")?;
+                return Ok(Self::String((sid, s_len)));
+            }
         } else if value.is_int32() {
             let i = value.to_int32(scope).ok_or("Failed to convert to int32")?.value();
             return Ok(Self::Integer(i));
@@ -401,6 +461,17 @@ impl ProxiedV8Value {
             return Ok(Self::String((sid, s_len)));
         } else if value.is_array() {
             let arr = v8::Local::<v8::Array>::try_from(value).map_err(|_| "Failed to convert to array")?;
+            if arr.length() == 3 {
+                let x = arr.get_index(scope, 0).ok_or("Failed to get array index 0")?;
+                let y = arr.get_index(scope, 1).ok_or("Failed to get array index 1")?;
+                let z = arr.get_index(scope, 2).ok_or("Failed to get array index 2")?;
+                if x.is_number() && y.is_number() && z.is_number() {
+                    let x = x.to_number(scope).ok_or("Failed to convert x to number")?.value() as f32;
+                    let y = y.to_number(scope).ok_or("Failed to convert y to number")?.value() as f32;
+                    let z = z.to_number(scope).ok_or("Failed to convert z to number")?.value() as f32;
+                    return Ok(Self::Vector((x, y, z)));
+                }
+            }
             let global_obj = v8::Global::new(scope, arr);
             let obj_id = common_state.proxy_client.array_registry.add(global_obj)
                 .ok_or("Failed to register array: too many array references")?;
@@ -439,97 +510,57 @@ impl ProxiedV8Value {
             return Err("Unsupported V8 value type".into());
         }
     }
-}
 
-impl V8IsolateManagerInner {
-    /// Proxy a ProxiedLuaValue to a V8 value
-    pub(crate) fn proxy_to_v8_impl(&mut self, value: ProxiedLuaValue) -> Result<v8::Global<v8::Value>, Error> {
-        let v8_ctx = self.deno.main_context();
-        let isolate = self.deno.v8_isolate();
-
-        let v8_value = {
-            let mut scope = v8::HandleScope::new(isolate);
-            let v8_ctx = v8::Local::new(&mut scope, v8_ctx);
-            let scope = &mut v8::ContextScope::new(&mut scope, v8_ctx);
-            match Self::proxy_to_v8(scope, &self.common_state, value, 0) {
-                Ok(v) => Ok(v8::Global::new(scope, v)),
-                Err(e) => Err(e),
-            }
-        };
-
-        println!("Proxied Lua value to V8");
-        
-        v8_value
-    }
-
-    fn proxy_objreg_from_lua<'s>(
-        scope: &mut v8::HandleScope<'s>,
-        typ: ObjectRegistryType,
-        id: ObjectRegistryID<LuaBridgeObject>,
-        len: Option<usize>,
-        common_state: &CommonState
-    ) -> Result<v8::Local<'s, v8::Value>, Error> {
-        let oid_key = v8::Local::new(scope, &common_state.bridge_vals.id_field);
-        let otype_key = v8::Local::new(scope, &common_state.bridge_vals.type_field);
-
-        let obj_template = common_state.obj_template.clone();
-        
-        let local_template = v8::Local::new(scope, (*obj_template).clone());
-        
-        let obj = local_template.new_instance(scope).ok_or("Failed to create V8 proxy object")?;
-
-        let id_val = v8::BigInt::new_from_i64(scope, id.objid());
-        obj.set(scope, oid_key.into(), id_val.into());
-        let type_val = v8::Integer::new(scope, obj_registry_type_to_i32(typ));
-        obj.set(scope, otype_key.into(), type_val.into());
-
-        if let Some(len) = len {
-            let len_key = v8::Local::new(scope, &common_state.bridge_vals.length_field);
-            let len_val = v8::Integer::new(scope, len as i32);
-            obj.set(scope, len_key.into(), len_val.into());
-        }
-        
-        let try_catch = &mut v8::TryCatch::new(scope);
-
-        let clfd = v8::Local::new(try_catch, &common_state.bridge_vals.create_lua_object_from_data);
-        let global = try_catch.get_current_context().global(try_catch);
-        let result = match clfd.call(try_catch, global.into(), &[obj.into()]) {
-            Some(r) => r,
-            None => {
-                if try_catch.has_caught() {
-                    let exception = try_catch.exception().unwrap();
-                    let exception_string = exception.to_rust_string_lossy(try_catch);
-                    return Err(format!("Failed to run createLuaObjectFromData: {}", exception_string).into());
-                }
-                return Err("Failed to run createLuaObjectFromData".into())
-            },
-        };
-        Ok(result)
-    }
-
-    // Internal implementation to convert a ProxiedLuaValue to a V8 value
+    /// Proxy a ProxiedV8Value to a V8 value
     pub(crate) fn proxy_to_v8<'s>(
+        self,
         scope: &mut v8::HandleScope<'s>, 
         common_state: &CommonState,
-        value: ProxiedLuaValue,
-        depth: usize,
     ) -> Result<v8::Local<'s, v8::Value>, Error> {
-        if depth > MAX_PROXY_DEPTH {
-            return Err("Maximum proxy depth exceeded".into());
-        }
-
-        let v8_value: v8::Local<v8::Value> = match value {
-            ProxiedLuaValue::Nil => v8::null(scope).into(),
-            ProxiedLuaValue::Boolean(b) => v8::Boolean::new(scope, b).into(),
-            ProxiedLuaValue::Integer(i) => {
-                if i >= i32::MIN as i64 && i <= i32::MAX as i64 {
-                    v8::Integer::new(scope, i as i32).into()
-                } else {
-                    v8::Number::new(scope, i as f64).into()
-                }
-            },
-            ProxiedLuaValue::Number(n) => v8::Number::new(scope, n).into(),
-            ProxiedLuaValue::Vector((x,y,z)) => {
+        match self {
+            Self::Nil => Ok(v8::null(scope).into()),
+            Self::Undefined => Ok(v8::undefined(scope).into()),
+            Self::Boolean(b) => Ok(v8::Boolean::new(scope, b).into()),
+            Self::Integer(i) => Ok(v8::Integer::new(scope, i).into()),
+            Self::BigInt(i) => Ok(v8::BigInt::new_from_i64(scope, i).into()),
+            Self::Number(n) => Ok(v8::Number::new(scope, n).into()),
+            Self::Array(arr_id) => {
+                let arr = common_state.proxy_client.array_registry.get(arr_id)
+                    .ok_or("Array ID not found in registry")?;
+                let arr = v8::Local::new(scope, arr.clone());
+                Ok(arr.into())
+            }
+            Self::ArrayBuffer(buf_id) => {
+                let ab = common_state.proxy_client.array_buffer_registry.get(buf_id)
+                    .ok_or("ArrayBuffer ID not found in registry")?;
+                let ab = v8::Local::new(scope, ab.clone());
+                Ok(ab.into())
+            }
+            Self::String((string_id, _len)) => {
+                let s = common_state.proxy_client.string_registry.get(string_id)
+                    .ok_or("String ID not found in registry")?;
+                let s = v8::Local::new(scope, s.clone());
+                Ok(s.into())
+            }
+            Self::Object(obj_id) => {
+                let obj = common_state.proxy_client.obj_registry.get(obj_id)
+                    .ok_or("Object ID not found in registry")?;
+                let obj = v8::Local::new(scope, obj.clone());
+                Ok(obj.into())
+            }
+            Self::Function(func_id) => {
+                let func = common_state.proxy_client.func_registry.get(func_id)
+                    .ok_or("Function ID not found in registry")?;
+                let func = v8::Local::new(scope, func.clone());
+                Ok(func.into())
+            }
+            Self::Promise(promise_id) => {
+                let promise = common_state.proxy_client.promise_registry.get(promise_id)
+                    .ok_or("Promise ID not found in registry")?;
+                let promise = v8::Local::new(scope, promise.clone());
+                Ok(promise.into())
+            }
+            Self::Vector((x,y, z)) => {
                 let arr = v8::Array::new(scope, 3);
                 let x = v8::Number::new(scope, x as f64);
                 let y = v8::Number::new(scope, y as f64);
@@ -537,29 +568,47 @@ impl V8IsolateManagerInner {
                 arr.set_index(scope, 0, x.into());
                 arr.set_index(scope, 1, y.into());
                 arr.set_index(scope, 2, z.into());
-                arr.into()
-            },
-            ProxiedLuaValue::String((string_id, len)) => {
-                Self::proxy_objreg_from_lua(scope, ObjectRegistryType::String, string_id, Some(len), common_state)?
+                Ok(arr.into())
             }
-            ProxiedLuaValue::Table(table_id) => {
-                Self::proxy_objreg_from_lua(scope, ObjectRegistryType::Table, table_id, None, common_state)?
-            }
-            ProxiedLuaValue::Function(func_id) => {
-                Self::proxy_objreg_from_lua(scope, ObjectRegistryType::Function, func_id, None, common_state)?
-            }
-            ProxiedLuaValue::Thread(thread_id) => {
-                Self::proxy_objreg_from_lua(scope, ObjectRegistryType::Thread, thread_id, None, common_state)?
-            }
-            ProxiedLuaValue::UserData(ud_id) => {
-                Self::proxy_objreg_from_lua(scope, ObjectRegistryType::UserData, ud_id, None, common_state)?
-            }
-            ProxiedLuaValue::Buffer(buf_id) => {
-                Self::proxy_objreg_from_lua(scope, ObjectRegistryType::Buffer, buf_id, None, common_state)?
-            }
-        };
+            Self::SourceOwnedObject((typ, id, len)) => {
+                let oid_key = v8::Local::new(scope, &common_state.bridge_vals.id_field);
+                let otype_key = v8::Local::new(scope, &common_state.bridge_vals.type_field);
 
-        Ok(v8_value)
+                let obj_template = common_state.obj_template.clone();
+                
+                let local_template = v8::Local::new(scope, (*obj_template).clone());
+                
+                let obj = local_template.new_instance(scope).ok_or("Failed to create V8 proxy object")?;
+
+                let id_val = v8::BigInt::new_from_i64(scope, id.objid());
+                obj.set(scope, oid_key.into(), id_val.into());
+                let type_val = v8::Integer::new(scope, obj_registry_type_to_i32(typ));
+                obj.set(scope, otype_key.into(), type_val.into());
+
+                if let Some(len) = len {
+                    let len_key = v8::Local::new(scope, &common_state.bridge_vals.length_field);
+                    let len_val = v8::Integer::new(scope, len as i32);
+                    obj.set(scope, len_key.into(), len_val.into());
+                }
+                
+                let try_catch = &mut v8::TryCatch::new(scope);
+
+                let clfd = v8::Local::new(try_catch, &common_state.bridge_vals.create_lua_object_from_data);
+                let global = try_catch.get_current_context().global(try_catch);
+                let result = match clfd.call(try_catch, global.into(), &[obj.into()]) {
+                    Some(r) => r,
+                    None => {
+                        if try_catch.has_caught() {
+                            let exception = try_catch.exception().unwrap();
+                            let exception_string = exception.to_rust_string_lossy(try_catch);
+                            return Err(format!("Failed to run createLuaObjectFromData: {}", exception_string).into());
+                        }
+                        return Err("Failed to run createLuaObjectFromData".into())
+                    },
+                };
+                Ok(result)
+            },
+        }
     }
 }
 
@@ -613,12 +662,12 @@ pub struct ProxyV8Client {
 pub enum V8IsolateManagerMessage {
     CodeExec {
         code: String,
-        args: Vec<ProxiedLuaValue>,
+        args: Vec<ProxiedV8Value>,
         resp: OneshotSender<Result<ProxiedV8Value, String>>,
     },
     GetObjectProperty {
         obj_id: ObjectRegistryID<V8BridgeObject>,
-        key: ProxiedLuaValue,
+        key: ProxiedV8Value,
         resp: OneshotSender<Result<ProxiedV8Value, String>>,
     },
     DropObject {
@@ -721,21 +770,73 @@ impl ConcurrentlyExecute for V8IsolateManagerClient {
                             };
                             // Call the function with args
                             // using denos' call_with_args
-                            let args = args.into_iter().map(|v| inner.proxy_to_v8_impl(v)).collect::<Result<Vec<_>, _>>();
-                            let args = match args {
-                                Ok(a) => a,
-                                Err(e) => {
-                                    let _ = resp.client(&client_ctx).send(Err(e.to_string()));
+                            let nargs = {
+                                let mut nargs = Vec::with_capacity(args.len());
+
+                                let main_ctx = inner.deno.main_context();
+                                let isolate = inner.deno.v8_isolate();
+                                let mut scope = v8::HandleScope::new(isolate);
+                                let main_ctx = v8::Global::new(&mut scope, main_ctx);
+                                let main_ctx = v8::Local::new(&mut scope, main_ctx);
+                                let context_scope = &mut v8::ContextScope::new(&mut scope, main_ctx);
+                                let mut err = None;
+                                for arg in args {
+                                    match arg.proxy_to_v8(context_scope, &inner.common_state) {
+                                        Ok(arg) => {
+                                            let global_arg = v8::Global::new(context_scope, arg);
+                                            nargs.push(global_arg);
+                                        },
+                                        Err(e) => {
+                                            err = Some(e);
+                                            break;
+                                        }
+                                    };
+                                }
+
+                                if let Some(err) = err {
+                                    let _ = resp.client(&client_ctx).send(Err(err.to_string()));
                                     continue;
                                 }
+
+                                nargs
                             };
-                            let fut = inner.deno.call_with_args(&func, &args);
+                            let fut = inner.deno.call_with_args(&func, &nargs);
                             code_exec_queue.push(async {
                                 let result = fut.await;
                                 (result, resp)
                             });
                         },
-                        V8IsolateManagerMessage::GetObjectProperty { obj_id: _, key: _, resp: _ } => {
+                        V8IsolateManagerMessage::GetObjectProperty { obj_id, key, resp } => {
+                            let obj = match inner.common_state.proxy_client.obj_registry.get(obj_id) {
+                                Some(o) => o,
+                                None => {
+                                    let _ = resp.client(&client_ctx).send(Err(format!("Object ID {} not found", obj_id).into()));
+                                    continue;
+                                }
+                            };
+                            let result = {
+                                let main_ctx = inner.deno.main_context();
+                                let isolate = inner.deno.v8_isolate();
+                                let mut scope = v8::HandleScope::new(isolate);
+                                let main_ctx = v8::Local::new(&mut scope, main_ctx);
+                                let scope = &mut v8::ContextScope::new(&mut scope, main_ctx);
+                                let obj = v8::Local::new(scope, obj);
+
+                                let key = match key.proxy_to_v8(scope, &inner.common_state) {
+                                    Ok(k) => k,
+                                    Err(e) => {
+                                        let _ = resp.client(&client_ctx).send(Err(e.to_string()));
+                                        continue;
+                                    }
+                                };
+
+                                let key = v8::Local::new(scope, key);
+                                match obj.get(scope, key) {
+                                    Some(v) => ProxiedV8Value::proxy_from_v8(scope, v, &inner.common_state, 0),
+                                    None => Err("Failed to get object property".into()),
+                                }
+                            };
+                            let _ = resp.client(&client_ctx).send(result.map_err(|e| e.to_string()));
                         },
                         V8IsolateManagerMessage::Shutdown => {
                             break;
@@ -845,7 +946,7 @@ impl V8IsolateManagerServer {
         Ok(self_ret)
     }
 
-    pub async fn exec_code(&self, code: String, args: Vec<ProxiedLuaValue>) -> Result<ProxiedV8Value, String> {
+    pub async fn exec_code(&self, code: String, args: Vec<ProxiedV8Value>) -> Result<ProxiedV8Value, String> {
         let (resp_tx, resp_rx) = self.executor.create_oneshot();
         let msg = V8IsolateManagerMessage::CodeExec {
             code,
@@ -879,11 +980,15 @@ impl ProxyBridge for V8IsolateManagerServer {
         self.executor.clone()
     }
 
-    fn to_source_lua_value(&self, lua: &mluau::Lua, value: Self::ValueType, plc: &ProxyLuaClient, depth: usize) -> Result<mluau::Value, Error> {
-        Ok(value.proxy_to_src_lua(lua, plc, self, depth).map_err(|e| e.to_string())?)
+    fn to_source_lua_value(&self, lua: &mluau::Lua, value: Self::ValueType, plc: &ProxyLuaClient) -> Result<mluau::Value, Error> {
+        Ok(value.proxy_to_src_lua(lua, plc, self).map_err(|e| e.to_string())?)
     }
 
-    async fn eval_from_source(&self, code: String, args: Vec<ProxiedLuaValue>) -> Result<Self::ValueType, crate::base::Error> {
+    fn from_source_lua_value(&self, _lua: &mluau::Lua, plc: &ProxyLuaClient, value: mluau::Value) -> Result<Self::ValueType, crate::base::Error> {
+        Ok(ProxiedV8Value::proxy_from_src_lua(plc, value).map_err(|e| e.to_string())?)
+    }
+
+    async fn eval_from_source(&self, code: String, args: Vec<ProxiedV8Value>) -> Result<Self::ValueType, crate::base::Error> {
         self.exec_code(code, args).await
             .map_err(|e| e.into())
     }

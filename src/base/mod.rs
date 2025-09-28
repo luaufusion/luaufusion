@@ -3,7 +3,7 @@ use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc};
 use concurrentlyexec::{ConcurrentExecutor, ConcurrentlyExecute};
 use serde::{Deserialize, Serialize};
 
-use crate::luau::bridge::{ProxiedLuaValue, ProxyLuaClient};
+use crate::luau::bridge::ProxyLuaClient;
 
 pub const MAX_INTERN_SIZE: usize = 1024 * 512; // 512 KB
 pub const MAX_OBJECT_REGISTRY_SIZE: usize = 2048; // 2048 objects
@@ -183,9 +183,12 @@ pub trait ProxyBridge: Clone {
     /// Returns the executor for concurrently executing tasks on a separate process
     fn get_executor(&self) -> Arc<ConcurrentExecutor<Self::ConcurrentlyExecuteClient>>;
 
-    /// Convert a value from the foreign language to a proxied value
-    fn to_source_lua_value(&self, lua: &mluau::Lua, value: Self::ValueType, plc: &ProxyLuaClient, depth: usize) -> Result<mluau::Value, Error>;
+    /// Convert a value from the foreign language to a lua owned value
+    fn to_source_lua_value(&self, lua: &mluau::Lua, value: Self::ValueType, plc: &ProxyLuaClient) -> Result<mluau::Value, Error>;
+
+    /// Convert a value from the source lua to a foreign language owned value type
+    fn from_source_lua_value(&self, lua: &mluau::Lua, plc: &ProxyLuaClient, value: mluau::Value) -> Result<Self::ValueType, Error>;
 
     /// Evaluates code (string) from the source Luau to the foreign language
-    async fn eval_from_source(&self, code: String, args: Vec<ProxiedLuaValue>) -> Result<Self::ValueType, Error>;
+    async fn eval_from_source(&self, code: String, args: Vec<Self::ValueType>) -> Result<Self::ValueType, Error>;
 }

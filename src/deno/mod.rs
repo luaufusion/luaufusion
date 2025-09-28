@@ -17,7 +17,7 @@ use deno_core::v8::CreateParams;
 use deno_core::{op2, v8, OpState};
 use tokio_util::sync::CancellationToken;
 
-use crate::luau::bridge::{i32_to_obj_registry_type, LuaBridgeServiceClient, ProxiedLuaValue};
+use crate::luau::bridge::{i32_to_obj_registry_type, LuaBridgeServiceClient};
 
 use crate::base::{ObjectRegistry, ObjectRegistryID};
 use bridge::{ProxiedV8Value, ProxyV8Client};
@@ -32,10 +32,10 @@ const MIN_HEAP_LIMIT: usize = 10 * 1024 * 1024; // 10MB
 /// This is used internally to track async function call states
 enum FunctionRunState {
     Created {
-        fut: Pin<Box<dyn std::future::Future<Output = Result<Vec<ProxiedLuaValue>, Error>>>>,
+        fut: Pin<Box<dyn std::future::Future<Output = Result<Vec<ProxiedV8Value>, Error>>>>,
     },
     Executed {
-        lua_resp: Vec<ProxiedLuaValue>,
+        lua_resp: Vec<ProxiedV8Value>,
     },
 }
 
@@ -247,7 +247,7 @@ fn __luaret<'s>(
             // Proxy every return value to V8
             let mut results = vec![];
             for ret in lua_resp {
-                match V8IsolateManagerInner::proxy_to_v8(scope, state, ret, 0) {
+                match ret.proxy_to_v8(scope, state) {
                     Ok(v8_ret) => results.push(v8_ret),
                     Err(e) => {
                         return Err(deno_error::JsErrorBox::generic(format!("Failed to convert return value: {}", e)));
