@@ -40,11 +40,20 @@ impl ModuleLoader for FusionModuleLoader {
     module_specifier: &ModuleSpecifier,
     _maybe_referrer: Option<&ModuleSpecifier>,
     _is_dyn_import: bool,
-    _requested_module_type: RequestedModuleType,
+    requested_module_type: RequestedModuleType,
   ) -> ModuleLoadResponse {
-    let res = if let Some(code) = self.map.get(module_specifier.as_str()) {
+    // TODO: Handle this better?
+    let module_type = if requested_module_type == RequestedModuleType::Json {
+      ModuleType::Json
+    } else {
+      ModuleType::JavaScript
+    };
+
+    let path = module_specifier.path_segments().unwrap().collect::<Vec<_>>().join("/");
+    println!("Loading module: {:?}", path);
+    let res = if let Some(code) = self.map.get(path.as_str()) {
       Ok(ModuleSource::new(
-        ModuleType::JavaScript, // TODO: Support autodetection module types
+        module_type,
         ModuleSourceCode::String(code.try_clone().unwrap()),
         module_specifier,
         None,

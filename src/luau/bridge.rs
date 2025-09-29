@@ -367,15 +367,15 @@ impl<T: ProxyBridge> mluau::UserData for LangBridge<T> {
         fields.add_field("lang", T::name());
     }
     fn add_methods<M: mluau::UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_scheduler_async_method("run", async move |lua, this, (code, args): (String, mluau::MultiValue)| {
-            let mut args_converted = Vec::with_capacity(args.len());
+        methods.add_scheduler_async_method("run", async move |lua, this, modname: String| {
+            /*let mut args_converted = Vec::with_capacity(args.len());
             for arg in args {
                 match this.bridge.from_source_lua_value(&lua, &this.plc, arg) {
                     Ok(v) => args_converted.push(v),
                     Err(e) => return Err(mluau::Error::external(format!("Failed to convert argument to foreign language value: {}", e))),
                 }
-            }
-            let result = this.bridge.eval_from_source(code, args_converted).await
+            }*/
+            let result = this.bridge.eval_from_source(modname).await
                 .map_err(|e| mluau::Error::external(format!("Failed to evaluate code in foreign language: {}", e)))?;
             this.bridge.to_source_lua_value(&lua, result, &this.plc)
                 .map_err(|e| mluau::Error::external(format!("Failed to convert return value to Lua value: {}", e)))

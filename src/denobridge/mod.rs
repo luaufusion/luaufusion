@@ -3,7 +3,8 @@
 pub mod bridge;
 pub mod modloader;
 
-use bridge::{BridgeVals, V8IsolateManagerServer};
+use bridge::BridgeVals;
+pub use bridge::V8IsolateManagerServer;
 
 pub(crate) mod denoexts;
 

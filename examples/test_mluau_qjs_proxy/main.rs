@@ -1,17 +1,15 @@
+use std::collections::HashMap;
+
+use concurrentlyexec::{ConcurrentExecutor, ConcurrentExecutorState, ProcessOpts};
+use mlua_scheduler::{taskmgr::NoopHooks, LuaSchedulerAsync, XRc};
+use mluau::IntoLua;
+use mluau_quickjs_proxy::base::ProxyBridge;
+use mluau_quickjs_proxy::denobridge::V8IsolateManagerServer;
+use mluau_quickjs_proxy::luau::bridge::LangBridge;
+
+const HEAP_LIMIT: usize = 10 * 1024 * 1024; // 10 MB
+
 fn main() {
-    /*use mlua_scheduler::{taskmgr::NoopHooks, LuaSchedulerAsync, XRc};
-    use mluau::IntoLua;
-    use tokio_util::sync::CancellationToken;
-
-    use mluau_quickjs_proxy::denobridge::V8IsolateManagerServer;
-
-    println!("Starting V8 isolate manager test");
-    let lua = mluau::Lua::new();
-    let compiler = mluau::Compiler::new().set_optimization_level(2);
-    lua.set_compiler(compiler);
-
-    let manager_i = super::V8IsolateManagerInner::new(&lua, super::MIN_HEAP_LIMIT);
-
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -19,7 +17,20 @@ fn main() {
 
     let local = tokio::task::LocalSet::new();
     local.block_on(&rt, async move {
+        let args = std::env::args().collect::<Vec<_>>();
+        if args.len() > 1 {
+            assert!(args[1] == "child", "Invalid argument");
+            println!("[child] Starting child process mode");
+            ConcurrentExecutor::<<V8IsolateManagerServer as ProxyBridge>::ConcurrentlyExecuteClient>::run_process_client().await;
+            return;
+        }
+
         println!("Creating Lua scheduler and task manager");
+
+        let lua = mluau::Lua::new();
+        let compiler = mluau::Compiler::new().set_optimization_level(2);
+        lua.set_compiler(compiler);
+
         let returns_tracker = mlua_scheduler::taskmgr::ReturnTracker::new();
 
         let mut wildcard_sender = returns_tracker.track_wildcard_thread();
@@ -55,39 +66,74 @@ fn main() {
 
         lua.sandbox(true).expect("Sandboxed VM"); // Sandbox VM
 
-        let (manager, rx) = V8IsolateManager::new();
-        tokio::task::spawn_local(async move {
-            let _inner = V8IsolateManager::run(manager_i, rx, CancellationToken::new()).await;
-        });
+        let vfs = HashMap::from([
+            ("foo.js".to_string(), r#"
+export function foo() { 
+    return 123 
+}
+
+export function bar(x) {
+    return x * 2;
+}
+
+await Promise.resolve(); // Force async
+console.log(`In foo.js ${structuredClone}`);
+"#.to_string()),
+    ("bar.js".to_string(), r#"
+export function foo2() { 
+    return 123 
+}
+
+export function baz(x) {
+    return x * 2;
+}
+// Sleep for 2 seconds
+console.log("In bar.js, sleeping for 10 seconds...");
+console.log(typeof Deno.core.queueUserTimer)
+await new Promise(resolve => setTimeout(resolve, 10000));
+console.log("Awake now!");
+console.log(`In foo2.js ${structuredClone} ${structuredClone([1,2,3,4,{},JSON.stringify({a:1,b:2})])}`);
+
+let timeNow = Date.now();
+console.log("Time now is: " + timeNow);
+// Sleep for 0 seconds
+await new Promise(resolve => setTimeout(resolve, 0));
+console.log("Awake now again! Time now is: " + Date.now() + ", timeNow -  Date.now()", Date.now() - timeNow);
+"#.to_string()),
+        ]);
+
+        let bridge = LangBridge::<V8IsolateManagerServer>::new_from_bridge(
+            &lua, 
+            HEAP_LIMIT,
+            ProcessOpts {
+                debug_print: false,
+                start_timeout: std::time::Duration::from_secs(10),
+                cmd_argv: vec!["-".to_string(), "child".to_string()],
+                cmd_envs: vec![],
+            },
+            ConcurrentExecutorState::new(1),
+            vfs
+        ).await.expect("Failed to create Lua-V8 bridge");
 
         // Call the v8 function now as a async script
         let lua_code = r#"
 local v8 = ...
-local result = v8:eval([[
-(function() {
-async function f(waiter, v8ud, buf) {
-    // Allocate a large array to test heap limits
-    //let arr = new Array(1e6).fill(0).map((_, i) => i);
-    //console.log('Array allocated with length:', arr.length);
-    let v = await v8ud.isrunning(v8ud);
-    console.log('V8 userdata:', v8ud, v, typeof v);
-    console.log('Buffer:', buf, typeof buf.buffer, buf.buffer.byteLength);
-    let waited = await waiter();
-    return [waited, buf, v8ud]
-}
-
-return f;
-})()
-]], function() print('am here'); return task.wait(1) end, v8, buffer.create(10))
-assert(result[3] == v8)
-return result[1], result[2], result[3]
+local result = v8:run("foo.js")
+-- args to pass to foo: function() print('am here'); return task.wait(1) end, v8, buffer.create(10)
+print("Result from V8:", result)
+local result2 = v8:run("foo.js")
+print("Result2 from V8:", result2)
+local result3 = v8:run("bar.js")
+print("Result3 from V8:", result3)
+local result4 = v8:run("bar.js")
+print("Result4 from V8:", result4)
 "#;
 
         let func = lua.load(lua_code).into_function().expect("Failed to load Lua code");
         let th = lua.create_thread(func).expect("Failed to create Lua thread");
         
         let mut args = mluau::MultiValue::new();
-        args.push_back(manager.into_lua(&lua).expect("Failed to push QuickJS runtime to Lua"));
+        args.push_back(bridge.into_lua(&lua).expect("Failed to push QuickJS runtime to Lua"));
 
         let output = task_mgr
             .spawn_thread_and_wait(th, args)
@@ -97,5 +143,5 @@ return result[1], result[2], result[3]
             .expect("Lua thread returned an error");
         
         println!("Output: {:?}", output);
-    });*/
+    });
 }

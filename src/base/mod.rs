@@ -200,7 +200,7 @@ pub trait ProxyBridge: Clone + 'static {
     fn from_source_lua_value(&self, lua: &mluau::Lua, plc: &ProxyLuaClient, value: mluau::Value) -> Result<Self::ValueType, Error>;
 
     /// Evaluates code (string) from the source Luau to the foreign language
-    async fn eval_from_source(&self, code: String, args: Vec<Self::ValueType>) -> Result<Self::ValueType, Error>;
+    async fn eval_from_source(&self, modname: String) -> Result<Self::ValueType, Error>;
 
     /// Shuts down the bridge and its resources
     async fn shutdown(&self) -> Result<(), Error>;

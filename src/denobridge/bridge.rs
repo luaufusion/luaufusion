@@ -4,8 +4,9 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use concurrentlyexec::{ConcurrentExecutor, ConcurrentExecutorState, ConcurrentlyExecute, MultiSender, OneshotSender, ProcessOpts};
+use deno_core::v8::GetPropertyNamesArgs;
 //use deno_core::error::{CoreError, CoreErrorKind};
-use deno_core::v8;
+use deno_core::{PollEventLoopOptions, v8};
 use futures_util::stream::FuturesUnordered;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -46,6 +47,7 @@ impl BridgeVals {
             let global = scope.get_current_context().global(scope);
             let lua_str = v8::String::new(scope, "lua").unwrap();
             let lua_obj = global.get(scope, lua_str.into()).unwrap();
+            //println!("lua_obj: {:?}", lua_obj.to_rust_string_lossy(scope));
             assert!(lua_obj.is_object());
             let lua_obj = lua_obj.to_object(scope).unwrap();
             let clofd = v8::String::new(scope, "createLuaObjectFromData").unwrap();
@@ -663,8 +665,7 @@ pub struct ProxyV8Client {
 #[derive(Serialize, Deserialize)]
 pub enum V8IsolateManagerMessage {
     CodeExec {
-        code: String,
-        args: Vec<ProxiedV8Value>,
+        modname: String,
         resp: OneshotSender<Result<ProxiedV8Value, String>>,
     },
     GetObjectProperty {
@@ -681,59 +682,6 @@ pub enum V8IsolateManagerMessage {
 
 #[derive(Clone)]
 pub struct V8IsolateManagerClient {}
-
-impl V8IsolateManagerClient {
-    fn compile_code(
-        inner: &mut V8IsolateManagerInner,
-        code: String,
-    ) -> Result<v8::Global<v8::Function>, Error> {
-        let func = {
-            let main_ctx = inner.deno.main_context();
-            let isolate = inner.deno.v8_isolate();
-            let mut scope = v8::HandleScope::new(isolate);
-            let main_ctx = v8::Global::new(&mut scope, main_ctx);
-            let main_ctx = v8::Local::new(&mut scope, main_ctx);
-            let context_scope = &mut v8::ContextScope::new(&mut scope, main_ctx);
-            let try_catch = &mut v8::TryCatch::new(context_scope);
-            let script = v8::String::new(try_catch, &code)
-                .and_then(|s| v8::Script::compile(try_catch, s, None))
-                .ok_or_else(|| {
-                    if try_catch.has_caught() {
-                        let exception = try_catch.exception().unwrap();
-                        let exception_string = exception.to_rust_string_lossy(try_catch);
-                        format!("Failed to compile script: {}", exception_string)
-                    } else {
-                        "Failed to compile script".to_string()
-                    }
-                })?;
-
-            // Convert and proxy
-            let local_func = match script.run(try_catch) {
-                Some(result) => {
-                    if result.is_function() {
-                        v8::Local::<v8::Function>::try_from(result)
-                        .map_err(|e| format!("Failed to convert script result to function: {}", e))?
-                    } else {
-                        return Err("Script did not return a function".to_string().into());
-                    }
-                },
-                None => {
-                    if try_catch.has_caught() {
-                        let exception = try_catch.exception().unwrap();
-                        let exception_string = exception.to_rust_string_lossy(try_catch);
-                        return Err(format!("Failed to run script: {}", exception_string).into());
-                    } else {
-                        return Err("Failed to run script".to_string().into())
-                    }
-                }
-            };
-
-            v8::Global::new(try_catch, local_func)
-        };
-
-        Ok(func)
-    }
-}
 
 #[derive(Serialize, Deserialize)]
 pub struct V8BootstrapData {
@@ -758,23 +706,15 @@ impl ConcurrentlyExecute for V8IsolateManagerClient {
             FusionModuleLoader::new(data.vfs.into_iter().map(|(x, y)| (x, y.into())))
         );
 
-        let mut code_exec_queue = FuturesUnordered::new();
+        let mut evaluated_modules = HashMap::new();
+        let mut module_evaluate_queue = FuturesUnordered::new();
 
         loop {
             tokio::select! {
                 Ok(msg) = rx.recv() => {
                     match msg {
-                        V8IsolateManagerMessage::CodeExec { code, args, resp } => {
-                            let func = match Self::compile_code(&mut inner, code) {
-                                Ok(f) => f,
-                                Err(e) => {
-                                    let _ = resp.client(&client_ctx).send(Err(e.to_string()));
-                                    continue;
-                                }
-                            };
-                            // Call the function with args
-                            // using denos' call_with_args
-                            let nargs = {
+                        V8IsolateManagerMessage::CodeExec { modname, resp } => {
+                            /*let nargs = {
                                 let mut nargs = Vec::with_capacity(args.len());
 
                                 let main_ctx = inner.deno.main_context();
@@ -803,11 +743,57 @@ impl ConcurrentlyExecute for V8IsolateManagerClient {
                                 }
 
                                 nargs
+                            };*/
+
+                            if let Some(module_id) = evaluated_modules.get(&modname) {
+                                // Module already evaluated, just return the namespace object
+                                let namespace_obj = match inner.deno.get_module_namespace(*module_id) {
+                                    Ok(obj) => obj,
+                                    Err(e) => {
+                                        let _ = resp.client(&client_ctx).send(Err(format!("Failed to get module namespace: {}", e).into()));
+                                        continue;
+                                    }
+                                };
+                                // Proxy the namespace object to a ProxiedV8Value
+                                let proxied = {
+                                    let main_ctx = inner.deno.main_context();
+                                    let isolate = inner.deno.v8_isolate();
+                                    let mut scope = v8::HandleScope::new(isolate);
+                                    let main_ctx = v8::Local::new(&mut scope, main_ctx);
+                                    let context_scope = &mut v8::ContextScope::new(&mut scope, main_ctx);
+                                    let namespace_obj = v8::Local::new(context_scope, namespace_obj);
+                                    match ProxiedV8Value::proxy_from_v8(context_scope, namespace_obj.into(), &inner.common_state, 0) {
+                                        Ok(v) => v,
+                                        Err(e) => {
+                                            let _ = resp.client(&client_ctx).send(Err(format!("Failed to proxy module namespace: {}", e).into()));
+                                            continue;
+                                        }
+                                    }
+                                };
+
+                                let _ = resp.client(&client_ctx).send(Ok(proxied));
+                                continue;
+                            }
+
+                            let url = match deno_core::url::Url::parse(&format!("file:///{modname}")) {
+                                Ok(u) => u,
+                                Err(e) => {
+                                    let _ = resp.client(&client_ctx).send(Err(format!("Failed to parse module name as URL: {}", e).into()));
+                                    continue;
+                                }
                             };
-                            let fut = inner.deno.call_with_args(&func, &nargs);
-                            code_exec_queue.push(async {
-                                let result = fut.await;
-                                (result, resp)
+
+                            let id = match inner.deno.load_side_es_module(&url).await {
+                                Ok(id) => id,
+                                Err(e) => {
+                                    let _ = resp.client(&client_ctx).send(Err(format!("Failed to load module: {}", e).into()));
+                                    continue;
+                                }
+                            };
+                            let fut = inner.deno.mod_evaluate(id);
+                            module_evaluate_queue.push(async move {
+                                let module_id = fut.await.map(|_| id);
+                                (modname, module_id, resp)
                             });
                         },
                         V8IsolateManagerMessage::GetObjectProperty { obj_id, key, resp } => {
@@ -872,30 +858,47 @@ impl ConcurrentlyExecute for V8IsolateManagerClient {
                 _ = inner.cancellation_token.cancelled() => {
                     break;
                 }
-                Some((result, resp)) = code_exec_queue.next() => {
-                    // A code execution future has completed
-                    let result = match result {
-                        Ok(v) => {
-                            // Convert v8::Global<v8::Value> to ProxiedV8Value
-                            let main_ctx = inner.deno.main_context();
-                            let isolate = inner.deno.v8_isolate();
-                            let mut scope = v8::HandleScope::new(isolate);
-                            let main_ctx = v8::Local::new(&mut scope, main_ctx);
-                            let mut scope = &mut v8::ContextScope::new(&mut scope, main_ctx);
-                            let v = v8::Local::new(&mut scope, v);
-                            match ProxiedV8Value::proxy_from_v8(
-                                &mut scope, 
-                                v,
-                                &inner.common_state, 
-                                0
-                            ) {
-                                Ok(pv) => Ok(pv),
-                                Err(e) => Err(e),
+                _ = inner.deno.run_event_loop(PollEventLoopOptions {
+                    wait_for_inspector: false,
+                    pump_v8_message_loop: true,
+                }) => {
+                    tokio::task::yield_now().await;
+                },
+                Some((modname, result, resp)) = module_evaluate_queue.next() => {
+                    let Ok(result) = result else {
+                        let _ = resp.client(&client_ctx).send(Err("Failed to evaluate module".to_string().into()));
+                        continue;
+                    };
+                    evaluated_modules.insert(modname, result);
+                    let namespace_obj = match inner.deno.get_module_namespace(result) {
+                        Ok(obj) => obj,
+                        Err(e) => {
+                            let _ = resp.client(&client_ctx).send(Err(format!("Failed to get module namespace: {}", e).into()));
+                            continue;
+                        }
+                    };
+                    // Proxy the namespace object to a ProxiedV8Value
+                    let proxied = {
+                        let main_ctx = inner.deno.main_context();
+                        let isolate = inner.deno.v8_isolate();
+                        let mut scope = v8::HandleScope::new(isolate);
+                        let main_ctx = v8::Local::new(&mut scope, main_ctx);
+                        let context_scope = &mut v8::ContextScope::new(&mut scope, main_ctx);
+                        let namespace_obj = v8::Local::new(context_scope, namespace_obj);
+                        {
+                            let props = namespace_obj.get_own_property_names(context_scope, GetPropertyNamesArgs::default()).unwrap();
+                            println!("Got namespace object: {:?}", props.to_rust_string_lossy(context_scope));
+                        }
+                        match ProxiedV8Value::proxy_from_v8(context_scope, namespace_obj.into(), &inner.common_state, 0) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                let _ = resp.client(&client_ctx).send(Err(format!("Failed to proxy module namespace: {}", e).into()));
+                                continue;
                             }
                         }
-                        Err(e) => Err(format!("JavaScript execution error: {}", e).into()),
                     };
-                    let _ = resp.client(&client_ctx).send(result.map_err(|e| e.to_string()));
+
+                    let _ = resp.client(&client_ctx).send(Ok(proxied));
                 }
             }
         }
@@ -952,11 +955,10 @@ impl V8IsolateManagerServer {
         Ok(self_ret)
     }
 
-    pub async fn exec_code(&self, code: String, args: Vec<ProxiedV8Value>) -> Result<ProxiedV8Value, String> {
+    pub async fn exec_code(&self, modname: String) -> Result<ProxiedV8Value, String> {
         let (resp_tx, resp_rx) = self.executor.create_oneshot();
         let msg = V8IsolateManagerMessage::CodeExec {
-            code,
-            args,
+            modname,
             resp: resp_tx,
         };
         self.messenger.server(self.executor.server_context()).send(msg).map_err(|e| format!("Failed to send code exec message: {}", e))?;
@@ -1020,8 +1022,8 @@ impl ProxyBridge for V8IsolateManagerServer {
         Ok(ProxiedV8Value::proxy_from_src_lua(plc, value).map_err(|e| e.to_string())?)
     }
 
-    async fn eval_from_source(&self, code: String, args: Vec<ProxiedV8Value>) -> Result<Self::ValueType, crate::base::Error> {
-        self.exec_code(code, args).await
+    async fn eval_from_source(&self, modname: String) -> Result<Self::ValueType, crate::base::Error> {
+        self.exec_code(modname).await
             .map_err(|e| e.into())
     }
 

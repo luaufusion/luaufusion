@@ -147,7 +147,7 @@ impl ExtensionTrait<()> for luau_bridge {
 }
 
 pub(crate) fn luau_bridge_extension(is_snapshot: bool) -> Vec<Extension> {
-    vec![deno_structuredclone::build((), is_snapshot)]
+    vec![luau_bridge::build((), is_snapshot)]
 }
 
 pub(crate) fn all_extensions(is_snapshot: bool) -> Vec<Extension> {

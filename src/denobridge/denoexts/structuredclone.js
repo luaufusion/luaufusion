@@ -1,138 +1,111 @@
-// Copyright 2018-2025 the Deno authors. MIT license.
-
+import { op_structured_clone } from "ext:core/ops";
 import { core, primordials } from "ext:core/mod.js";
 const {
-  isArrayBuffer,
-} = core;
-const {
-  ArrayBuffer,
-  ArrayBufferPrototypeGetByteLength,
-  ArrayBufferPrototypeSlice,
-  ArrayBufferIsView,
-  DataView,
-  DataViewPrototypeGetBuffer,
-  DataViewPrototypeGetByteLength,
-  DataViewPrototypeGetByteOffset,
-  ObjectPrototypeIsPrototypeOf,
-  SafeWeakMap,
-  TypedArrayPrototypeGetBuffer,
-  TypedArrayPrototypeGetByteOffset,
-  TypedArrayPrototypeGetLength,
-  TypedArrayPrototypeGetSymbolToStringTag,
-  TypeErrorPrototype,
-  WeakMapPrototypeSet,
-  Int8Array,
-  Int16Array,
-  Int32Array,
-  BigInt64Array,
-  Uint8Array,
-  Uint8ClampedArray,
-  Uint16Array,
-  Uint32Array,
-  BigUint64Array,
-  Float32Array,
-  Float64Array,
+  TypeError,
+  indirectEval,
+  ReflectApply,
 } = primordials;
+const {
+  getAsyncContext,
+  setAsyncContext,
+} = core;
+import * as webidl from "ext:deno_webidl/00_webidl.js";
 
-const objectCloneMemo = new SafeWeakMap();
+/**
+ * Structured Clone
+ */
+globalThis.structuredClone = (value) => op_structured_clone(value)
+globalThis.structuredClone.toString = () => "function() { [native code] }"
+Object.freeze(globalThis.structuredClone);
 
-function cloneArrayBuffer(
-  srcBuffer,
-  srcByteOffset,
-  srcLength,
-  _cloneConstructor,
-) {
-  // this function fudges the return type but SharedArrayBuffer is disabled for a while anyway
-  return ArrayBufferPrototypeSlice(
-    srcBuffer,
-    srcByteOffset,
-    srcByteOffset + srcLength,
+// Timers as well
+function checkThis(thisArg) {
+  if (thisArg !== null && thisArg !== undefined && thisArg !== globalThis) {
+    throw new TypeError("Illegal invocation");
+  }
+}
+
+/**
+ * Call a callback function after a delay.
+ */
+globalThis.setTimeout = (callback, timeout = 0, ...args) => {
+  checkThis(this);
+  // If callback is a string, replace it with a function that evals the string on every timeout
+  if (typeof callback !== "function") {
+    const unboundCallback = webidl.converters.DOMString(callback);
+    callback = () => indirectEval(unboundCallback);
+  }
+  const unboundCallback = callback;
+  const asyncContext = getAsyncContext();
+  callback = () => {
+    const oldContext = getAsyncContext();
+    try {
+      setAsyncContext(asyncContext);
+      ReflectApply(unboundCallback, globalThis, args);
+    } finally {
+      setAsyncContext(oldContext);
+    }
+  };
+  timeout = webidl.converters.long(timeout);
+  return core.queueUserTimer(
+    core.getTimerDepth() + 1,
+    false,
+    timeout,
+    callback,
   );
 }
+globalThis.setTimeout.toString = () => "function() { [native code] }";
+Object.freeze(globalThis.setTimeout);
 
-// TODO(petamoriken): add Resizable ArrayBuffer support
-/** Clone a value in a similar way to structured cloning. It is similar to a
- * StructureDeserialize(StructuredSerialize(...)). */
-function structuredClone(value) {
-  // Performance optimization for buffers, otherwise
-  // `serialize/deserialize` will allocate new buffer.
-  if (isArrayBuffer(value)) {
-    const cloned = cloneArrayBuffer(
-      value,
-      0,
-      ArrayBufferPrototypeGetByteLength(value),
-      ArrayBuffer,
-    );
-    WeakMapPrototypeSet(objectCloneMemo, value, cloned);
-    return cloned;
+/**
+ * Call a callback function after a delay.
+ */
+globalThis.setInterval = (callback, timeout = 0, ...args) => {
+  checkThis(this);
+  if (typeof callback !== "function") {
+    const unboundCallback = webidl.converters.DOMString(callback);
+    callback = () => indirectEval(unboundCallback);
   }
-
-  if (ArrayBufferIsView(value)) {
-    const tag = TypedArrayPrototypeGetSymbolToStringTag(value);
-    // DataView
-    if (tag === undefined) {
-      return new DataView(
-        structuredClone(DataViewPrototypeGetBuffer(value)),
-        DataViewPrototypeGetByteOffset(value),
-        DataViewPrototypeGetByteLength(value),
-      );
+  const unboundCallback = callback;
+  const asyncContext = getAsyncContext();
+  callback = () => {
+    const oldContext = getAsyncContext(asyncContext);
+    try {
+      setAsyncContext(asyncContext);
+      ReflectApply(unboundCallback, globalThis, args);
+    } finally {
+      setAsyncContext(oldContext);
     }
-    // TypedArray
-    let Constructor;
-    switch (tag) {
-      case "Int8Array":
-        Constructor = Int8Array;
-        break;
-      case "Int16Array":
-        Constructor = Int16Array;
-        break;
-      case "Int32Array":
-        Constructor = Int32Array;
-        break;
-      case "BigInt64Array":
-        Constructor = BigInt64Array;
-        break;
-      case "Uint8Array":
-        Constructor = Uint8Array;
-        break;
-      case "Uint8ClampedArray":
-        Constructor = Uint8ClampedArray;
-        break;
-      case "Uint16Array":
-        Constructor = Uint16Array;
-        break;
-      case "Uint32Array":
-        Constructor = Uint32Array;
-        break;
-      case "BigUint64Array":
-        Constructor = BigUint64Array;
-        break;
-      case "Float16Array":
-        // TODO(petamoriken): add Float16Array to primordials
-        Constructor = Float16Array;
-        break;
-      case "Float32Array":
-        Constructor = Float32Array;
-        break;
-      case "Float64Array":
-        Constructor = Float64Array;
-        break;
-    }
-    return new Constructor(
-      structuredClone(TypedArrayPrototypeGetBuffer(value)),
-      TypedArrayPrototypeGetByteOffset(value),
-      TypedArrayPrototypeGetLength(value),
-    );
-  }
-
-  try {
-    return core.structuredClone(value);
-  } catch (e) {
-    if (ObjectPrototypeIsPrototypeOf(TypeErrorPrototype, e)) {
-      throw new Error(e.message, "DataCloneError");
-    }
-    throw e;
-  }
+  };
+  timeout = webidl.converters.long(timeout);
+  return core.queueUserTimer(
+    core.getTimerDepth() + 1,
+    true,
+    timeout,
+    callback,
+  );
 }
+globalThis.setInterval.toString = () => "function() { [native code] }";
+Object.freeze(globalThis.setInterval);
 
-export { structuredClone };
+/**
+ * Clear a timeout or interval.
+ */
+globalThis.clearTimeout = (id = 0) => {
+  checkThis(this);
+  id = webidl.converters.long(id);
+  core.cancelTimer(id);
+}
+globalThis.clearTimeout.toString = () => "function() { [native code] }";
+Object.freeze(globalThis.clearTimeout);
+
+/**
+ * Clear a timeout or interval.
+ */
+globalThis.clearInterval = (id = 0) => {
+  checkThis(this);
+  id = webidl.converters.long(id);
+  core.cancelTimer(id);
+}
+globalThis.clearInterval.toString = () => "function() { [native code] }";
+Object.freeze(globalThis.clearInterval);
