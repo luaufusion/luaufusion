@@ -1,6 +1,6 @@
 use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc};
 
-use concurrentlyexec::{ConcurrentExecutor, ConcurrentlyExecute};
+use concurrentlyexec::{ConcurrentExecutor, ConcurrentExecutorState, ConcurrentlyExecute, ProcessOpts};
 use serde::{Deserialize, Serialize};
 
 use crate::luau::bridge::ProxyLuaClient;
@@ -176,9 +176,19 @@ impl<T: Clone + PartialEq, U> ObjectRegistry<T, U> {
 }
 
 #[allow(async_fn_in_trait)]
-pub trait ProxyBridge: Clone {
+pub trait ProxyBridge: Clone + 'static {
     type ValueType: Send + Sync + Serialize + for<'de> Deserialize<'de> + 'static;
     type ConcurrentlyExecuteClient: ConcurrentlyExecute;
+
+    fn name() -> &'static str;
+
+    async fn new(
+        cs_state: ConcurrentExecutorState<Self::ConcurrentlyExecuteClient>, 
+        heap_limit: usize, 
+        process_opts: ProcessOpts,
+        plc: ProxyLuaClient,
+        vfs: HashMap<String, String>,
+    ) -> Result<Self, Error>;
 
     /// Returns the executor for concurrently executing tasks on a separate process
     fn get_executor(&self) -> Arc<ConcurrentExecutor<Self::ConcurrentlyExecuteClient>>;
@@ -191,4 +201,7 @@ pub trait ProxyBridge: Clone {
 
     /// Evaluates code (string) from the source Luau to the foreign language
     async fn eval_from_source(&self, code: String, args: Vec<Self::ValueType>) -> Result<Self::ValueType, Error>;
+
+    /// Shuts down the bridge and its resources
+    async fn shutdown(&self) -> Result<(), Error>;
 }

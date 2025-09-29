@@ -1,5 +1,8 @@
+use std::collections::HashMap;
+
 use crate::base::{ObjectRegistryID, ProxyBridge};
-use concurrentlyexec::{ClientContext, MultiReceiver, MultiSender, OneshotSender};
+use concurrentlyexec::{ClientContext, ConcurrentExecutorState, MultiReceiver, MultiSender, OneshotSender, ProcessOpts};
+use mlua_scheduler::LuaSchedulerAsyncUserData;
 use mluau::ObjectLike;
 use serde::{Deserialize, Serialize};
 use futures_util::stream::{FuturesUnordered, StreamExt};
@@ -40,13 +43,28 @@ pub struct LuaBridgeObject;
 /// 
 /// This struct is not thread safe and must be kept on the Lua side
 pub struct ProxyLuaClient {
-    pub weak_lua: WeakLua,
-    pub string_registry: ObjectRegistry<mluau::String, LuaBridgeObject>,
-    pub table_registry: ObjectRegistry<mluau::Table, LuaBridgeObject>,
-    pub func_registry: ObjectRegistry<mluau::Function, LuaBridgeObject>,
-    pub thread_registry: ObjectRegistry<mluau::Thread, LuaBridgeObject>,
-    pub userdata_registry: ObjectRegistry<mluau::AnyUserData, LuaBridgeObject>,
-    pub buffer_registry: ObjectRegistry<mluau::Buffer, LuaBridgeObject>,
+    pub(crate) weak_lua: WeakLua,
+    pub(crate) string_registry: ObjectRegistry<mluau::String, LuaBridgeObject>,
+    pub(crate) table_registry: ObjectRegistry<mluau::Table, LuaBridgeObject>,
+    pub(crate) func_registry: ObjectRegistry<mluau::Function, LuaBridgeObject>,
+    pub(crate) thread_registry: ObjectRegistry<mluau::Thread, LuaBridgeObject>,
+    pub(crate) userdata_registry: ObjectRegistry<mluau::AnyUserData, LuaBridgeObject>,
+    pub(crate) buffer_registry: ObjectRegistry<mluau::Buffer, LuaBridgeObject>,
+}
+
+impl ProxyLuaClient {
+    /// Creates a new proxy Lua client
+    pub fn new(lua: &mluau::Lua) -> Self {
+        Self {
+            weak_lua: lua.weak(),
+            string_registry: ObjectRegistry::new(),
+            table_registry: ObjectRegistry::new(),
+            func_registry: ObjectRegistry::new(),
+            thread_registry: ObjectRegistry::new(),
+            userdata_registry: ObjectRegistry::new(),
+            buffer_registry: ObjectRegistry::new(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize)]
@@ -70,6 +88,10 @@ pub enum LuaBridgeMessage<T: ProxyBridge> {
     ReadBuffer {
         buffer_id: ObjectRegistryID<LuaBridgeObject>,
         resp: OneshotSender<Result<Vec<u8>, String>>,
+    },
+    ReadString {
+        string_id: ObjectRegistryID<LuaBridgeObject>,
+        resp: OneshotSender<Result<String, String>>,
     },
     DropObject {
         obj_type: ObjectRegistryType,
@@ -161,6 +183,14 @@ impl<T: ProxyBridge> LuaBridgeService<T> {
                                 let buffer = plc.buffer_registry.get(buffer_id)
                                     .ok_or_else(|| format!("Buffer ID {} not found in registry", buffer_id))?;
                                 Ok(buffer.to_vec())
+                            })();
+                            let _ = resp.server(server_ctx).send(result);
+                        }
+                        LuaBridgeMessage::ReadString { string_id, resp } => {
+                            let result = (|| {
+                                let string = plc.string_registry.get(string_id)
+                                    .ok_or_else(|| format!("String ID {} not found in registry", string_id))?;
+                                Ok(string.to_str().map_err(|e| e.to_string())?.to_string())
                             })();
                             let _ = resp.server(server_ctx).send(result);
                         }
@@ -283,9 +313,73 @@ impl<T: ProxyBridge> LuaBridgeServiceClient<T> {
         Ok(resp_rx.recv().await.map_err(|e| format!("Failed to receive ReadBuffer response: {}", e))??)
     }
 
+    /// Reads the contents of a Lua string by its ID
+    pub async fn read_string(&self, string_id: ObjectRegistryID<LuaBridgeObject>) -> Result<String, Error> {
+        let (resp_tx, resp_rx) = self.client_context.oneshot();
+        self.tx.client(&self.client_context).send(LuaBridgeMessage::ReadString { string_id, resp: resp_tx })
+            .map_err(|e| format!("Failed to send ReadString message: {}", e))?;
+        Ok(resp_rx.recv().await.map_err(|e| format!("Failed to receive ReadString response: {}", e))??)
+    }
+
     /// Requests that an object be dropped from the registry
     pub fn request_drop_object(&self, obj_type: ObjectRegistryType, obj_id: ObjectRegistryID<LuaBridgeObject>) {
         let _ = self.tx.client(&self.client_context).send(LuaBridgeMessage::DropObject { obj_type, obj_id });
+    }
+}
+
+/// Common userdata for language bridges
+pub struct LangBridge<T: ProxyBridge> {
+    bridge: T,
+    plc: ProxyLuaClient,
+}
+
+impl<T: ProxyBridge> LangBridge<T> {
+    /// Creates a new language bridge
+    pub fn new(bridge: T, plc: ProxyLuaClient) -> Self {
+        Self { bridge, plc }
+    }
+
+    pub async fn new_from_bridge(
+        lua: &mluau::Lua,
+        heap_limit: usize,
+        process_opts: ProcessOpts,
+        cs_state: ConcurrentExecutorState<T::ConcurrentlyExecuteClient>,
+        vfs: HashMap<String, String>,
+    ) -> Result<Self, crate::base::Error> {
+        let plc = ProxyLuaClient::new(lua);
+        let bridge_vals = T::new(
+            cs_state,
+            heap_limit, // No heap limit
+            process_opts,
+            plc.clone(),
+            vfs
+        ).await?;
+
+        Ok(Self {
+            bridge: bridge_vals,
+            plc
+        })
+    }
+}
+
+impl<T: ProxyBridge> mluau::UserData for LangBridge<T> {
+    fn add_fields<F: mluau::UserDataFields<Self>>(fields: &mut F) {
+        fields.add_field("lang", T::name());
+    }
+    fn add_methods<M: mluau::UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_scheduler_async_method("run", async move |lua, this, (code, args): (String, mluau::MultiValue)| {
+            let mut args_converted = Vec::with_capacity(args.len());
+            for arg in args {
+                match this.bridge.from_source_lua_value(&lua, &this.plc, arg) {
+                    Ok(v) => args_converted.push(v),
+                    Err(e) => return Err(mluau::Error::external(format!("Failed to convert argument to foreign language value: {}", e))),
+                }
+            }
+            let result = this.bridge.eval_from_source(code, args_converted).await
+                .map_err(|e| mluau::Error::external(format!("Failed to evaluate code in foreign language: {}", e)))?;
+            this.bridge.to_source_lua_value(&lua, result, &this.plc)
+                .map_err(|e| mluau::Error::external(format!("Failed to convert return value to Lua value: {}", e)))
+        });
     }
 }
 

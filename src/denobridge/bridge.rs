@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -12,13 +13,14 @@ use serde::{Deserialize, Serialize};
 //use deno_error::JsErrorBox;
 //use mluau::serde::de;
 
+use crate::denobridge::modloader::FusionModuleLoader;
 use crate::luau::bridge::{
     LuaBridgeMessage, LuaBridgeObject, LuaBridgeService, LuaBridgeServiceClient, ObjectRegistryType, ProxyLuaClient,
     obj_registry_type_to_i32, i32_to_obj_registry_type
 };
 
 use crate::base::{ObjectRegistry, ObjectRegistryID, ProxyBridge};
-use crate::deno::{CommonState, V8IsolateManagerInner};
+use super::{CommonState, V8IsolateManagerInner};
 use super::Error;
 
 use crate::MAX_PROXY_DEPTH;
@@ -735,9 +737,10 @@ impl V8IsolateManagerClient {
 
 #[derive(Serialize, Deserialize)]
 pub struct V8BootstrapData {
-    pub heap_limit: usize,
-    pub messenger_tx: OneshotSender<MultiSender<V8IsolateManagerMessage>>,
-    pub lua_bridge_tx: MultiSender<LuaBridgeMessage<V8IsolateManagerServer>>
+    heap_limit: usize,
+    messenger_tx: OneshotSender<MultiSender<V8IsolateManagerMessage>>,
+    lua_bridge_tx: MultiSender<LuaBridgeMessage<V8IsolateManagerServer>>,
+    vfs: HashMap<String, String>,
 }
 
 impl ConcurrentlyExecute for V8IsolateManagerClient {
@@ -752,6 +755,7 @@ impl ConcurrentlyExecute for V8IsolateManagerClient {
         let mut inner = V8IsolateManagerInner::new(
             LuaBridgeServiceClient::new(client_ctx.clone(), data.lua_bridge_tx),
             data.heap_limit,
+            FusionModuleLoader::new(data.vfs.into_iter().map(|(x, y)| (x, y.into())))
         );
 
         let mut code_exec_queue = FuturesUnordered::new();
@@ -917,6 +921,7 @@ impl V8IsolateManagerServer {
         heap_limit: usize, 
         process_opts: ProcessOpts,
         plc: ProxyLuaClient,
+        vfs: HashMap<String, String>,
     ) -> Result<Self, crate::base::Error> {
         let (executor, (lua_bridge_rx, ms_rx)) = ConcurrentExecutor::new(
             cs_state,
@@ -928,6 +933,7 @@ impl V8IsolateManagerServer {
                     heap_limit,
                     messenger_tx: msg_tx,
                     lua_bridge_tx: tx,
+                    vfs
                 }, (rx, msg_rx))
             }
         ).await.map_err(|e| format!("Failed to create V8 isolate manager executor: {}", e))?;
@@ -965,9 +971,21 @@ impl V8IsolateManagerServer {
         let _ = self.messenger.server(self.executor.server_context()).send(msg);
     }
 
-    pub async fn shutdown(&self) {
+    pub async fn get_object_property(&self, obj_id: ObjectRegistryID<V8BridgeObject>, key: ProxiedV8Value) -> Result<ProxiedV8Value, String> {
+        let (resp_tx, resp_rx) = self.executor.create_oneshot();
+        let msg = V8IsolateManagerMessage::GetObjectProperty {
+            obj_id,
+            key,
+            resp: resp_tx,
+        };
+        self.messenger.server(self.executor.server_context()).send(msg).map_err(|e| format!("Failed to send get object property message: {}", e))?;
+        resp_rx.recv().await.map_err(|e| format!("Failed to receive get object property response: {}", e))?
+    }
+
+    pub async fn shutdown(&self) -> Result<(), crate::base::Error> {
         let _ = self.messenger.server(self.executor.server_context()).send(V8IsolateManagerMessage::Shutdown);
-        let _ = self.executor.shutdown();
+        self.executor.shutdown().await?;
+        Ok(())
     }
 }
 
@@ -975,6 +993,20 @@ impl V8IsolateManagerServer {
 impl ProxyBridge for V8IsolateManagerServer {
     type ValueType = ProxiedV8Value;
     type ConcurrentlyExecuteClient = V8IsolateManagerClient;
+
+    fn name() -> &'static str {
+        "v8"
+    }
+
+    async fn new(
+        cs_state: ConcurrentExecutorState<Self::ConcurrentlyExecuteClient>, 
+        heap_limit: usize, 
+        process_opts: ProcessOpts,
+        plc: ProxyLuaClient,
+        vfs: HashMap<String, String>,
+    ) -> Result<Self, crate::base::Error> {
+        Self::new(cs_state, heap_limit, process_opts, plc, vfs).await        
+    }
 
     fn get_executor(&self) -> Arc<ConcurrentExecutor<Self::ConcurrentlyExecuteClient>> {
         self.executor.clone()
@@ -992,4 +1024,9 @@ impl ProxyBridge for V8IsolateManagerServer {
         self.exec_code(code, args).await
             .map_err(|e| e.into())
     }
+
+    async fn shutdown(&self) -> Result<(), crate::base::Error> {
+        self.shutdown().await
+    }
 }
+

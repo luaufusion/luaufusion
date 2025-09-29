@@ -28,7 +28,7 @@ extension!(
     init_console,
     deps = [],
     esm_entry_point = "ext:init_console/console.js",
-    esm = [ dir "src/deno", "console.js" ],
+    esm = [ dir "src/denobridge/denoexts", "console.js" ],
 );
 impl ExtensionTrait<()> for init_console {
     fn init((): ()) -> Extension {
@@ -52,7 +52,7 @@ extension!(
     init_url,
     deps = [],
     esm_entry_point = "ext:init_url/url.js",
-    esm = [ dir "src/deno", "url.js" ],
+    esm = [ dir "src/denobridge/denoexts", "url.js" ],
 );
 impl ExtensionTrait<()> for init_url {
     fn init((): ()) -> Extension {
@@ -76,7 +76,7 @@ extension!(
     init_webidl,
     deps = [],
     esm_entry_point = "ext:init_webidl/webidl.js",
-    esm = [ dir "src/deno", "webidl.js" ],
+    esm = [ dir "src/denobridge/denoexts", "webidl.js" ],
 );
 impl ExtensionTrait<()> for init_webidl {
     fn init((): ()) -> Extension {
@@ -102,7 +102,7 @@ extension!(
         super::base64_ops::op_base64_decode, super::base64_ops::op_base64_atob, super::base64_ops::op_base64_encode, super::base64_ops::op_base64_btoa,
     ],
     esm_entry_point = "ext:init_b64/base64.js",
-    esm = [ dir "src/deno", "base64.js" ],
+    esm = [ dir "src/denobridge/denoexts", "base64.js" ],
 );
 impl ExtensionTrait<()> for init_b64 {
     fn init((): ()) -> Extension {
@@ -117,7 +117,7 @@ pub(crate) fn b64_extensions(is_snapshot: bool) -> Vec<Extension> {
 extension!(
     deno_structuredclone,
     esm_entry_point = "ext:deno_structuredclone/structuredclone.js",
-    esm = [ dir "src/deno", "structuredclone.js" ],
+    esm = [ dir "src/denobridge/denoexts", "structuredclone.js" ],
 );
 impl ExtensionTrait<()> for deno_structuredclone {
     fn init((): ()) -> Extension {
@@ -132,13 +132,13 @@ pub(crate) fn structuredclone_extensions(is_snapshot: bool) -> Vec<Extension> {
 extension!(
     luau_bridge,
     ops = [
-        super::__dropluaobject,
-        super::__luadispatch,
-        super::__luarun,
-        super::__luaret,
+        crate::denobridge::__dropluaobject,
+        crate::denobridge::__luadispatch,
+        crate::denobridge::__luarun,
+        crate::denobridge::__luaret,
     ],
     esm_entry_point = "ext:luau_bridge/cls.js",
-    esm = [ dir "src/deno/bridge", "cls.js" ],
+    esm = [ dir "src/denobridge/bridge", "cls.js" ],
 );
 impl ExtensionTrait<()> for luau_bridge {
     fn init((): ()) -> Extension {
