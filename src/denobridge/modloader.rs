@@ -32,7 +32,13 @@ impl ModuleLoader for FusionModuleLoader {
     referrer: &str,
     _kind: ResolutionKind,
   ) -> Result<ModuleSpecifier, ModuleLoaderError> {
-    resolve_import(specifier, referrer).map_err(JsErrorBox::from_err)
+    let res = resolve_import(specifier, referrer).map_err(|e| {
+      JsErrorBox::from_err(e)
+    });
+
+    //println!("Resolving module: {:?} from {:?} -> {:?}", specifier, referrer, res);
+
+    res
   }
 
   fn load(
@@ -43,17 +49,28 @@ impl ModuleLoader for FusionModuleLoader {
     requested_module_type: RequestedModuleType,
   ) -> ModuleLoadResponse {
     // TODO: Handle this better?
+
+    let path = module_specifier.path_segments().unwrap().collect::<Vec<_>>().join("/");
+
     let module_type = if requested_module_type == RequestedModuleType::Json {
       ModuleType::Json
     } else {
-      ModuleType::JavaScript
+      let ext = path
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_lowercase();
+      if ext == "json" {
+        ModuleType::Json
+      } else {
+        ModuleType::JavaScript
+      }
     };
 
-    let path = module_specifier.path_segments().unwrap().collect::<Vec<_>>().join("/");
-    println!("Loading module: {:?}", path);
+    //println!("Loading module: {:?} {module_type} {requested_module_type}", path);
     let res = if let Some(code) = self.map.get(path.as_str()) {
       Ok(ModuleSource::new(
-        module_type,
+        module_type.clone(),
         ModuleSourceCode::String(code.try_clone().unwrap()),
         module_specifier,
         None,
@@ -61,6 +78,7 @@ impl ModuleLoader for FusionModuleLoader {
     } else {
       Err(JsErrorBox::generic("Module not found"))
     };
+    //println!("Loaded module: {:?} {res:?}", path);
     ModuleLoadResponse::Sync(res)
   }
 }

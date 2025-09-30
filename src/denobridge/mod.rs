@@ -69,6 +69,8 @@ impl V8IsolateManagerInner {
         // TODO: Support snapshots maybe
         let extensions = denoexts::extension::all_extensions(false);
 
+        deno_core::v8::V8::set_flags_from_string("--harmony-import-assertions --harmony-import-attributes");
+
         let mut deno = deno_core::JsRuntime::new(deno_core::RuntimeOptions {
             create_params: Some(
                 CreateParams::default()
@@ -77,6 +79,7 @@ impl V8IsolateManagerInner {
             extensions,
             module_loader: Some(Rc::new(loader)),
             inspector: false,
+            import_assertions_support: deno_core::ImportAssertionsSupport::Yes,
             ..Default::default()
         });
 
@@ -129,6 +132,10 @@ impl V8IsolateManagerInner {
         };
 
         deno.op_state().borrow_mut().put(common_state.clone());
+
+        let permissions = deno_permissions::Permissions::allow_all();
+
+        deno.op_state().borrow_mut().put(permissions);
 
         Self {
             deno,

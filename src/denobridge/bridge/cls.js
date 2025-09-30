@@ -156,7 +156,7 @@ let luaObjectCache = new WeakMap(); // Cache of LuaObject instances by luaid to 
  */
 const createLuaObjectFromData = (data) => {
     if(!data) throw new Error("No data provided to createLuaObject");
-    if(typeof data.luaid !== "number") throw new Error("Invalid luaid provided to createLuaObject");
+    if(typeof data.luaid !== "bigint") throw new Error("Invalid luaid provided to createLuaObject");
     if(typeof data.luatype !== "number") throw new Error("Invalid luatype provided to createLuaObject"); 
 
     // Check cache first

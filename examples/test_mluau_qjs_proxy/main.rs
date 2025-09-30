@@ -79,7 +79,22 @@ export function bar(x) {
 await Promise.resolve(); // Force async
 console.log(`In foo.js ${structuredClone}`);
 "#.to_string()),
+    ("foo1.json".to_string(), "{\"foo\":1929}".to_string()),
+    ("dir/foo.js".to_string(), r#"
+import * as bar from "./bar/bar.js";
+console.log("In dir/foo.js");
+"#.to_string()),
+    ("dir/bar/bar.js".to_string(), r#"
+import * as baz from "../baz.js";
+console.log("In dir/bar/bar.js");
+"#.to_string()),
+    ("dir/baz.js".to_string(), r#"
+console.log("In dir/baz.js");
+"#.to_string()),
     ("bar.js".to_string(), r#"
+import * as foobar from "./dir/foo.js";
+import a from "./foo1.json" with { type: "json" };
+console.log("In bar.js, imported foo1.json:", a);
 export function foo2() { 
     return 123 
 }
@@ -121,6 +136,11 @@ local v8 = ...
 local result = v8:run("foo.js")
 -- args to pass to foo: function() print('am here'); return task.wait(1) end, v8, buffer.create(10)
 print("Result from V8:", result)
+local propnames = result:getproperties()
+local fooprop = result:getproperty("foo")
+print("Properties of result:", propnames, fooprop)
+
+-- Test calling multiple times to ensure caching works
 local result2 = v8:run("foo.js")
 print("Result2 from V8:", result2)
 local result3 = v8:run("bar.js")

@@ -18,9 +18,11 @@ deno_url = { version = "0.214", optional = true }
 deno_webidl = { version = "0.214", optional = true }
 deno_error = { version = "0.7", optional = true }
 deno_console = { version = "0.214", optional = true }
+deno_permissions = { version = "0.76", optional = true }
 thiserror = { version = "2", optional = true }
 base64-simd = { version = "0.8", optional = true }
 
+
 [features]
 default = ["deno"]
-deno = ["dep:deno_core", "dep:deno_url", "dep:deno_webidl", "dep:deno_error", "dep:deno_console", "dep:thiserror", "dep:base64-simd"]
+deno = ["dep:deno_core", "dep:deno_url", "dep:deno_webidl", "dep:deno_error", "dep:deno_console", "dep:thiserror", "dep:base64-simd", "dep:deno_permissions"]

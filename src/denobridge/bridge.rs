@@ -9,6 +9,7 @@ use deno_core::v8::GetPropertyNamesArgs;
 use deno_core::{PollEventLoopOptions, v8};
 use futures_util::stream::FuturesUnordered;
 use futures_util::StreamExt;
+use mlua_scheduler::LuaSchedulerAsyncUserData;
 use serde::{Deserialize, Serialize};
 //use deno_core::{op2, OpState};
 //use deno_error::JsErrorBox;
@@ -74,14 +75,16 @@ pub struct V8BridgeObject;
 pub struct V8ObjectInner {
     pub id: ObjectRegistryID<V8BridgeObject>,
     pub typ: V8ObjectRegistryType,
+    pub plc: ProxyLuaClient,
     pub bridge: V8IsolateManagerServer,
 }
 
 impl V8ObjectInner {
-    fn new(id: ObjectRegistryID<V8BridgeObject>, typ: V8ObjectRegistryType, bridge: V8IsolateManagerServer) -> Self {
+    fn new(id: ObjectRegistryID<V8BridgeObject>, typ: V8ObjectRegistryType, plc: ProxyLuaClient, bridge: V8IsolateManagerServer) -> Self {
         Self {
             id,
             typ,
+            plc,
             bridge,
         }
     }
@@ -93,9 +96,9 @@ pub struct V8Object {
 }
 
 impl V8Object {
-    fn new(id: ObjectRegistryID<V8BridgeObject>, typ: V8ObjectRegistryType, bridge: V8IsolateManagerServer) -> Self {
+    fn new(id: ObjectRegistryID<V8BridgeObject>, typ: V8ObjectRegistryType, plc: ProxyLuaClient, bridge: V8IsolateManagerServer) -> Self {
         Self {
-            inner: Rc::new(RefCell::new(Some(V8ObjectInner::new(id, typ, bridge)))),
+            inner: Rc::new(RefCell::new(Some(V8ObjectInner::new(id, typ, plc, bridge)))),
         }
     }
 }
@@ -133,31 +136,21 @@ impl mluau::UserData for V8Object {
             Ok(v8_obj_registry_type_to_i32(typ))
         });
 
-        methods.add_method("requestdispose", |_, this, ()| {
+        methods.add_scheduler_async_method("requestdispose", async move |_, this, ()| {
             if let Some(v) = this.inner.borrow_mut().take() {
                 let bridge = v.bridge;
-                bridge.request_drop_object(v.typ, v.id);
+                bridge.send(DropObjectMessage {
+                    obj_type: v.typ,
+                    obj_id: v.id,
+                }).await.map_err(|e| mluau::Error::external(format!("Failed to send DropObjectMessage: {}", e)))?;
             }
             Ok(())
         }); 
     }
 }
 
-pub struct V8String {
-    pub obj: V8Object,
-    pub len: usize,
-}
 
-impl V8String {
-    fn new(id: ObjectRegistryID<V8BridgeObject>, len: usize, bridge: V8IsolateManagerServer) -> Self {
-        Self {
-            obj: V8Object::new(id, V8ObjectRegistryType::String, bridge),
-            len,
-        }
-    }
-}
-
-impl mluau::UserData for V8String {
+/*impl mluau::UserData for V8String {
     fn add_methods<M: mluau::UserDataMethods<Self>>(methods: &mut M) {
         methods.add_meta_method(mluau::MetaMethod::Len, |_, this, ()| {
             Ok(this.len)
@@ -167,19 +160,23 @@ impl mluau::UserData for V8String {
             Ok(this.obj.clone())
         });
     }
-}
+}*/
 
-macro_rules! impl_v8_obj_stub {
-    ($name:ident, $typ:expr) => {
+macro_rules! impl_v8_obj {
+    ($name:ident, $typ:expr, $ext_methods:expr) => {
         pub struct $name {
             pub obj: V8Object,
         }
 
         impl $name {
-            pub fn new(id: ObjectRegistryID<V8BridgeObject>, bridge: V8IsolateManagerServer) -> Self {
+            pub fn new(id: ObjectRegistryID<V8BridgeObject>, plc: ProxyLuaClient, bridge: V8IsolateManagerServer) -> Self {
                 Self {
-                    obj: V8Object::new(id, $typ, bridge),
+                    obj: V8Object::new(id, $typ, plc, bridge),
                 }
+            }
+
+            fn method_adder<M: mluau::UserDataMethods<Self>>(methods: &mut M) {
+                $ext_methods(methods);
             }
         }
 
@@ -188,17 +185,169 @@ macro_rules! impl_v8_obj_stub {
                 methods.add_method("object", |_, this, ()| {
                     Ok(this.obj.clone())
                 });
+
+                Self::method_adder(methods);
             }
         }
-    };
+    }
 }
 
-// For now
-impl_v8_obj_stub!(V8ArrayBuffer, V8ObjectRegistryType::ArrayBuffer);
-impl_v8_obj_stub!(V8ObjectObj, V8ObjectRegistryType::Object);
-impl_v8_obj_stub!(V8Array, V8ObjectRegistryType::Array);
-impl_v8_obj_stub!(V8Function, V8ObjectRegistryType::Function);
-impl_v8_obj_stub!(V8Promise, V8ObjectRegistryType::Promise);
+macro_rules! impl_v8_obj_with_len {
+    ($name:ident, $typ:expr, $ext_methods:expr) => {
+        pub struct $name {
+            pub obj: V8Object,
+            pub len: usize,
+        }
+
+        impl $name {
+            pub fn new(id: ObjectRegistryID<V8BridgeObject>, plc: ProxyLuaClient, bridge: V8IsolateManagerServer, len: usize) -> Self {
+                Self {
+                    obj: V8Object::new(id, $typ, plc, bridge),
+                    len,
+                }
+            }
+
+            fn method_adder<M: mluau::UserDataMethods<Self>>(methods: &mut M) {
+                $ext_methods(methods);
+            }
+        }
+
+        impl mluau::UserData for $name {
+            fn add_methods<M: mluau::UserDataMethods<Self>>(methods: &mut M) {
+                methods.add_meta_method(mluau::MetaMethod::Len, |_, this, ()| {
+                    Ok(this.len)
+                });
+
+                methods.add_method("object", |_, this, ()| {
+                    Ok(this.obj.clone())
+                });
+
+                Self::method_adder(methods);
+            }
+        }
+    }
+}
+
+impl_v8_obj_with_len!(V8String, V8ObjectRegistryType::String, |_m| {});
+
+impl_v8_obj!(V8ArrayBuffer, V8ObjectRegistryType::ArrayBuffer, |_m| {});
+
+impl_v8_obj!(V8ObjectObj, V8ObjectRegistryType::Object, __objmethods);
+fn __objmethods<M: mluau::UserDataMethods<V8ObjectObj>>(methods: &mut M) {
+    methods.add_scheduler_async_method("getproperties", async move |lua, this, has_own: Option<bool>| {
+        let _g = this.obj.inner.try_borrow()
+        .map_err(|e| mluau::Error::external(format!("Failed to borrow V8Object inner: {}", e)))?;
+        let inner = match _g.as_ref() {
+            Some(inner) => inner,
+            None => return Err(mluau::Error::external("V8Object has already been dropped")),
+        };
+        match inner.bridge.send(ObjectPropertiesMessage {
+            obj_id: inner.id,
+            own_props: has_own.unwrap_or(true)
+        })
+        .await
+        .map_err(|e| mluau::Error::external(format!("Failed to send ObjectPropertiesMessage: {}", e)))? {
+            Ok(v) => {
+                let val = v.proxy_to_src_lua(&lua, &inner.plc, &inner.bridge)?;
+                Ok(val)
+            },
+            Err(e) => return Err(mluau::Error::external(format!("Failed to get properties: {}", e))),
+        }
+    });
+
+    methods.add_scheduler_async_method("getproperty", async move |lua, this, key: mluau::Value| {
+        let _g = this.obj.inner.try_borrow()
+        .map_err(|e| mluau::Error::external(format!("Failed to borrow V8Object inner: {}", e)))?;
+        let inner = match _g.as_ref() {
+            Some(inner) => inner,
+            None => return Err(mluau::Error::external("V8Object has already been dropped")),
+        };
+        let key = ProxiedV8Key::luau_to_key(&key)
+        .map_err(|e| mluau::Error::external(format!("Failed to proxy key to ProxiedV8Value: {}", e)))?;
+        match inner.bridge.send(ObjectGetPropertyMessage {
+            obj_id: inner.id,
+            key
+        })
+        .await
+        .map_err(|e| mluau::Error::external(format!("Failed to send ObjectGetPropertyMessage: {}", e)))? {
+            Ok(v) => {
+                let val = v.proxy_to_src_lua(&lua, &inner.plc, &inner.bridge)?;
+                Ok(val)
+            },
+            Err(e) => return Err(mluau::Error::external(format!("Failed to get property: {}", e))),
+        }
+    });
+}
+
+//impl_v8_obj_stub!(V8ObjectObj, V8ObjectRegistryType::Object);
+impl_v8_obj!(V8Array, V8ObjectRegistryType::Array, |_m| {});
+impl_v8_obj!(V8Function, V8ObjectRegistryType::Function, |_m| {});
+impl_v8_obj!(V8Promise, V8ObjectRegistryType::Promise, |_m| {});
+
+/// While most operations can be expressed using just ProxiedV8Value, some operations
+/// need to have dynamic (non-owned) keys (especially for bootstrapping the JS side)
+/// 
+/// ProxiedV8Values, in comparison, are Luau-owned values that are sent to the VM as references.
+/// With objectgetproperty etc. however, we need to be able to send a key as a string and recover it
+/// as a V8 value.
+#[derive(Serialize, Deserialize, Clone)]
+pub enum ProxiedV8Key {
+    Nil,
+    Undefined,
+    Boolean(bool),
+    String(String),
+    Integer(i32),
+    Number(f64),
+    BigInt(i64),
+}
+
+impl ProxiedV8Key {
+    /// Luau -> ProxiedV8Key
+    pub(crate) fn luau_to_key(value: &mluau::Value) -> Result<Self, Error> {
+        match value {
+            mluau::Value::Nil => Ok(ProxiedV8Key::Nil),
+            mluau::Value::Boolean(b) => Ok(ProxiedV8Key::Boolean(*b)),
+            mluau::Value::LightUserData(s) => Ok(ProxiedV8Key::BigInt(s.0 as i64)),
+            mluau::Value::Integer(i) => {
+                if i >= &(i32::MIN as i64) && i <= &(i32::MAX as i64) {
+                    Ok(ProxiedV8Key::Integer(*i as i32))
+                } else {
+                    Ok(ProxiedV8Key::BigInt(*i))
+                }
+            },
+            mluau::Value::Number(n) => Ok(ProxiedV8Key::Number(*n)),
+            mluau::Value::String(s) => Ok(ProxiedV8Key::String(s.to_str().map_err(|e| format!("Failed to convert Lua string to Rust string: {}", e))?.to_string())),
+            _ => Err("Unsupported key type for ProxiedV8Key".into()),
+        }
+    }
+
+    /// ProxiedV8Key -> V8
+    pub(crate) fn to_v8<'s>(&self, scope: &mut v8::HandleScope<'s>) -> Result<v8::Local<'s, v8::Value>, Error> {
+        match self {
+            ProxiedV8Key::Nil => Ok(v8::null(scope).into()),
+            ProxiedV8Key::Undefined => Ok(v8::undefined(scope).into()),
+            ProxiedV8Key::Boolean(b) => Ok(v8::Boolean::new(scope, *b).into()),
+            ProxiedV8Key::String(s) => {
+                let mut try_catch = v8::TryCatch::new(scope);
+                let s = v8::String::new(try_catch.as_mut(), s);
+                match s {
+                    Some(s) => Ok(s.into()),
+                    None => {
+                        if try_catch.has_caught() {
+                            let exception = try_catch.exception().unwrap();
+                            let exception_str = exception.to_rust_string_lossy(try_catch.as_mut());
+                            return Err(format!("Failed to create V8 string from ProxiedV8Key: {}", exception_str).into());
+                        }
+                        return Err("Failed to create V8 string from ProxiedV8Key".into());
+                    },
+                }
+            },
+            ProxiedV8Key::Integer(i) => Ok(v8::Integer::new(scope, *i).into()),
+            ProxiedV8Key::Number(n) => Ok(v8::Number::new(scope, *n).into()),
+            ProxiedV8Key::BigInt(i) => Ok(v8::BigInt::new_from_i64(scope, *i).into()),
+        }
+    }
+}
 
 /// A V8 value that can now be easily proxied to Luau
 #[derive(Serialize, Deserialize)]
@@ -295,32 +444,32 @@ impl ProxiedV8Value {
 
             // v8 values (v8 values being proxied from v8 to lua)
             ProxiedV8Value::ArrayBuffer(buf_id) => {
-                let ud = V8ArrayBuffer::new(buf_id, bridge.clone());
+                let ud = V8ArrayBuffer::new(buf_id, plc.clone(), bridge.clone());
                 let ud = lua.create_userdata(ud)?;
                 Ok(mluau::Value::UserData(ud))
             }
             ProxiedV8Value::String((string_id, len)) => {
-                let ud = V8String::new(string_id, len, bridge.clone());
+                let ud = V8String::new(string_id, plc.clone(), bridge.clone(), len);
                 let ud = lua.create_userdata(ud)?;
                 Ok(mluau::Value::UserData(ud))
             }
             ProxiedV8Value::Object(obj_id) => {
-                let ud = V8ObjectObj::new(obj_id, bridge.clone());
+                let ud = V8ObjectObj::new(obj_id, plc.clone(), bridge.clone());
                 let ud = lua.create_userdata(ud)?;
                 Ok(mluau::Value::UserData(ud))
             }
             ProxiedV8Value::Array(arr_id) => {
-                let ud = V8Array::new(arr_id, bridge.clone());
+                let ud = V8Array::new(arr_id, plc.clone(), bridge.clone());
                 let ud = lua.create_userdata(ud)?;
                 Ok(mluau::Value::UserData(ud))
             }
             ProxiedV8Value::Function(func_id) => {
-                let ud = V8Function::new(func_id, bridge.clone());
+                let ud = V8Function::new(func_id, plc.clone(), bridge.clone());
                 let ud = lua.create_userdata(ud)?;
                 Ok(mluau::Value::UserData(ud))
             }
             ProxiedV8Value::Promise(promise_id) => {
-                let ud = V8Promise::new(promise_id, bridge.clone());
+                let ud = V8Promise::new(promise_id, plc.clone(), bridge.clone());
                 let ud = lua.create_userdata(ud)?;
                 Ok(mluau::Value::UserData(ud))
             }
@@ -663,14 +812,20 @@ pub struct ProxyV8Client {
 }
 
 #[derive(Serialize, Deserialize)]
-pub enum V8IsolateManagerMessage {
+/// Internal representation of a message that can be sent to the V8 isolate manager
+enum V8IsolateManagerMessage {
     CodeExec {
         modname: String,
         resp: OneshotSender<Result<ProxiedV8Value, String>>,
     },
-    GetObjectProperty {
+    ObjectProperties {
         obj_id: ObjectRegistryID<V8BridgeObject>,
-        key: ProxiedV8Value,
+        own_props: bool,
+        resp: OneshotSender<Result<ProxiedV8Value, String>>,
+    },
+    ObjectGetProperty {
+        obj_id: ObjectRegistryID<V8BridgeObject>,
+        key: ProxiedV8Key,
         resp: OneshotSender<Result<ProxiedV8Value, String>>,
     },
     DropObject {
@@ -680,8 +835,109 @@ pub enum V8IsolateManagerMessage {
     Shutdown,
 }
 
+/// A message that can be sent to the V8 isolate manager
+trait V8IsolateSendableMessage: Send + 'static {
+    type Response: Send + serde::Serialize + for<'de> serde::Deserialize<'de> + 'static;
+    fn to_message(self, resp: OneshotSender<Self::Response>) -> V8IsolateManagerMessage;
+}
+
+struct CodeExecMessage {
+    modname: String,
+}
+
+impl V8IsolateSendableMessage for CodeExecMessage {
+    type Response = Result<ProxiedV8Value, String>;
+    fn to_message(self, resp: OneshotSender<Self::Response>) -> V8IsolateManagerMessage {
+        V8IsolateManagerMessage::CodeExec {
+            modname: self.modname,
+            resp,
+        }
+    }
+}
+
+struct ObjectPropertiesMessage {
+    obj_id: ObjectRegistryID<V8BridgeObject>,
+    own_props: bool,
+}
+
+impl V8IsolateSendableMessage for ObjectPropertiesMessage {
+    type Response = Result<ProxiedV8Value, String>;
+    fn to_message(self, resp: OneshotSender<Self::Response>) -> V8IsolateManagerMessage {
+        V8IsolateManagerMessage::ObjectProperties {
+            obj_id: self.obj_id,
+            own_props: self.own_props,
+            resp,
+        }
+    }
+}
+
+struct ObjectGetPropertyMessage {
+    obj_id: ObjectRegistryID<V8BridgeObject>,
+    key: ProxiedV8Key,
+}
+
+impl V8IsolateSendableMessage for ObjectGetPropertyMessage {
+    type Response = Result<ProxiedV8Value, String>;
+    fn to_message(self, resp: OneshotSender<Self::Response>) -> V8IsolateManagerMessage {
+        V8IsolateManagerMessage::ObjectGetProperty {
+            obj_id: self.obj_id,
+            key: self.key,
+            resp,
+        }
+    }
+}
+
+struct DropObjectMessage {
+    obj_type: V8ObjectRegistryType,
+    obj_id: ObjectRegistryID<V8BridgeObject>,
+}
+
+impl V8IsolateSendableMessage for DropObjectMessage {
+    type Response = ();
+    fn to_message(self, _resp: OneshotSender<Self::Response>) -> V8IsolateManagerMessage {
+        V8IsolateManagerMessage::DropObject {
+            obj_type: self.obj_type,
+            obj_id: self.obj_id,
+        }
+    }
+}
+
+struct ShutdownMessage;
+
+impl V8IsolateSendableMessage for ShutdownMessage {
+    type Response = ();
+    fn to_message(self, _resp: OneshotSender<Self::Response>) -> V8IsolateManagerMessage {
+        V8IsolateManagerMessage::Shutdown
+    }
+}
+
 #[derive(Clone)]
 pub struct V8IsolateManagerClient {}
+
+impl V8IsolateManagerClient {
+    fn obj_op<'s, R>(
+        inner: &'s mut V8IsolateManagerInner, 
+        obj_id: ObjectRegistryID<V8BridgeObject>,
+        func: impl FnOnce(&mut v8::HandleScope<'s>, &CommonState, v8::Local<'s, v8::Object>) -> Result<R, crate::base::Error>,
+    ) -> Result<R, crate::base::Error> {
+        let obj = match inner.common_state.proxy_client.obj_registry.get(obj_id) {
+            Some(o) => o,
+            None => {
+                return Err(format!("Object ID {} not found", obj_id).into());
+            }
+        };
+        let result = {
+            let main_ctx = inner.deno.main_context();
+            let isolate = inner.deno.v8_isolate();
+            let mut scope = v8::HandleScope::new(isolate);
+            let main_ctx = v8::Local::new(&mut scope, main_ctx);
+            let scope = &mut v8::ContextScope::new(&mut scope, main_ctx);
+            let obj = v8::Local::new(scope, obj.clone());
+            func(scope, &inner.common_state, obj)
+        };
+        result.map_err(|e| format!("V8 object operation failed: {}", e).into())
+    }
+}
 
 #[derive(Serialize, Deserialize)]
 pub struct V8BootstrapData {
@@ -796,37 +1052,42 @@ impl ConcurrentlyExecute for V8IsolateManagerClient {
                                 (modname, module_id, resp)
                             });
                         },
-                        V8IsolateManagerMessage::GetObjectProperty { obj_id, key, resp } => {
-                            let obj = match inner.common_state.proxy_client.obj_registry.get(obj_id) {
-                                Some(o) => o,
-                                None => {
-                                    let _ = resp.client(&client_ctx).send(Err(format!("Object ID {} not found", obj_id).into()));
-                                    continue;
-                                }
-                            };
-                            let result = {
-                                let main_ctx = inner.deno.main_context();
-                                let isolate = inner.deno.v8_isolate();
-                                let mut scope = v8::HandleScope::new(isolate);
-                                let main_ctx = v8::Local::new(&mut scope, main_ctx);
-                                let scope = &mut v8::ContextScope::new(&mut scope, main_ctx);
-                                let obj = v8::Local::new(scope, obj);
-
-                                let key = match key.proxy_to_v8(scope, &inner.common_state) {
-                                    Ok(k) => k,
-                                    Err(e) => {
-                                        let _ = resp.client(&client_ctx).send(Err(e.to_string()));
-                                        continue;
-                                    }
+                        V8IsolateManagerMessage::ObjectProperties { obj_id, own_props, resp } => {
+                            match Self::obj_op(&mut inner, obj_id, |scope, common_state, obj| {
+                                // TODO: Allow customizing GetPropertyNamesArgs 
+                                let props = if own_props {
+                                    obj.get_own_property_names(scope, GetPropertyNamesArgs::default())
+                                    .ok_or("Failed to get object property names")?
+                                } else {
+                                    obj.get_property_names(scope, GetPropertyNamesArgs::default())
+                                    .ok_or("Failed to get object property names")?
                                 };
-
+                                ProxiedV8Value::proxy_from_v8(scope, props.into(), common_state, 0)
+                            }) {
+                                Ok(v) => {
+                                    let _ = resp.client(&client_ctx).send(Ok(v));
+                                }
+                                Err(e) => {
+                                    let _ = resp.client(&client_ctx).send(Err(e.to_string()));
+                                }
+                            }
+                        },
+                        V8IsolateManagerMessage::ObjectGetProperty { obj_id, key, resp } => {
+                            match Self::obj_op(&mut inner, obj_id, |scope, common_state, obj| {
+                                let key = key.to_v8(scope)?;
                                 let key = v8::Local::new(scope, key);
                                 match obj.get(scope, key) {
-                                    Some(v) => ProxiedV8Value::proxy_from_v8(scope, v, &inner.common_state, 0),
+                                    Some(v) => ProxiedV8Value::proxy_from_v8(scope, v, common_state, 0),
                                     None => Err("Failed to get object property".into()),
                                 }
-                            };
-                            let _ = resp.client(&client_ctx).send(result.map_err(|e| e.to_string()));
+                            }) {
+                                Ok(v) => {
+                                    let _ = resp.client(&client_ctx).send(Ok(v));
+                                }
+                                Err(e) => {
+                                    let _ = resp.client(&client_ctx).send(Err(e.to_string()));
+                                }
+                            }
                         },
                         V8IsolateManagerMessage::Shutdown => {
                             break;
@@ -907,8 +1168,8 @@ impl ConcurrentlyExecute for V8IsolateManagerClient {
 
 #[derive(Clone)]
 pub struct V8IsolateManagerServer {
-    pub executor: Arc<ConcurrentExecutor<V8IsolateManagerClient>>,
-    pub messenger: Arc<MultiSender<V8IsolateManagerMessage>>,
+    executor: Arc<ConcurrentExecutor<V8IsolateManagerClient>>,
+    messenger: Arc<MultiSender<V8IsolateManagerMessage>>,
 }
 
 impl Drop for V8IsolateManagerServer {
@@ -919,7 +1180,8 @@ impl Drop for V8IsolateManagerServer {
 }
 
 impl V8IsolateManagerServer {
-    pub async fn new(
+    /// Create a new V8 isolate manager server
+    async fn new(
         cs_state: ConcurrentExecutorState<V8IsolateManagerClient>, 
         heap_limit: usize, 
         process_opts: ProcessOpts,
@@ -955,39 +1217,12 @@ impl V8IsolateManagerServer {
         Ok(self_ret)
     }
 
-    pub async fn exec_code(&self, modname: String) -> Result<ProxiedV8Value, String> {
+    /// Send a message to the V8 isolate process and wait for a response
+    async fn send<T: V8IsolateSendableMessage>(&self, msg: T) -> Result<T::Response, crate::base::Error> {
         let (resp_tx, resp_rx) = self.executor.create_oneshot();
-        let msg = V8IsolateManagerMessage::CodeExec {
-            modname,
-            resp: resp_tx,
-        };
-        self.messenger.server(self.executor.server_context()).send(msg).map_err(|e| format!("Failed to send code exec message: {}", e))?;
-        resp_rx.recv().await.map_err(|e| format!("Failed to receive code exec response: {}", e))?
-    }
-
-    pub fn request_drop_object(&self, obj_type: V8ObjectRegistryType, obj_id: ObjectRegistryID<V8BridgeObject>) {
-        let msg = V8IsolateManagerMessage::DropObject {
-            obj_type,
-            obj_id,
-        };
-        let _ = self.messenger.server(self.executor.server_context()).send(msg);
-    }
-
-    pub async fn get_object_property(&self, obj_id: ObjectRegistryID<V8BridgeObject>, key: ProxiedV8Value) -> Result<ProxiedV8Value, String> {
-        let (resp_tx, resp_rx) = self.executor.create_oneshot();
-        let msg = V8IsolateManagerMessage::GetObjectProperty {
-            obj_id,
-            key,
-            resp: resp_tx,
-        };
-        self.messenger.server(self.executor.server_context()).send(msg).map_err(|e| format!("Failed to send get object property message: {}", e))?;
-        resp_rx.recv().await.map_err(|e| format!("Failed to receive get object property response: {}", e))?
-    }
-
-    pub async fn shutdown(&self) -> Result<(), crate::base::Error> {
-        let _ = self.messenger.server(self.executor.server_context()).send(V8IsolateManagerMessage::Shutdown);
-        self.executor.shutdown().await?;
-        Ok(())
+        self.messenger.server(self.executor.server_context()).send(msg.to_message(resp_tx))
+            .map_err(|e| format!("Failed to send message to V8 isolate: {}", e))?;
+        resp_rx.recv().await.map_err(|e| format!("Failed to receive response from V8 isolate: {}", e).into())
     }
 }
 
@@ -1023,12 +1258,11 @@ impl ProxyBridge for V8IsolateManagerServer {
     }
 
     async fn eval_from_source(&self, modname: String) -> Result<Self::ValueType, crate::base::Error> {
-        self.exec_code(modname).await
-            .map_err(|e| e.into())
+        Ok(self.send(CodeExecMessage { modname }).await??)
     }
 
     async fn shutdown(&self) -> Result<(), crate::base::Error> {
-        self.shutdown().await
+        self.send(ShutdownMessage).await
     }
 }
 
