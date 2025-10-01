@@ -69,7 +69,7 @@ impl V8IsolateManagerInner {
         // TODO: Support snapshots maybe
         let extensions = denoexts::extension::all_extensions(false);
 
-        deno_core::v8::V8::set_flags_from_string("--harmony-import-assertions --harmony-import-attributes");
+        deno_core::v8::V8::set_flags_from_string("--harmony-import-assertions --harmony-import-attributes --jitless");
 
         let mut deno = deno_core::JsRuntime::new(deno_core::RuntimeOptions {
             create_params: Some(

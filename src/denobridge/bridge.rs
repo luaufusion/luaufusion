@@ -17,8 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::denobridge::modloader::FusionModuleLoader;
 use crate::luau::bridge::{
-    LuaBridgeMessage, LuaBridgeObject, LuaBridgeService, LuaBridgeServiceClient, ObjectRegistryType, ProxyLuaClient,
-    obj_registry_type_to_i32, i32_to_obj_registry_type
+    LuaBridgeMessage, LuaBridgeObject, LuaBridgeService, LuaBridgeServiceClient, ObjectRegistryType, ProxyLuaClient, StringRef, i32_to_obj_registry_type, obj_registry_type_to_i32
 };
 
 use crate::base::{ObjectRegistry, ObjectRegistryID, ProxyBridge};
@@ -27,6 +26,8 @@ use super::Error;
 
 use crate::MAX_PROXY_DEPTH;
 
+/// Max size for a owned v8 string
+pub const MAX_OWNED_V8_STRING_SIZE: usize = 1024 * 16; // 16KB
 /// Minimum stack size for V8 isolates
 pub const V8_MIN_STACK_SIZE: usize = 1024 * 1024 * 15; // 15MB minimum memory
 
@@ -35,6 +36,7 @@ pub(crate) struct BridgeVals {
     id_field: v8::Global<v8::String>,
     length_field: v8::Global<v8::String>,
     create_lua_object_from_data: v8::Global<v8::Function>,
+    string_ref_field: v8::Global<v8::Symbol>,
 }
 
 impl BridgeVals {
@@ -44,7 +46,7 @@ impl BridgeVals {
         let length_field = v8::String::new(scope, "length").unwrap();
 
         // The createLuaObjectFromData function is stored in globalThis.lua.createLuaObjectFromData
-        let create_lua_object_from_data = {
+        let (string_ref_field, create_lua_object_from_data) = {
             let global = scope.get_current_context().global(scope);
             let lua_str = v8::String::new(scope, "lua").unwrap();
             let lua_obj = global.get(scope, lua_str.into()).unwrap();
@@ -55,13 +57,18 @@ impl BridgeVals {
             let create_lua_object_from_data = lua_obj.get(scope, clofd.into()).unwrap();
             assert!(create_lua_object_from_data.is_function());
             let create_lua_object_from_data = v8::Local::<v8::Function>::try_from(create_lua_object_from_data).unwrap();
-            create_lua_object_from_data
+            let srfk = v8::String::new(scope, "__stringref").unwrap();
+            let string_ref_field = lua_obj.get(scope, srfk.into()).unwrap();
+            assert!(string_ref_field.is_symbol());
+            let string_ref_field = v8::Local::<v8::Symbol>::try_from(string_ref_field).unwrap();
+            (string_ref_field, create_lua_object_from_data)
         };
 
         Self {
             id_field: v8::Global::new(scope, id_field),
             type_field: v8::Global::new(scope, type_field),
             length_field: v8::Global::new(scope, length_field),
+            string_ref_field: v8::Global::new(scope, string_ref_field),
             create_lua_object_from_data: v8::Global::new(scope, create_lua_object_from_data),
         }
     }
@@ -262,8 +269,9 @@ fn __objmethods<M: mluau::UserDataMethods<V8ObjectObj>>(methods: &mut M) {
             Some(inner) => inner,
             None => return Err(mluau::Error::external("V8Object has already been dropped")),
         };
-        let key = ProxiedV8Key::luau_to_key(&key)
-        .map_err(|e| mluau::Error::external(format!("Failed to proxy key to ProxiedV8Value: {}", e)))?;
+        let key = ProxiedV8Primitive::luau_to_primitive(&key)
+        .map_err(|e| mluau::Error::external(format!("Failed to proxy key to ProxiedV8Value: {}", e)))?
+        .ok_or(mluau::Error::external("Key is not a primitive value"))?;
         match inner.bridge.send(ObjectGetPropertyMessage {
             obj_id: inner.id,
             key
@@ -284,50 +292,75 @@ impl_v8_obj!(V8Array, V8ObjectRegistryType::Array, |_m| {});
 impl_v8_obj!(V8Function, V8ObjectRegistryType::Function, |_m| {});
 impl_v8_obj!(V8Promise, V8ObjectRegistryType::Promise, |_m| {});
 
-/// While most operations can be expressed using just ProxiedV8Value, some operations
-/// need to have dynamic (non-owned) keys (especially for bootstrapping the JS side)
-/// 
-/// ProxiedV8Values, in comparison, are Luau-owned values that are sent to the VM as references.
-/// With objectgetproperty etc. however, we need to be able to send a key as a string and recover it
-/// as a V8 value.
-#[derive(Serialize, Deserialize, Clone)]
-pub enum ProxiedV8Key {
+#[derive(Serialize, Deserialize)]
+/// A primitive value that is primitive across v8 and luau
+pub enum ProxiedV8Primitive {
     Nil,
     Undefined,
     Boolean(bool),
-    String(String),
     Integer(i32),
-    Number(f64),
     BigInt(i64),
+    Number(f64),
+    String(String),
 }
 
-impl ProxiedV8Key {
-    /// Luau -> ProxiedV8Key
-    pub(crate) fn luau_to_key(value: &mluau::Value) -> Result<Self, Error> {
+impl ProxiedV8Primitive {
+    /// Luau -> ProxiedV8Primitive
+    pub(crate) fn luau_to_primitive(value: &mluau::Value) -> Result<Option<Self>, Error> {
         match value {
-            mluau::Value::Nil => Ok(ProxiedV8Key::Nil),
-            mluau::Value::Boolean(b) => Ok(ProxiedV8Key::Boolean(*b)),
-            mluau::Value::LightUserData(s) => Ok(ProxiedV8Key::BigInt(s.0 as i64)),
+            mluau::Value::Nil => Ok(Some(ProxiedV8Primitive::Nil)),
+            mluau::Value::Boolean(b) => Ok(Some(ProxiedV8Primitive::Boolean(*b))),
+            mluau::Value::LightUserData(s) => Ok(Some(ProxiedV8Primitive::BigInt(s.0 as i64))),
             mluau::Value::Integer(i) => {
                 if i >= &(i32::MIN as i64) && i <= &(i32::MAX as i64) {
-                    Ok(ProxiedV8Key::Integer(*i as i32))
+                    Ok(Some(ProxiedV8Primitive::Integer(*i as i32)))
                 } else {
-                    Ok(ProxiedV8Key::BigInt(*i))
+                    Ok(Some(ProxiedV8Primitive::BigInt(*i)))
                 }
             },
-            mluau::Value::Number(n) => Ok(ProxiedV8Key::Number(*n)),
-            mluau::Value::String(s) => Ok(ProxiedV8Key::String(s.to_str().map_err(|e| format!("Failed to convert Lua string to Rust string: {}", e))?.to_string())),
-            _ => Err("Unsupported key type for ProxiedV8Key".into()),
+
+            mluau::Value::Number(n) => Ok(Some(ProxiedV8Primitive::Number(*n))),
+            mluau::Value::String(s) => {
+                if s.as_bytes().len() > MAX_OWNED_V8_STRING_SIZE {
+                    return Err(format!("String too large to be a primitive (max {} bytes)", MAX_OWNED_V8_STRING_SIZE).into());
+                }
+                Ok(Some(ProxiedV8Primitive::String(s.to_str().map_err(|e| format!("Failed to convert Lua string to Rust string: {}", e))?.to_string())))
+            },
+            mluau::Value::Other(r) => {
+                let s = format!("unknown({r:?})");
+                Ok(Some(ProxiedV8Primitive::String(s)))
+            },
+            _ => Ok(None),
         }
     }
 
-    /// ProxiedV8Key -> V8
+    /// ProxiedV8Primitive -> Luau
+    pub(crate) fn to_luau(&self, lua: &mluau::Lua) -> Result<mluau::Value, Error> {
+        match self {
+            ProxiedV8Primitive::Nil => Ok(mluau::Value::Nil),
+            ProxiedV8Primitive::Boolean(b) => Ok(mluau::Value::Boolean(*b)),
+            ProxiedV8Primitive::Integer(i) => Ok(mluau::Value::Integer(*i as i64)),
+            ProxiedV8Primitive::BigInt(i) => Ok(mluau::Value::Integer(*i)),
+            ProxiedV8Primitive::Number(n) => Ok(mluau::Value::Number(*n)),
+            ProxiedV8Primitive::Undefined => Ok(mluau::Value::Nil), // Luau does not have undefined, so we map it to nil
+            ProxiedV8Primitive::String(s) => {
+                let s = lua.create_string(s)
+                .map_err(|e| format!("Failed to create Lua string: {}", e))?;
+                Ok(mluau::Value::String(s))
+            }
+        }
+    }
+
+    /// ProxiedV8Primitive -> V8
     pub(crate) fn to_v8<'s>(&self, scope: &mut v8::HandleScope<'s>) -> Result<v8::Local<'s, v8::Value>, Error> {
         match self {
-            ProxiedV8Key::Nil => Ok(v8::null(scope).into()),
-            ProxiedV8Key::Undefined => Ok(v8::undefined(scope).into()),
-            ProxiedV8Key::Boolean(b) => Ok(v8::Boolean::new(scope, *b).into()),
-            ProxiedV8Key::String(s) => {
+            ProxiedV8Primitive::Nil => Ok(v8::null(scope).into()),
+            ProxiedV8Primitive::Undefined => Ok(v8::undefined(scope).into()),
+            ProxiedV8Primitive::Boolean(b) => Ok(v8::Boolean::new(scope, *b).into()),
+            ProxiedV8Primitive::Integer(i) => Ok(v8::Integer::new(scope, *i).into()),
+            ProxiedV8Primitive::BigInt(i) => Ok(v8::BigInt::new_from_i64(scope, *i).into()),
+            ProxiedV8Primitive::Number(n) => Ok(v8::Number::new(scope, *n).into()),
+            ProxiedV8Primitive::String(s) => {
                 let mut try_catch = v8::TryCatch::new(scope);
                 let s = v8::String::new(try_catch.as_mut(), s);
                 match s {
@@ -336,31 +369,73 @@ impl ProxiedV8Key {
                         if try_catch.has_caught() {
                             let exception = try_catch.exception().unwrap();
                             let exception_str = exception.to_rust_string_lossy(try_catch.as_mut());
-                            return Err(format!("Failed to create V8 string from ProxiedV8Key: {}", exception_str).into());
-                        }
-                        return Err("Failed to create V8 string from ProxiedV8Key".into());
+                            return Err(format!("Failed to create V8 string from ProxiedV8Primitive: {}", exception_str).into());
+                        } 
+                        return Err("Failed to create V8 string from ProxiedV8Primitive".into());
                     },
                 }
-            },
-            ProxiedV8Key::Integer(i) => Ok(v8::Integer::new(scope, *i).into()),
-            ProxiedV8Key::Number(n) => Ok(v8::Number::new(scope, *n).into()),
-            ProxiedV8Key::BigInt(i) => Ok(v8::BigInt::new_from_i64(scope, *i).into()),
+            }
         }
+    }
+
+    /// V8 -> ProxiedV8Primitive
+    pub(crate) fn v8_to_primitive<'s>(
+        scope: &mut v8::HandleScope<'s>,
+        value: v8::Local<'s, v8::Value>,
+    ) -> Result<Option<Self>, Error> {
+        if value.is_null() {
+            return Ok(Some(ProxiedV8Primitive::Nil));
+        }
+        if value.is_undefined() {
+            return Ok(Some(ProxiedV8Primitive::Undefined));
+        }
+        if value.is_boolean() {
+            let b = value.to_boolean(scope).is_true();
+            return Ok(Some(ProxiedV8Primitive::Boolean(b)));
+        }
+        if value.is_int32() {
+            let i = value.to_int32(scope).ok_or("Failed to convert V8 value to int32")?.value();
+            return Ok(Some(ProxiedV8Primitive::Integer(i)));
+        }
+        if value.is_big_int() {
+            let bi = value.to_big_int(scope).ok_or("Failed to convert V8 value to BigInt")?;
+            let (i, lossless) = bi.i64_value();
+            if !lossless {
+                // BigInt too large to fit in i64, so return string representation instead
+                // as strings are also primitive values
+                let s = value.to_string(scope).ok_or("Failed to convert to string")?;
+                let string = s.to_rust_string_lossy(scope);
+                return Ok(Some(ProxiedV8Primitive::String(string)));
+
+            }
+            return Ok(Some(ProxiedV8Primitive::BigInt(i)));
+        }
+        if value.is_number() {
+            let n = value.to_number(scope).unwrap().value();
+            return Ok(Some(ProxiedV8Primitive::Number(n)));
+        }
+        if value.is_string() {
+            let s = value.to_string(scope).ok_or("Failed to convert to string")?;
+            let s_len = s.length();
+            if s_len > MAX_OWNED_V8_STRING_SIZE {
+                return Err(format!("String too large to be a primitive (max {} bytes)", MAX_OWNED_V8_STRING_SIZE).into());
+            }
+            let string = s.to_rust_string_lossy(scope);
+            return Ok(Some(Self::String(string)));
+        }
+
+        // Not a primitive
+        Ok(None)
     }
 }
 
 /// A V8 value that can now be easily proxied to Luau
 #[derive(Serialize, Deserialize)]
 pub enum ProxiedV8Value {
-    Nil,
-    Undefined,
-    Boolean(bool),
-    Integer(i32),
-    BigInt(i64),
-    Number(f64),
+    Primitive(ProxiedV8Primitive),
     Vector((f32, f32, f32)), 
     ArrayBuffer(ObjectRegistryID<V8BridgeObject>), // Buffer ID in the buffer registry
-    String((ObjectRegistryID<V8BridgeObject>, usize)), // String ID in the string registry, length
+    StringRef((ObjectRegistryID<V8BridgeObject>, usize)), // String ID in the string registry, length
     Object(ObjectRegistryID<V8BridgeObject>), // Object ID in the map registry
     Array(ObjectRegistryID<V8BridgeObject>), // Array ID in the array registry
     Function(ObjectRegistryID<V8BridgeObject>), // Function ID in the function registry
@@ -373,18 +448,32 @@ pub enum ProxiedV8Value {
 impl ProxiedV8Value {
     /// Proxies a Luau value to a ProxiedV8Value
     pub(crate) fn proxy_from_src_lua(plc: &ProxyLuaClient, value: mluau::Value) -> Result<Self, Error> {
+        if let Some(prim) = ProxiedV8Primitive::luau_to_primitive(&value)? {
+            return Ok(ProxiedV8Value::Primitive(prim));
+        }
+        
         match value {
-            mluau::Value::Nil => Ok(ProxiedV8Value::Nil),
-            mluau::Value::LightUserData(s) => Ok(ProxiedV8Value::BigInt(s.0 as i64)),
-            mluau::Value::Boolean(b) => Ok(ProxiedV8Value::Boolean(b)),
-            mluau::Value::Integer(i) => Ok(ProxiedV8Value::BigInt(i)),
-            mluau::Value::Number(n) => Ok(ProxiedV8Value::Number(n)),
-            mluau::Value::String(s) => {
-                let s_len = s.as_bytes().len();
-                let string_id = plc.string_registry.add(s)
-                    .ok_or_else(|| "String registry is full".to_string())?;
-                Ok(ProxiedV8Value::SourceOwnedObject((ObjectRegistryType::String, string_id, Some(s_len))))
-            },
+            mluau::Value::Nil => unreachable!(
+                "Nil should have been handled as a primitive"
+            ), // is a primitive
+            mluau::Value::LightUserData(_s) => unreachable!(
+                "LightUserData should have been handled as a primitive"
+            ), // is a primitive
+            mluau::Value::Boolean(_b) => unreachable!(
+                "Boolean should have been handled as a primitive"
+            ), // is a primitive
+            mluau::Value::Integer(_i) => unreachable!(
+                "Integer should have been handled as a primitive"
+            ), // is a primitive
+            mluau::Value::Number(_n) => unreachable!(
+                "Number should have been handled as a primitive"
+            ), // is a primitive
+            mluau::Value::String(_s) => unreachable!(
+                "String should have been handled as a primitive"
+            ), // is a primitive
+            mluau::Value::Other(r) => unreachable!(
+                "Other({r:?}) should have been handled as a primitive"
+            ), // is a primitive 
             mluau::Value::Table(t) => {
                 let table_id = plc.table_registry.add(t)
                     .ok_or_else(|| "Table registry is full".to_string())?;
@@ -397,6 +486,13 @@ impl ProxiedV8Value {
                 Ok(ProxiedV8Value::SourceOwnedObject((ObjectRegistryType::Function, func_id, None)))
             }
             mluau::Value::UserData(ud) => {
+                if let Ok(ref_wrapper) = ud.borrow::<StringRef<V8IsolateManagerServer>>() {
+                    let s_len = ref_wrapper.value.as_bytes().len();
+                    let string_id = plc.string_registry.add(ref_wrapper.value.clone())
+                        .ok_or_else(|| "String registry is full".to_string())?;
+                    return Ok(ProxiedV8Value::SourceOwnedObject((ObjectRegistryType::String, string_id, Some(s_len))))
+                }
+
                 let userdata_id = plc.userdata_registry.add(ud)
                     .ok_or_else(|| "UserData registry is full".to_string())?;
                 Ok(ProxiedV8Value::SourceOwnedObject((ObjectRegistryType::UserData, userdata_id, None)))
@@ -414,29 +510,13 @@ impl ProxiedV8Value {
                 Ok(ProxiedV8Value::SourceOwnedObject((ObjectRegistryType::Thread, thread_id, None)))
             }
             mluau::Value::Error(e) => return Err(format!("Cannot proxy Lua error value: {}", e).into()),
-            mluau::Value::Other(r) => {
-                let s = format!("unknown({r:?})");
-                let s = plc.weak_lua.try_upgrade()
-                    .ok_or_else(|| "Lua state has been dropped".to_string())?
-                    .create_string(s.as_bytes())
-                    .map_err(|e| format!("Failed to create string for unknown Lua value: {}", e))?;
-                let s_len = s.as_bytes().len();
-                let string_id = plc.string_registry.add(s)
-                    .ok_or_else(|| "String registry is full".to_string())?;
-
-                Ok(ProxiedV8Value::SourceOwnedObject((ObjectRegistryType::String, string_id, Some(s_len))))
-            },
         }
     }
 
     /// Proxy a ProxiedV8Value to a Luau value
     pub(crate) fn proxy_to_src_lua(self, lua: &mluau::Lua, plc: &ProxyLuaClient, bridge: &V8IsolateManagerServer) -> Result<mluau::Value, mluau::Error> {
         match self {
-            ProxiedV8Value::Nil | ProxiedV8Value::Undefined => Ok(mluau::Value::Nil),
-            ProxiedV8Value::Boolean(b) => Ok(mluau::Value::Boolean(b)),
-            ProxiedV8Value::Integer(i) => Ok(mluau::Value::Integer(i as i64)),
-            ProxiedV8Value::BigInt(i) => Ok(mluau::Value::Integer(i)),
-            ProxiedV8Value::Number(n) => Ok(mluau::Value::Number(n)),
+            ProxiedV8Value::Primitive(p) => Ok(p.to_luau(lua).map_err(|e| mluau::Error::external(format!("Failed to convert ProxiedV8Primitive to Luau: {}", e)))?),
             ProxiedV8Value::Vector((x,y,z)) => {
                 let vec = mluau::Vector::new(x, y, z);
                 Ok(mluau::Value::Vector(vec))
@@ -448,7 +528,7 @@ impl ProxiedV8Value {
                 let ud = lua.create_userdata(ud)?;
                 Ok(mluau::Value::UserData(ud))
             }
-            ProxiedV8Value::String((string_id, len)) => {
+            ProxiedV8Value::StringRef((string_id, len)) => {
                 let ud = V8String::new(string_id, plc.clone(), bridge.clone(), len);
                 let ud = lua.create_userdata(ud)?;
                 Ok(mluau::Value::UserData(ud))
@@ -512,7 +592,8 @@ impl ProxiedV8Value {
         }
     }
 
-    pub(crate) fn proxy_from_v8_get_proxied<'s>(
+    // Helper function to extract a SourceOwnedObject from a V8 object, if it is one
+    fn proxy_source_owned_object_from_v8<'s>(
         scope: &mut v8::HandleScope<'s>,
         common_state: &CommonState,
         obj: v8::Local<'s, v8::Object>,
@@ -524,7 +605,7 @@ impl ProxiedV8Value {
                 let typ_i32 = typ_val.to_int32(scope).ok_or("Failed to convert lua type to int32")?.value();
                 if let Some(typ) = i32_to_obj_registry_type(typ_i32) {
                     
-                    // Look for __luaid
+                    // Look for luaid
                     let lua_id = {
                         let p_obj_key = v8::Local::new(scope, &common_state.bridge_vals.id_field);
                         let p_obj_val = obj.get(scope, p_obj_key.into());
@@ -578,41 +659,11 @@ impl ProxiedV8Value {
             return Err("Maximum proxy depth exceeded".into());
         }
 
-        if value.is_null() {
-            return Ok(Self::Nil);
-        } else if value.is_undefined() {
-            return Ok(Self::Undefined)
-        } else if value.is_boolean() {
-            let b = value.to_boolean(scope).is_true();
-            return Ok(Self::Boolean(b));
-        } else if value.is_big_int() {
-            let bi = value.to_big_int(scope).ok_or("Failed to convert to BigInt")?;
-            let (i, ok) = bi.i64_value();
-            if ok {
-                return Ok(Self::BigInt(i));
-            } else {
-                // Convert to an string instead
-                 let s = value.to_string(scope).ok_or("Failed to convert to string")?;
-                let s_len = s.length();
-                let global_str = v8::Global::new(scope, s);
-                let sid = common_state.proxy_client.string_registry.add(global_str)
-                    .ok_or("Failed to register string: too many string references")?;
-                return Ok(Self::String((sid, s_len)));
-            }
-        } else if value.is_int32() {
-            let i = value.to_int32(scope).ok_or("Failed to convert to int32")?.value();
-            return Ok(Self::Integer(i));
-        } else if value.is_number() {
-            let n = value.to_number(scope).ok_or("Failed to convert to number")?.value();
-            return Ok(Self::Number(n));
-        } else if value.is_string() {
-            let s = value.to_string(scope).ok_or("Failed to convert to string")?;
-            let s_len = s.length();
-            let global_str = v8::Global::new(scope, s);
-            let sid = common_state.proxy_client.string_registry.add(global_str)
-                .ok_or("Failed to register string: too many string references")?;
-            return Ok(Self::String((sid, s_len)));
-        } else if value.is_array() {
+        if let Some(prim) = ProxiedV8Primitive::v8_to_primitive(scope, value)? {
+            return Ok(Self::Primitive(prim));
+        }
+
+        if value.is_array() {
             let arr = v8::Local::<v8::Array>::try_from(value).map_err(|_| "Failed to convert to array")?;
             if arr.length() == 3 {
                 let x = arr.get_index(scope, 0).ok_or("Failed to get array index 0")?;
@@ -650,9 +701,25 @@ impl ProxiedV8Value {
         } else if value.is_object() {
             let obj = value.to_object(scope).ok_or("Failed to convert to object")?;
 
-            // Handled source-proxied objects
-            if let Some(v) = Self::proxy_from_v8_get_proxied(scope, &common_state, obj)? {
+            // Handled source-owned objects
+            if let Some(v) = Self::proxy_source_owned_object_from_v8(scope, &common_state, obj)? {
                 return Ok(v);
+            }
+
+            // Handle string ref cases
+            {
+                let string_ref_field = v8::Local::new(scope, &common_state.bridge_vals.string_ref_field);
+                if let Some(s) = obj.get(scope, string_ref_field.into()) && !s.is_undefined() {
+                    if s.is_string() {
+                        let s = s.to_string(scope).ok_or("Failed to convert to string")?;
+                        let s_len = s.length();
+                        let global_str = v8::Global::new(scope, s);
+                        let sid = common_state.proxy_client.string_registry.add(global_str)
+                            .ok_or("Failed to register string: too many string references")?;
+                        return Ok(Self::StringRef((sid, s_len)));
+                    } 
+                    return Err("string_ref field is not a string".into());
+                }
             }
 
             let global_obj = v8::Global::new(scope, obj);
@@ -671,12 +738,7 @@ impl ProxiedV8Value {
         common_state: &CommonState,
     ) -> Result<v8::Local<'s, v8::Value>, Error> {
         match self {
-            Self::Nil => Ok(v8::null(scope).into()),
-            Self::Undefined => Ok(v8::undefined(scope).into()),
-            Self::Boolean(b) => Ok(v8::Boolean::new(scope, b).into()),
-            Self::Integer(i) => Ok(v8::Integer::new(scope, i).into()),
-            Self::BigInt(i) => Ok(v8::BigInt::new_from_i64(scope, i).into()),
-            Self::Number(n) => Ok(v8::Number::new(scope, n).into()),
+            Self::Primitive(p) => Ok(p.to_v8(scope)?),
             Self::Array(arr_id) => {
                 let arr = common_state.proxy_client.array_registry.get(arr_id)
                     .ok_or("Array ID not found in registry")?;
@@ -689,7 +751,7 @@ impl ProxiedV8Value {
                 let ab = v8::Local::new(scope, ab.clone());
                 Ok(ab.into())
             }
-            Self::String((string_id, _len)) => {
+            Self::StringRef((string_id, _len)) => {
                 let s = common_state.proxy_client.string_registry.get(string_id)
                     .ok_or("String ID not found in registry")?;
                 let s = v8::Local::new(scope, s.clone());
@@ -825,7 +887,7 @@ enum V8IsolateManagerMessage {
     },
     ObjectGetProperty {
         obj_id: ObjectRegistryID<V8BridgeObject>,
-        key: ProxiedV8Key,
+        key: ProxiedV8Primitive,
         resp: OneshotSender<Result<ProxiedV8Value, String>>,
     },
     DropObject {
@@ -873,7 +935,7 @@ impl V8IsolateSendableMessage for ObjectPropertiesMessage {
 
 struct ObjectGetPropertyMessage {
     obj_id: ObjectRegistryID<V8BridgeObject>,
-    key: ProxiedV8Key,
+    key: ProxiedV8Primitive,
 }
 
 impl V8IsolateSendableMessage for ObjectGetPropertyMessage {

@@ -212,6 +212,14 @@ const createLuaObjectFromData = (data) => {
     }
 }
 
+const __stringref = Symbol("luaufusion.stringref");
+const createStringRef = (string) => {
+    if(typeof string !== "string") throw new Error("Invalid string provided to createStringRef");
+    return {
+        __stringref: string
+    }
+}
+
 globalThis.lua = {
     LuaObject,
     LuaString,
@@ -221,5 +229,7 @@ globalThis.lua = {
     LuaThread,
     LuaUserData,
     objRegistryType,
-    createLuaObjectFromData
+    createLuaObjectFromData,
+    createStringRef,
+    __stringref
 }

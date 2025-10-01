@@ -114,6 +114,7 @@ console.log("Time now is: " + timeNow);
 // Sleep for 0 seconds
 await new Promise(resolve => setTimeout(resolve, 0));
 console.log("Awake now again! Time now is: " + Date.now() + ", timeNow -  Date.now()", Date.now() - timeNow);
+//console.log(WebAssembly);
 "#.to_string()),
         ]);
 
