@@ -1,12 +1,12 @@
 use serde::{Deserialize, Serialize};
-use crate::base::{Error, ObjectRegistryID};
+use crate::base::Error;
+use crate::denobridge::objreg::V8ObjectRegistryID;
+use crate::luau::objreg::LuauObjectRegistryID;
 use super::primitives::ProxiedV8Primitive;
 use super::V8IsolateManagerServer;
-use super::bridge::V8BridgeObject;
 use super::luauobjs::{V8Array, V8ArrayBuffer, V8Function, V8ObjectObj, V8Promise, V8String};
 use crate::luau::bridge::{
-    ObjectRegistryType, LuaBridgeObject, ProxyLuaClient, StringRef,
-    i32_to_obj_registry_type, obj_registry_type_to_i32
+    ObjectRegistryType, ProxyLuaClient, StringRef, i32_to_obj_registry_type, luau_value_to_obj_registry_type, obj_registry_type_to_i32
 };
 use super::inner::CommonState;
 use deno_core::v8;
@@ -17,15 +17,15 @@ use crate::MAX_PROXY_DEPTH;
 pub enum ProxiedV8Value {
     Primitive(ProxiedV8Primitive),
     Vector((f32, f32, f32)), 
-    ArrayBuffer(ObjectRegistryID<V8BridgeObject>), // Buffer ID in the buffer registry
-    StringRef((ObjectRegistryID<V8BridgeObject>, usize)), // String ID in the string registry, length
-    Object(ObjectRegistryID<V8BridgeObject>), // Object ID in the map registry
-    Array(ObjectRegistryID<V8BridgeObject>), // Array ID in the array registry
-    Function(ObjectRegistryID<V8BridgeObject>), // Function ID in the function registry
-    Promise(ObjectRegistryID<V8BridgeObject>), // Promise ID in the function registry
+    ArrayBuffer(V8ObjectRegistryID), // Buffer ID in the buffer registry
+    StringRef((V8ObjectRegistryID, usize)), // String ID in the string registry, length
+    Object(V8ObjectRegistryID), // Object ID in the map registry
+    Array(V8ObjectRegistryID), // Array ID in the array registry
+    Function(V8ObjectRegistryID), // Function ID in the function registry
+    Promise(V8ObjectRegistryID), // Promise ID in the function registry
 
     // Source-owned stuff
-    SourceOwnedObject((ObjectRegistryType, ObjectRegistryID<LuaBridgeObject>, Option<usize>)), // (Type, ID, <optional length>) of the source-owned object
+    SourceOwnedObject((ObjectRegistryType, LuauObjectRegistryID, Option<usize>)), // (Type, ID, <optional length>) of the source-owned object
 }
 
 impl ProxiedV8Value {
@@ -57,42 +57,31 @@ impl ProxiedV8Value {
             mluau::Value::Other(r) => unreachable!(
                 "Other({r:?}) should have been handled as a primitive"
             ), // is a primitive 
-            mluau::Value::Table(t) => {
-                let table_id = plc.table_registry.add(t)
-                    .ok_or_else(|| "Table registry is full".to_string())?;
-
-                Ok(ProxiedV8Value::SourceOwnedObject((ObjectRegistryType::Table, table_id, None)))
-            }
-            mluau::Value::Function(f) => {
-                let func_id = plc.func_registry.add(f)
-                    .ok_or_else(|| "Function registry is full".to_string())?;
-                Ok(ProxiedV8Value::SourceOwnedObject((ObjectRegistryType::Function, func_id, None)))
-            }
+            mluau::Value::Vector(v) => Ok(ProxiedV8Value::Vector((v.x(), v.y(), v.z()))),
             mluau::Value::UserData(ud) => {
                 if let Ok(ref_wrapper) = ud.borrow::<StringRef<V8IsolateManagerServer>>() {
                     let s_len = ref_wrapper.value.as_bytes().len();
-                    let string_id = plc.string_registry.add(ref_wrapper.value.clone())
-                        .ok_or_else(|| "String registry is full".to_string())?;
+                    let string_id = plc.obj_registry.add(mluau::Value::String(ref_wrapper.value.clone()))
+                        .map_err(|e| format!("Failed to add string to registry: {}", e))?;
                     return Ok(ProxiedV8Value::SourceOwnedObject((ObjectRegistryType::String, string_id, Some(s_len))))
                 }
 
-                let userdata_id = plc.userdata_registry.add(ud)
-                    .ok_or_else(|| "UserData registry is full".to_string())?;
+                let userdata_id = plc.obj_registry.add(mluau::Value::UserData(ud))
+                    .map_err(|e| format!("Failed to add object to registry: {}", e))?;
                 Ok(ProxiedV8Value::SourceOwnedObject((ObjectRegistryType::UserData, userdata_id, None)))
             }
-            mluau::Value::Vector(v) => Ok(ProxiedV8Value::Vector((v.x(), v.y(), v.z()))),
-            mluau::Value::Buffer(b) => {
-                let buffer_len = b.len();
-                let buffer_id = plc.buffer_registry.add(b)
-                    .ok_or_else(|| "Buffer registry is full".to_string())?;
-                Ok(ProxiedV8Value::SourceOwnedObject((ObjectRegistryType::Buffer, buffer_id, Some(buffer_len))))
-            }
-            mluau::Value::Thread(th) => {
-                let thread_id = plc.thread_registry.add(th)
-                    .ok_or_else(|| "Thread registry is full".to_string())?;
-                Ok(ProxiedV8Value::SourceOwnedObject((ObjectRegistryType::Thread, thread_id, None)))
-            }
             mluau::Value::Error(e) => return Err(format!("Cannot proxy Lua error value: {}", e).into()),
+            value => {
+                let obj_type = match luau_value_to_obj_registry_type(&value) {
+                    Some(t) => t,
+                    None => return Err(format!("Cannot proxy Luau value of type {:?}", value).into()),
+                };
+
+                let id = plc.obj_registry.add(value)
+                    .map_err(|e| format!("Failed to add object to registry: {}", e))?; 
+
+                Ok(ProxiedV8Value::SourceOwnedObject((obj_type, id, None)))
+            }
         }
     }
 
@@ -138,39 +127,10 @@ impl ProxiedV8Value {
             }
 
             // Source-owned values (lua values being proxied back from v8 to lua)
-            ProxiedV8Value::SourceOwnedObject((typ, id, _len)) => {
-                match typ {
-                    ObjectRegistryType::String => {
-                        let s = plc.string_registry.get(id)
-                            .ok_or_else(|| mluau::Error::external(format!("String ID {} not found in registry", id)))?;
-                        return Ok(mluau::Value::String(s));
-                    }
-                    ObjectRegistryType::Function => {
-                        let func = plc.func_registry.get(id)
-                            .ok_or_else(|| mluau::Error::external(format!("Function ID {} not found in registry", id)))?;
-                        return Ok(mluau::Value::Function(func));
-                    }
-                    ObjectRegistryType::Table => {
-                        let table = plc.table_registry.get(id)
-                            .ok_or_else(|| mluau::Error::external(format!("Table ID {} not found in registry", id)))?;
-                        return Ok(mluau::Value::Table(table));
-                    }
-                    ObjectRegistryType::Thread => {
-                        let thread = plc.thread_registry.get(id)
-                            .ok_or_else(|| mluau::Error::external(format!("Thread ID {} not found in registry", id)))?;
-                        return Ok(mluau::Value::Thread(thread));
-                    }
-                    ObjectRegistryType::Buffer => {
-                        let buffer = plc.buffer_registry.get(id)
-                            .ok_or_else(|| mluau::Error::external(format!("Buffer ID {} not found in registry", id)))?;
-                        return Ok(mluau::Value::Buffer(buffer));
-                    }
-                    ObjectRegistryType::UserData => {
-                        let userdata = plc.userdata_registry.get(id)
-                            .ok_or_else(|| mluau::Error::external(format!("Userdata ID {} not found in registry", id)))?;
-                        return Ok(mluau::Value::UserData(userdata));
-                    }
-                }
+            ProxiedV8Value::SourceOwnedObject((_typ, id, _len)) => {
+                let value = plc.obj_registry.get(id)
+                    .map_err(|e| mluau::Error::external(format!("Failed to get object from registry: {}", e)))?;
+                Ok(value)
             }
         }
     }
@@ -223,7 +183,7 @@ impl ProxiedV8Value {
                         }
                     };
 
-                    return Ok(Some(Self::SourceOwnedObject((typ, ObjectRegistryID::from_i64(lua_id), len))))
+                    return Ok(Some(Self::SourceOwnedObject((typ, LuauObjectRegistryID::from_i64(lua_id), len))))
                 }
             }
         }
@@ -259,27 +219,24 @@ impl ProxiedV8Value {
                     return Ok(Self::Vector((x, y, z)));
                 }
             }
-            let global_obj = v8::Global::new(scope, arr);
-            let obj_id = common_state.proxy_client.array_registry.add(global_obj)
-                .ok_or("Failed to register array: too many array references")?;
+
+            let obj_id = common_state.proxy_client.obj_registry.add(scope, arr.into())
+                .map_err(|e| format!("Failed to register array: {}", e))?;
             return Ok(Self::Array(obj_id));
         } else if value.is_array_buffer() {
             let ab = v8::Local::<v8::ArrayBuffer>::try_from(value).map_err(|_| "Failed to convert to ArrayBuffer")?;
-            let ab = v8::Global::new(scope, ab);
-            let ab_id = common_state.proxy_client.array_buffer_registry.add(ab)
-                .ok_or("Failed to register ArrayBuffer: too many ArrayBuffer references")?;
+            let ab_id = common_state.proxy_client.obj_registry.add(scope, ab.into())
+                .map_err(|e| format!("Failed to register ArrayBuffer: {}", e))?;
             return Ok(Self::ArrayBuffer(ab_id));
         } else if value.is_function() {
             let func = v8::Local::<v8::Function>::try_from(value).map_err(|_| "Failed to convert to function")?;
-            let global_func = v8::Global::new(scope, func);
-            let func_id = common_state.proxy_client.func_registry.add(global_func)
-                .ok_or("Failed to register function: too many function references")?;
+            let func_id = common_state.proxy_client.obj_registry.add(scope, func.into())
+                .map_err(|e| format!("Failed to register function: {}", e))?;
             return Ok(Self::Function(func_id));
         } else if value.is_promise() {
             let promise = v8::Local::<v8::Promise>::try_from(value).map_err(|_| "Failed to convert to promise")?;
-            let global_promise = v8::Global::new(scope, promise);
-            let promise_id = common_state.proxy_client.promise_registry.add(global_promise)
-                .ok_or("Failed to register promise: too many promise references")?;
+            let promise_id = common_state.proxy_client.obj_registry.add(scope, promise.into())
+                .map_err(|e| format!("Failed to register promise: {}", e))?;
             return Ok(Self::Promise(promise_id));
         } else if value.is_object() {
             let obj = value.to_object(scope).ok_or("Failed to convert to object")?;
@@ -296,18 +253,16 @@ impl ProxiedV8Value {
                     if s.is_string() {
                         let s = s.to_string(scope).ok_or("Failed to convert to string")?;
                         let s_len = s.length();
-                        let global_str = v8::Global::new(scope, s);
-                        let sid = common_state.proxy_client.string_registry.add(global_str)
-                            .ok_or("Failed to register string: too many string references")?;
+                        let sid = common_state.proxy_client.obj_registry.add(scope, s.into())
+                            .map_err(|e| format!("Failed to register string: {}", e))?;
                         return Ok(Self::StringRef((sid, s_len)));
                     } 
                     return Err("string_ref field is not a string".into());
                 }
             }
 
-            let global_obj = v8::Global::new(scope, obj);
-            let obj_id = common_state.proxy_client.obj_registry.add(global_obj)
-                .ok_or("Failed to register object: too many object references")?;
+            let obj_id = common_state.proxy_client.obj_registry.add(scope, obj.into())
+                .map_err(|e| format!("Failed to register object: {}", e))?;
             return Ok(Self::Object(obj_id));
         } else {
             return Err("Unsupported V8 value type".into());
@@ -322,41 +277,15 @@ impl ProxiedV8Value {
     ) -> Result<v8::Local<'s, v8::Value>, Error> {
         match self {
             Self::Primitive(p) => Ok(p.to_v8(scope)?),
-            Self::Array(arr_id) => {
-                let arr = common_state.proxy_client.array_registry.get(arr_id)
-                    .ok_or("Array ID not found in registry")?;
-                let arr = v8::Local::new(scope, arr.clone());
-                Ok(arr.into())
-            }
-            Self::ArrayBuffer(buf_id) => {
-                let ab = common_state.proxy_client.array_buffer_registry.get(buf_id)
-                    .ok_or("ArrayBuffer ID not found in registry")?;
-                let ab = v8::Local::new(scope, ab.clone());
-                Ok(ab.into())
-            }
-            Self::StringRef((string_id, _len)) => {
-                let s = common_state.proxy_client.string_registry.get(string_id)
-                    .ok_or("String ID not found in registry")?;
-                let s = v8::Local::new(scope, s.clone());
-                Ok(s.into())
-            }
-            Self::Object(obj_id) => {
-                let obj = common_state.proxy_client.obj_registry.get(obj_id)
-                    .ok_or("Object ID not found in registry")?;
-                let obj = v8::Local::new(scope, obj.clone());
+            Self::Array(id) | 
+            Self::ArrayBuffer(id) | 
+            Self::Object(id) | 
+            Self::Function(id) |
+            Self::Promise(id) | 
+            Self::StringRef((id, _)) => {
+                let obj = common_state.proxy_client.obj_registry.get(scope, id, |_scope, x| Ok(x))
+                    .map_err(|e| format!("Object ID not found in registry: {}", e))?;
                 Ok(obj.into())
-            }
-            Self::Function(func_id) => {
-                let func = common_state.proxy_client.func_registry.get(func_id)
-                    .ok_or("Function ID not found in registry")?;
-                let func = v8::Local::new(scope, func.clone());
-                Ok(func.into())
-            }
-            Self::Promise(promise_id) => {
-                let promise = common_state.proxy_client.promise_registry.get(promise_id)
-                    .ok_or("Promise ID not found in registry")?;
-                let promise = v8::Local::new(scope, promise.clone());
-                Ok(promise.into())
             }
             Self::Vector((x,y, z)) => {
                 let arr = v8::Array::new(scope, 3);
@@ -371,10 +300,8 @@ impl ProxiedV8Value {
             Self::SourceOwnedObject((typ, id, len)) => {
                 let oid_key = v8::Local::new(scope, &common_state.bridge_vals.id_field);
                 let otype_key = v8::Local::new(scope, &common_state.bridge_vals.type_field);
-
-                let obj_template = common_state.obj_template.clone();
                 
-                let local_template = v8::Local::new(scope, (*obj_template).clone());
+                let local_template = v8::Local::new(scope, (*common_state.obj_template).clone());
                 
                 let obj = local_template.new_instance(scope).ok_or("Failed to create V8 proxy object")?;
 

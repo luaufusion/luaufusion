@@ -2,7 +2,6 @@ use super::bridge::{BridgeVals, V8IsolateManagerServer};
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::pin::Pin;
 use std::rc::Rc;
 
 //use deno_core::error::{CoreError, CoreErrorKind};
@@ -16,7 +15,6 @@ use super::{
 };
 use crate::luau::bridge::LuaBridgeServiceClient;
 
-use crate::base::{ObjectRegistry, Error};
 use super::bridge::{ProxyV8Client, MIN_HEAP_LIMIT};
 use super::denoexts;
 
@@ -25,10 +23,10 @@ use super::denoexts;
 /// This is used internally to track async function call states
 pub(super) enum FunctionRunState {
     Created {
-        fut: Pin<Box<dyn std::future::Future<Output = Result<Vec<ProxiedV8Value>, Error>>>>,
+        args: Vec<ProxiedV8Value>,
     },
     Executed {
-        lua_resp: Vec<ProxiedV8Value>,
+        resp: Vec<ProxiedV8Value>,
     },
 }
 
@@ -110,12 +108,7 @@ impl V8IsolateManagerInner {
             obj_template,
             bridge,
             proxy_client: ProxyV8Client {
-                string_registry: ObjectRegistry::new(),
-                array_registry: ObjectRegistry::new(),
-                func_registry: ObjectRegistry::new(),
-                obj_registry: ObjectRegistry::new(),
-                array_buffer_registry: ObjectRegistry::new(),
-                promise_registry: ObjectRegistry::new(),
+                obj_registry: bridge_vals.obj_registry.clone(),
             },
             bridge_vals: Rc::new(bridge_vals)
         };

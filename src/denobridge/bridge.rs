@@ -1,4 +1,3 @@
-use super::primitives::ProxiedV8Primitive;
 use super::value::ProxiedV8Value;
 
 use std::collections::HashMap;
@@ -16,12 +15,13 @@ use serde::{Deserialize, Serialize};
 //use mluau::serde::de;
 
 use crate::denobridge::modloader::FusionModuleLoader;
+use crate::denobridge::objreg::{V8ObjectRegistry, V8ObjectRegistryID};
 use crate::luau::bridge::{
     LuaBridgeMessage, LuaBridgeService, LuaBridgeServiceClient, ProxyLuaClient,
 };
 
-use crate::base::{ObjectRegistry, ObjectRegistryID, ProxyBridge, Error};
-use super::inner::{CommonState, V8IsolateManagerInner};
+use crate::base::{ProxyBridge, Error};
+use super::inner::V8IsolateManagerInner;
 
 /// Max size for a owned v8 string
 pub const MAX_OWNED_V8_STRING_SIZE: usize = 1024 * 16; // 16KB
@@ -36,6 +36,9 @@ pub(crate) struct BridgeVals {
     pub length_field: v8::Global<v8::String>,
     pub create_lua_object_from_data: v8::Global<v8::Function>,
     pub string_ref_field: v8::Global<v8::Symbol>,
+
+    // obj registry fields (addV8Object, getV8Object and removeV8Object)
+    pub obj_registry: V8ObjectRegistry,
 }
 
 impl BridgeVals {
@@ -45,22 +48,50 @@ impl BridgeVals {
         let length_field = v8::String::new(scope, "length").unwrap();
 
         // The createLuaObjectFromData function is stored in globalThis.lua.createLuaObjectFromData
-        let (string_ref_field, create_lua_object_from_data) = {
+        let (string_ref_field, create_lua_object_from_data, add_v8_object, get_v8_object, remove_v8_object) = {
+            // Get globalThis.lua
             let global = scope.get_current_context().global(scope);
             let lua_str = v8::String::new(scope, "lua").unwrap();
             let lua_obj = global.get(scope, lua_str.into()).unwrap();
             //println!("lua_obj: {:?}", lua_obj.to_rust_string_lossy(scope));
             assert!(lua_obj.is_object());
             let lua_obj = lua_obj.to_object(scope).unwrap();
+
+            // get createLuaObjectFromData and __stringref
             let clofd = v8::String::new(scope, "createLuaObjectFromData").unwrap();
             let create_lua_object_from_data = lua_obj.get(scope, clofd.into()).unwrap();
             assert!(create_lua_object_from_data.is_function());
             let create_lua_object_from_data = v8::Local::<v8::Function>::try_from(create_lua_object_from_data).unwrap();
+            
+            // get addV8Object, getV8Object and removeV8Object from V8ObjectRegistry
+            let add_v8_object = {
+                let addv8obj_str = v8::String::new(scope, "addV8Object").unwrap();
+                let addv8obj = lua_obj.get(scope, addv8obj_str.into()).unwrap();
+                assert!(addv8obj.is_function());
+                let addv8obj = v8::Local::<v8::Function>::try_from(addv8obj).unwrap();
+                addv8obj
+            };
+            let get_v8_object = {
+                let getv8obj_str = v8::String::new(scope, "getV8Object").unwrap();
+                let getv8obj = lua_obj.get(scope, getv8obj_str.into()).unwrap();
+                assert!(getv8obj.is_function());
+                let getv8obj = v8::Local::<v8::Function>::try_from(getv8obj).unwrap();
+                getv8obj
+            };
+            let remove_v8_object = {
+                let removev8obj_str = v8::String::new(scope, "removeV8Object").unwrap();
+                let removev8obj = lua_obj.get(scope, removev8obj_str.into()).unwrap();
+                assert!(removev8obj.is_function());
+                let removev8obj = v8::Local::<v8::Function>::try_from(removev8obj).unwrap();
+                removev8obj
+            };
+
+            // Get the stringref symbol
             let srfk = v8::String::new(scope, "__stringref").unwrap();
             let string_ref_field = lua_obj.get(scope, srfk.into()).unwrap();
             assert!(string_ref_field.is_symbol());
             let string_ref_field = v8::Local::<v8::Symbol>::try_from(string_ref_field).unwrap();
-            (string_ref_field, create_lua_object_from_data)
+            (string_ref_field, create_lua_object_from_data, add_v8_object, get_v8_object, remove_v8_object)
         };
 
         Self {
@@ -69,8 +100,16 @@ impl BridgeVals {
             length_field: v8::Global::new(scope, length_field),
             string_ref_field: v8::Global::new(scope, string_ref_field),
             create_lua_object_from_data: v8::Global::new(scope, create_lua_object_from_data),
+            obj_registry: V8ObjectRegistry { 
+                add_v8_object: v8::Global::new(scope, add_v8_object),
+                get_v8_object: v8::Global::new(scope, get_v8_object), 
+                remove_v8_object: v8::Global::new(scope, remove_v8_object),
+            }
         }
     }
+
+    // Adds a value to the V8 object registry and returns its ID
+
 }
 
 /// Marker struct for V8 objects in the object registry
@@ -115,12 +154,7 @@ pub fn i32_to_v8_obj_registry_type(i: i32) -> Option<V8ObjectRegistryType> {
 /// 
 /// This struct is not thread safe and must be kept on the Lua side
 pub struct ProxyV8Client {
-    pub array_buffer_registry: ObjectRegistry<v8::Global<v8::ArrayBuffer>, V8BridgeObject>,
-    pub string_registry: ObjectRegistry<v8::Global<v8::String>, V8BridgeObject>,
-    pub array_registry: ObjectRegistry<v8::Global<v8::Array>, V8BridgeObject>,
-    pub obj_registry: ObjectRegistry<v8::Global<v8::Object>, V8BridgeObject>,
-    pub func_registry: ObjectRegistry<v8::Global<v8::Function>, V8BridgeObject>,
-    pub promise_registry: ObjectRegistry<v8::Global<v8::Promise>, V8BridgeObject>,
+    pub obj_registry: V8ObjectRegistry
 }
 
 #[derive(Serialize, Deserialize)]
@@ -130,19 +164,11 @@ pub(super) enum V8IsolateManagerMessage {
         modname: String,
         resp: OneshotSender<Result<ProxiedV8Value, String>>,
     },
-    ObjectProperties {
-        obj_id: ObjectRegistryID<V8BridgeObject>,
-        own_props: bool,
-        resp: OneshotSender<Result<ProxiedV8Value, String>>,
-    },
-    ObjectGetProperty {
-        obj_id: ObjectRegistryID<V8BridgeObject>,
-        key: ProxiedV8Primitive,
-        resp: OneshotSender<Result<ProxiedV8Value, String>>,
-    },
-    DropObject {
-        obj_type: V8ObjectRegistryType,
-        obj_id: ObjectRegistryID<V8BridgeObject>,
+    OpCall {
+        obj_id: V8ObjectRegistryID,
+        op: V8ObjectOp,
+        args: Vec<ProxiedV8Value>,
+        resp: OneshotSender<Result<Vec<ProxiedV8Value>, String>>,
     },
     Shutdown,
 }
@@ -167,49 +193,20 @@ impl V8IsolateSendableMessage for CodeExecMessage {
     }
 }
 
-pub(super) struct ObjectPropertiesMessage {
-    pub obj_id: ObjectRegistryID<V8BridgeObject>,
-    pub own_props: bool,
+pub(super) struct OpCallMessage {
+    pub obj_id: V8ObjectRegistryID,
+    pub op: V8ObjectOp,
+    pub args: Vec<ProxiedV8Value>,
 }
 
-impl V8IsolateSendableMessage for ObjectPropertiesMessage {
-    type Response = Result<ProxiedV8Value, String>;
+impl V8IsolateSendableMessage for OpCallMessage {
+    type Response = Result<Vec<ProxiedV8Value>, String>;
     fn to_message(self, resp: OneshotSender<Self::Response>) -> V8IsolateManagerMessage {
-        V8IsolateManagerMessage::ObjectProperties {
+        V8IsolateManagerMessage::OpCall {
             obj_id: self.obj_id,
-            own_props: self.own_props,
+            op: self.op,
+            args: self.args,
             resp,
-        }
-    }
-}
-
-pub(super) struct ObjectGetPropertyMessage {
-    pub obj_id: ObjectRegistryID<V8BridgeObject>,
-    pub key: ProxiedV8Primitive,
-}
-
-impl V8IsolateSendableMessage for ObjectGetPropertyMessage {
-    type Response = Result<ProxiedV8Value, String>;
-    fn to_message(self, resp: OneshotSender<Self::Response>) -> V8IsolateManagerMessage {
-        V8IsolateManagerMessage::ObjectGetProperty {
-            obj_id: self.obj_id,
-            key: self.key,
-            resp,
-        }
-    }
-}
-
-pub(super) struct DropObjectMessage {
-    pub obj_type: V8ObjectRegistryType,
-    pub obj_id: ObjectRegistryID<V8BridgeObject>,
-}
-
-impl V8IsolateSendableMessage for DropObjectMessage {
-    type Response = ();
-    fn to_message(self, _resp: OneshotSender<Self::Response>) -> V8IsolateManagerMessage {
-        V8IsolateManagerMessage::DropObject {
-            obj_type: self.obj_type,
-            obj_id: self.obj_id,
         }
     }
 }
@@ -223,33 +220,131 @@ impl V8IsolateSendableMessage for ShutdownMessage {
     }
 }
 
-#[derive(Clone)]
-pub struct V8IsolateManagerClient {}
+#[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum V8ObjectOp {
+    ObjectGetProperty,
+    ObjectProperties,
+    FunctionCall,
+    RequestDispose,
+}
 
-impl V8IsolateManagerClient {
-    fn obj_op<'s, R>(
-        inner: &'s mut V8IsolateManagerInner, 
-        obj_id: ObjectRegistryID<V8BridgeObject>,
-        func: impl FnOnce(&mut v8::HandleScope<'s>, &CommonState, v8::Local<'s, v8::Object>) -> Result<R, crate::base::Error>,
-    ) -> Result<R, crate::base::Error> {
-        let obj = match inner.common_state.proxy_client.obj_registry.get(obj_id) {
-            Some(o) => o,
-            None => {
-                return Err(format!("Object ID {} not found", obj_id).into());
+enum OpCallRet {
+    ProxiedMulti(Vec<ProxiedV8Value>),
+    FunctAsync((v8::Global<v8::Function>, Vec<v8::Global<v8::Value>>))
+}
+
+impl V8ObjectOp {
+    fn run<'s>(self, inner: &mut V8IsolateManagerInner, obj_id: V8ObjectRegistryID, args: Vec<ProxiedV8Value>) -> Result<OpCallRet, Error> {        
+        match self {
+            Self::FunctionCall => {
+                    let main_ctx = inner.deno.main_context();
+                    let isolate = inner.deno.v8_isolate();
+                    let mut scope = v8::HandleScope::new(isolate);
+                    let main_ctx = v8::Local::new(&mut scope, main_ctx);
+                    let mut context_scope = &mut v8::ContextScope::new(&mut scope, main_ctx);
+
+                let func = match inner.common_state.proxy_client.obj_registry.get(context_scope, obj_id, |tc, v| {
+                    if !v.is_function() {
+                        return Err("Object is not a function".into());
+                    }
+                    let func = v8::Local::<v8::Function>::try_from(v)
+                        .map_err(|e| format!("Failed to convert V8 value to function: {}", e))?;
+                    Ok(v8::Global::new(tc, func))
+                }) {
+                    Ok(o) => o,
+                    Err(e) => return Err(format!("Failed to get V8 object from registry: {}", e).into()),
+                };
+
+                let mut v8_args = Vec::with_capacity(args.len());
+                for arg in args {
+                    let v8_arg = match arg.proxy_to_v8(&mut context_scope, &inner.common_state) {
+                        Ok(v) => v,
+                        Err(e) => return Err(format!("Failed to convert argument to V8: {}", e).into()),
+                    };
+                    v8_args.push(v8::Global::new(&mut context_scope, v8_arg));
+                }
+
+                Ok(OpCallRet::FunctAsync((func, v8_args)))
             }
-        };
-        let result = {
-            let main_ctx = inner.deno.main_context();
-            let isolate = inner.deno.v8_isolate();
-            let mut scope = v8::HandleScope::new(isolate);
-            let main_ctx = v8::Local::new(&mut scope, main_ctx);
-            let scope = &mut v8::ContextScope::new(&mut scope, main_ctx);
-            let obj = v8::Local::new(scope, obj.clone());
-            func(scope, &inner.common_state, obj)
-        };
-        result.map_err(|e| format!("V8 object operation failed: {}", e).into())
+            Self::ObjectProperties => {
+                let main_ctx = inner.deno.main_context();
+                let isolate = inner.deno.v8_isolate();
+                let mut scope = v8::HandleScope::new(isolate);
+                let main_ctx = v8::Local::new(&mut scope, main_ctx);
+                let mut context_scope = &mut v8::ContextScope::new(&mut scope, main_ctx);
+
+                let obj = match inner.common_state.proxy_client.obj_registry.get(context_scope, obj_id, |tc, v| {
+                    if !v.is_object() {
+                        return Err("Object is not an object".into());
+                    }
+                    let obj = v8::Local::<v8::Object>::try_from(v)
+                        .map_err(|e| format!("Failed to convert V8 value to object: {}", e))?;
+                    Ok(v8::Global::new(tc, obj))
+                }) {
+                    Ok(o) => o,
+                    Err(e) => return Err(format!("Failed to get V8 object from registry: {}", e).into()),
+                };
+
+                let obj = v8::Local::new(&mut context_scope, &obj);
+
+                let prop_names = obj.get_property_names(&mut context_scope, GetPropertyNamesArgs::default())
+                    .ok_or("Failed to get property names")?;
+                
+                let prop_names = ProxiedV8Value::proxy_from_v8(&mut context_scope, prop_names.into(), &inner.common_state, 0)
+                    .map_err(|e| format!("Failed to proxy property names: {}", e))?;
+
+                Ok(OpCallRet::ProxiedMulti(vec![prop_names]))
+            }
+            Self::ObjectGetProperty => {
+                let main_ctx = inner.deno.main_context();
+                let isolate = inner.deno.v8_isolate();
+                let mut scope = v8::HandleScope::new(isolate);
+                let main_ctx = v8::Local::new(&mut scope, main_ctx);
+                let mut context_scope = &mut v8::ContextScope::new(&mut scope, main_ctx);
+
+                if args.len() != 1 {
+                    return Err("ObjectGetProperty requires exactly one argument".into());
+                }
+                let key = match args.into_iter().next().unwrap() {
+                    ProxiedV8Value::Primitive(p) => p,
+                    _ => return Err("ObjectGetProperty key must be a primitive".into()),
+                };
+                let key = match key.to_v8(&mut context_scope) {
+                    Ok(v) => v,
+                    Err(e) => return Err(format!("Failed to convert key to V8: {}", e).into()),
+                };
+
+                let obj = match inner.common_state.proxy_client.obj_registry.get(context_scope, obj_id, |tc, v| {
+                    if !v.is_object() {
+                        return Err("Object is not an object".into());
+                    }
+                    let obj = v8::Local::<v8::Object>::try_from(v)
+                        .map_err(|e| format!("Failed to convert V8 value to object: {}", e))?;
+                    Ok(v8::Global::new(tc, obj))
+                }) {
+                    Ok(o) => o,
+                    Err(e) => return Err(format!("Failed to get V8 object from registry: {}", e).into()),
+                };
+
+                let obj = v8::Local::new(&mut context_scope, &obj);
+
+                let prop_names = obj.get(&mut context_scope, key)
+                    .ok_or("Failed to get property names")?;
+                
+                let prop_names = ProxiedV8Value::proxy_from_v8(&mut context_scope, prop_names.into(), &inner.common_state, 0)
+                    .map_err(|e| format!("Failed to proxy property names: {}", e))?;
+
+                Ok(OpCallRet::ProxiedMulti(vec![prop_names]))
+            }
+            _ => {
+                Err("Not implemented yet".into())
+            }
+        }
     }
 }
+
+#[derive(Clone)]
+pub struct V8IsolateManagerClient {}
 
 #[derive(Serialize, Deserialize)]
 pub struct V8BootstrapData {
@@ -276,43 +371,13 @@ impl ConcurrentlyExecute for V8IsolateManagerClient {
 
         let mut evaluated_modules = HashMap::new();
         let mut module_evaluate_queue = FuturesUnordered::new();
+        let mut op_call_queue = FuturesUnordered::new();
 
         loop {
             tokio::select! {
                 Ok(msg) = rx.recv() => {
                     match msg {
                         V8IsolateManagerMessage::CodeExec { modname, resp } => {
-                            /*let nargs = {
-                                let mut nargs = Vec::with_capacity(args.len());
-
-                                let main_ctx = inner.deno.main_context();
-                                let isolate = inner.deno.v8_isolate();
-                                let mut scope = v8::HandleScope::new(isolate);
-                                let main_ctx = v8::Global::new(&mut scope, main_ctx);
-                                let main_ctx = v8::Local::new(&mut scope, main_ctx);
-                                let context_scope = &mut v8::ContextScope::new(&mut scope, main_ctx);
-                                let mut err = None;
-                                for arg in args {
-                                    match arg.proxy_to_v8(context_scope, &inner.common_state) {
-                                        Ok(arg) => {
-                                            let global_arg = v8::Global::new(context_scope, arg);
-                                            nargs.push(global_arg);
-                                        },
-                                        Err(e) => {
-                                            err = Some(e);
-                                            break;
-                                        }
-                                    };
-                                }
-
-                                if let Some(err) = err {
-                                    let _ = resp.client(&client_ctx).send(Err(err.to_string()));
-                                    continue;
-                                }
-
-                                nargs
-                            };*/
-
                             if let Some(module_id) = evaluated_modules.get(&modname) {
                                 // Module already evaluated, just return the namespace object
                                 let namespace_obj = match inner.deno.get_module_namespace(*module_id) {
@@ -351,80 +416,50 @@ impl ConcurrentlyExecute for V8IsolateManagerClient {
                                 }
                             };
 
-                            let id = match inner.deno.load_side_es_module(&url).await {
-                                Ok(id) => id,
-                                Err(e) => {
-                                    let _ = resp.client(&client_ctx).send(Err(format!("Failed to load module: {}", e).into()));
-                                    continue;
+                            let id = tokio::select! {
+                                id = inner.deno.load_side_es_module(&url) => {
+                                    match id {
+                                        Ok(id) => id,
+                                        Err(e) => {
+                                            let _ = resp.client(&client_ctx).send(Err(format!("Failed to load module: {}", e).into()));
+                                            continue;
+                                        }
+                                    }
+                                }
+                                _ = inner.cancellation_token.cancelled() => {
+                                    return;
                                 }
                             };
+
                             let fut = inner.deno.mod_evaluate(id);
                             module_evaluate_queue.push(async move {
                                 let module_id = fut.await.map(|_| id);
                                 (modname, module_id, resp)
                             });
                         },
-                        V8IsolateManagerMessage::ObjectProperties { obj_id, own_props, resp } => {
-                            match Self::obj_op(&mut inner, obj_id, |scope, common_state, obj| {
-                                // TODO: Allow customizing GetPropertyNamesArgs 
-                                let props = if own_props {
-                                    obj.get_own_property_names(scope, GetPropertyNamesArgs::default())
-                                    .ok_or("Failed to get object property names")?
-                                } else {
-                                    obj.get_property_names(scope, GetPropertyNamesArgs::default())
-                                    .ok_or("Failed to get object property names")?
-                                };
-                                ProxiedV8Value::proxy_from_v8(scope, props.into(), common_state, 0)
-                            }) {
-                                Ok(v) => {
+                        V8IsolateManagerMessage::OpCall { obj_id, op, args, resp } => {
+                            let fut = match op.run(&mut inner, obj_id, args) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    let _ = resp.client(&client_ctx).send(Err(format!("Failed to run op: {}", e).into()));
+                                    continue;
+                                }
+                            };
+                            match fut {
+                                OpCallRet::ProxiedMulti(v) => {
                                     let _ = resp.client(&client_ctx).send(Ok(v));
                                 }
-                                Err(e) => {
-                                    let _ = resp.client(&client_ctx).send(Err(e.to_string()));
-                                }
-                            }
-                        },
-                        V8IsolateManagerMessage::ObjectGetProperty { obj_id, key, resp } => {
-                            match Self::obj_op(&mut inner, obj_id, |scope, common_state, obj| {
-                                let key = key.to_v8(scope)?;
-                                let key = v8::Local::new(scope, key);
-                                match obj.get(scope, key) {
-                                    Some(v) => ProxiedV8Value::proxy_from_v8(scope, v, common_state, 0),
-                                    None => Err("Failed to get object property".into()),
-                                }
-                            }) {
-                                Ok(v) => {
-                                    let _ = resp.client(&client_ctx).send(Ok(v));
-                                }
-                                Err(e) => {
-                                    let _ = resp.client(&client_ctx).send(Err(e.to_string()));
+                                OpCallRet::FunctAsync((func, args)) => {
+                                    let fut = inner.deno.call_with_args(&func, &args);
+                                    op_call_queue.push(async move {
+                                        let result = fut.await;
+                                        (result, resp)
+                                    });
                                 }
                             }
                         },
                         V8IsolateManagerMessage::Shutdown => {
                             break;
-                        }
-                        V8IsolateManagerMessage::DropObject { obj_type, obj_id } => {
-                            match obj_type {
-                                V8ObjectRegistryType::ArrayBuffer => {
-                                    inner.common_state.proxy_client.array_buffer_registry.remove(obj_id);
-                                }
-                                V8ObjectRegistryType::String => {
-                                    inner.common_state.proxy_client.string_registry.remove(obj_id);
-                                }
-                                V8ObjectRegistryType::Array => {
-                                    inner.common_state.proxy_client.array_registry.remove(obj_id);
-                                }
-                                V8ObjectRegistryType::Object => {
-                                    inner.common_state.proxy_client.obj_registry.remove(obj_id);
-                                }
-                                V8ObjectRegistryType::Function => {
-                                    inner.common_state.proxy_client.func_registry.remove(obj_id);
-                                }
-                                V8ObjectRegistryType::Promise => {
-                                    inner.common_state.proxy_client.promise_registry.remove(obj_id);
-                                }
-                            }
                         }
                     }
                 }
@@ -437,6 +472,31 @@ impl ConcurrentlyExecute for V8IsolateManagerClient {
                 }) => {
                     tokio::task::yield_now().await;
                 },
+                Some((result, resp)) = op_call_queue.next() => {
+                    match result {
+                        Ok(res) => {
+                            let main_ctx = inner.deno.main_context();
+                            let isolate = inner.deno.v8_isolate();
+                            let mut scope = v8::HandleScope::new(isolate);
+                            let main_ctx = v8::Local::new(&mut scope, main_ctx);
+                            let mut context_scope = &mut v8::ContextScope::new(&mut scope, main_ctx);
+                            let res = v8::Local::new(&mut context_scope, res);
+                            let res = ProxiedV8Value::proxy_from_v8(context_scope, res, &inner.common_state, 0);
+                            match res {
+                                Ok(v) => {
+                                    let _ = resp.client(&client_ctx).send(Ok(vec![v]));
+                                }
+                                Err(e) => {
+                                    let _ = resp.client(&client_ctx).send(Err(format!("Failed to proxy function result: {}", e).into()));
+                                }
+                            }
+                        },
+                        Err(e) => {
+                            let _ = resp.client(&client_ctx).send(Err(e.to_string()));
+                            continue;
+                        }
+                    }
+                }
                 Some((modname, result, resp)) = module_evaluate_queue.next() => {
                     let Ok(result) = result else {
                         let _ = resp.client(&client_ctx).send(Err("Failed to evaluate module".to_string().into()));

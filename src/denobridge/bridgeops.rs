@@ -2,31 +2,17 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use deno_core::{op2, v8, OpState};
-use crate::luau::bridge::i32_to_obj_registry_type;
 
-use crate::base::ObjectRegistryID;
+use crate::luau::bridge::LuauObjectOp;
+use crate::luau::objreg::LuauObjectRegistryID;
 use super::value::ProxiedV8Value;
 use super::inner::{CommonState, FunctionRunState};
 
-// OP to request dropping an object by ID and type
+// OP to bind arguments to a object by ID, returning a run ID
 #[op2(fast)]
-pub(super) fn __dropluaobject(
-    #[state] state: &CommonState,
-    typ: i32,
-    #[bigint] id: i64,
-) {
-    if let Some(typ) = i32_to_obj_registry_type(typ) {            
-        let id = ObjectRegistryID::from_i64(id);
-        state.bridge.request_drop_object(typ, id);
-    }
-}
-
-// OP to bind arguments to a function by ID, returning a run ID
-#[op2(fast)]
-pub(super) fn __luadispatch(
+pub(super) fn __luabind(
     #[state] state: &CommonState,
     scope: &mut v8::HandleScope,
-    #[bigint] func_id: i64,
     args: v8::Local<v8::Array>,
 ) -> Result<i32, deno_error::JsErrorBox> {
     let mut args_proxied = Vec::with_capacity(args.length() as usize);
@@ -42,22 +28,21 @@ pub(super) fn __luadispatch(
 
     let mut funcs = state.list.borrow_mut();
     let run_id = funcs.len() as i32 + 1;
-    let bridge = state.bridge.clone();
     funcs.insert(run_id, FunctionRunState::Created {
-        fut: Box::pin(async move { 
-            bridge.call_function(ObjectRegistryID::from_i64(func_id), args_proxied).await
-        })
+        args: args_proxied,
     });
     Ok(run_id)
 }
 
-// OP to execute a bound function by run ID
+// OP to execute a opcall by run ID
 //
 // Returns nothing
 #[op2(async)]
 pub(super) async fn __luarun(
     state_rc: Rc<RefCell<OpState>>,
     run_id: i32,
+    #[bigint] obj_id: i64,
+    op_id: u8,
 ) -> Result<(), deno_error::JsErrorBox> {
     let running_funcs = {
         let state = state_rc.try_borrow()
@@ -77,12 +62,20 @@ pub(super) async fn __luarun(
     }; // list borrow ends here
 
     match func_state {
-        FunctionRunState::Created { fut } => {
-            let lua_resp = fut.await
-                .map_err(|e| deno_error::JsErrorBox::generic(format!("Function execution error: {}", e)))?;
+        FunctionRunState::Created { args } => {
+            let obj_reg_id = LuauObjectRegistryID::from_i64(obj_id);
+            let op_id = LuauObjectOp::try_from(op_id)
+                .map_err(|e| deno_error::JsErrorBox::generic(format!("Invalid op_id: {}", e)))?;
+            let lua_resp = running_funcs.bridge.opcall(
+                obj_reg_id,
+                op_id,
+                args,
+            )
+            .await
+            .map_err(|e| deno_error::JsErrorBox::generic(format!("Bridge call failed: {}", e)))?;
             // Store the result in the run state
             let mut funcs = running_funcs.list.borrow_mut();
-            funcs.insert(run_id, FunctionRunState::Executed { lua_resp });
+            funcs.insert(run_id, FunctionRunState::Executed { resp: lua_resp });
             return Ok(())
         }
         _ => {
@@ -91,7 +84,7 @@ pub(super) async fn __luarun(
     }
 }
 
-// OP to get the results of a function by func ID/run ID
+// OP to get the results of a opcall by run ID
 #[op2]
 pub(super) fn __luaret<'s>(
     #[state] state: &CommonState,
@@ -107,10 +100,10 @@ pub(super) fn __luaret<'s>(
     }; // list borrow ends here
 
     match func_state {
-        FunctionRunState::Executed { lua_resp } => {
+        FunctionRunState::Executed { resp } => {
             // Proxy every return value to V8
             let mut results = vec![];
-            for ret in lua_resp {
+            for ret in resp {
                 match ret.proxy_to_v8(scope, state) {
                     Ok(v8_ret) => results.push(v8_ret),
                     Err(e) => {

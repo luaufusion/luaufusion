@@ -132,8 +132,7 @@ pub(crate) fn structuredclone_extensions(is_snapshot: bool) -> Vec<Extension> {
 extension!(
     luau_bridge,
     ops = [
-        crate::denobridge::bridgeops::__dropluaobject,
-        crate::denobridge::bridgeops::__luadispatch,
+        crate::denobridge::bridgeops::__luabind,
         crate::denobridge::bridgeops::__luarun,
         crate::denobridge::bridgeops::__luaret,
     ],
