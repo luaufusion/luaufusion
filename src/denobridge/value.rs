@@ -10,7 +10,6 @@ use crate::luau::bridge::{
 };
 use super::inner::CommonState;
 use deno_core::v8;
-use crate::MAX_PROXY_DEPTH;
 
 /// A V8 value that can now be easily proxied to Luau
 #[derive(Serialize, Deserialize)]
@@ -101,7 +100,7 @@ impl ProxiedV8Value {
                 Ok(mluau::Value::UserData(ud))
             }
             ProxiedV8Value::StringRef((string_id, len)) => {
-                let ud = V8String::new(string_id, plc.clone(), bridge.clone(), len);
+                let ud = V8String::new_with_len(string_id, plc.clone(), bridge.clone(), len);
                 let ud = lua.create_userdata(ud)?;
                 Ok(mluau::Value::UserData(ud))
             }
@@ -196,12 +195,7 @@ impl ProxiedV8Value {
         scope: &mut v8::HandleScope<'s>, 
         value: v8::Local<'s, v8::Value>,
         common_state: &CommonState,
-        depth: usize,
     ) -> Result<Self, Error> {
-        if depth > MAX_PROXY_DEPTH {
-            return Err("Maximum proxy depth exceeded".into());
-        }
-
         if let Some(prim) = ProxiedV8Primitive::v8_to_primitive(scope, value)? {
             return Ok(Self::Primitive(prim));
         }

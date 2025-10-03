@@ -3,8 +3,8 @@ import { __luabind, __luarun, __luaret } from "ext:core/ops";
 // Enum for opcalls
 const opCalls = {
     FunctionCallSync: 1,
-    Index: 2,
-    StringRead: 3,
+    FunctionCallAsync: 2,
+    Index: 3,
     Drop: 4,
 }
 
@@ -17,7 +17,15 @@ const objRegistryType = {
     Buffer: 4,
     Thread: 5
 }
+Object.freeze(objRegistryType);
+const objRegistryTypeNames = {};
+for (let key in objRegistryType) {
+    objRegistryTypeNames[objRegistryType[key]] = key;
+}
+Object.freeze(objRegistryTypeNames);
 
+// Cache of Lua objects to avoid creating multiple JS wrappers for the same Lua object
+// Map of luatype -> Map of luaid -> LuaObject
 let __objcache = {}
 for (let key in objRegistryType) {
     __objcache[objRegistryType[key]] = new Map();
@@ -46,6 +54,10 @@ class LuaObject {
         return this.#luatype
     }
 
+    get typename() {
+        return objRegistryTypeNames[this.#luatype] || "Unknown"
+    }
+
     /**
      * Perform an opcall on this object
      * 
@@ -69,24 +81,89 @@ class LuaObject {
 
         await this.__opcall(opCalls.Drop, [])
     }
+
+    toString() {
+        return `[LuaObject type=${this.#luatype} id=${this.#luaid}, typename=${this.typename}]`
+    }
 }
 
-// Represents a Luau string
-class LuaString extends LuaObject {
+/**
+ * A Lua object that can be called like a function etc.
+ */
+class LuaCallableObject extends LuaObject {
+    /**
+     * Calls the function synchronously/not in a new Luau thread
+     * 
+     * Note: this method is non-blocking in the JS side. The main benefit of callSync over callAsync is that
+     * callSync is executed in the main Luau thread, while callAsync is executed in a new Luau thread (making
+     * callSync potentially faster than callAsync at the expense of blocking yielding).
+     * @param {any} args The arguments to pass
+     * @returns {any} The returned data from the function. A single value returned by Luau is automatically
+     * converted to a single value internally
+     */
+    async callSync(...args) {
+        console.log("Calling Lua function with ID", this.luaid);
+        let ret = await this.__opcall(opCalls.FunctionCallSync, args);
+        if (Array.isArray(ret) && ret.length <= 1) {
+            return ret[0]; // Cast to single value due to lua multivalue things
+        }
+        return ret;
+    }
+
+    /**
+     * Calls the function asynchronously/in a new Luau thread. This is useful if the function being called may yield
+     * but is slower than callSync due to the overhead of creating a new Luau thread and running the function using the
+     * scheduler.
+     * 
+     * @param {any} args The arguments to pass
+     * @returns {any} The returned data from the function. A single value returned by Luau is automatically
+     * converted to a single value internally
+     */
+    async callAsync(...args) {
+        console.log("Calling Lua function with ID", this.luaid);
+        let ret = await this.__opcall(opCalls.FunctionCallAsync, args);
+        if (Array.isArray(ret) && ret.length <= 1) {
+            return ret[0]; // Cast to single value due to lua multivalue things
+        }
+        return ret;
+    }
+}
+
+/**
+ * A Lua object that can be indexed like a table/userdata
+ * 
+ * Currently only supports tables/userdata.
+ */
+class LuaIndexableObject extends LuaObject {
+    /**
+     * Index the object with the provided key
+     * 
+     * This method calls the __index metamethod of the object, if it exists.
+     * 
+     * @param {any} key The key to index the object with
+     * @returns {any} The value at the provided key
+     */
+    async get(key) {
+        console.log("Calling Lua function with ID", this.luaid);
+        let ret = await this.__opcall(opCalls.Index, [key]);
+        if (Array.isArray(ret) && ret.length <= 1) {
+            return ret[0]; // Cast to single value due to lua multivalue things
+        }
+    }
+}
+
+class LuaLenghtableObject extends LuaObject {
     #length
-    #stringCache = null // Cache the string once read
 
     /**
      * 
      * @param {number} luaid The id of the type
      * @param {number} luatype The type of the type on the registry
      * @param {number} length The length of the string
-     * @param {string|null} stringCache Optional cache of the string if already read
      */
-    constructor(luaid, luatype, length, stringCache) {
+    constructor(luaid, luatype, length) {
         super(luaid, luatype)
         this.#length = length
-        this.#stringCache = stringCache
     }
 
     /**
@@ -95,79 +172,19 @@ class LuaString extends LuaObject {
     get length() {
         return this.#length
     }
-
-    /**
-     * Reads a string fully to a Javascript. May request multiple chunks from the string from Luau.
-     * 
-     * This method may error if there was an issue reading the string or if the Luau string isn't UTF-8.
-     * 
-     * String length is always known, but content needs to be loaded in
-     *
-     * @returns {string} The contents of the string from Luau
-     */
-    async read() {
-        if(this.#stringCache !== null) return this.#stringCache; // Return cached value if already read
-        let result = await this.__opcall(opCalls.StringRead, []); // TODO: Support reading substrings with args
-        let s = result[0];
-        if(typeof s !== "string") {
-            throw new Error("Failed to read string from Luau: returned value is not a string");
-        }
-        this.#stringCache = s;
-        return s;
-    }
-
-    __withNewObj(obj) {
-        return new LuaString(this.luaid, this.luatype, obj, this.#length, this.#stringCache);
-    }
 }
 
-class LuaBuffer extends LuaObject {} // TODO: Implement methods
+class LuaString extends LuaLenghtableObject {}
 
-// Represents a Luau function
-class LuaFunction extends LuaObject {
-    /**
-     * 
-     * @param {any} args The arguments to pass
-     * @returns {any} The returned data from the function. A single value returned by Luau is automatically
-     * converted to a single value internally
-     */
-    async callSync(args) {
-        console.log("Calling Lua function with ID", this.luaid);
-        let ret = await this.__opcall(opCalls.FunctionCallSync, args);
-        if (Array.isArray(ret) && ret.length <= 1) {
-            return ret[0]; // Cast to single value due to lua multivalue things
-        }
-        return ret;
-    }
-}
+class LuaBuffer extends LuaObject {} 
 
-class LuaTable extends LuaObject {
-    async get(key) {
-        let runId = NOT_IMPLEMENTED.__luaobjbind(this.luaid, key, null);
-        await NOT_IMPLEMENTED.__luaobjget(runId);
-        return NOT_IMPLEMENTED.__luaobjret(runId);
-    }
+class LuaFunction extends LuaCallableObject {}
 
-    async set(key, value) {
-        let runId = NOT_IMPLEMENTED.__luaobjbind(this.luaid, key, value);
-        await NOT_IMPLEMENTED.__luaobjset(runId);
-        return NOT_IMPLEMENTED.__luaobjret(runId);
-    }
+class LuaTable extends LuaIndexableObject {}
 
-    async keys() {
-        let runId = NOT_IMPLEMENTED.__luaobjbind(this.luaid, null, null);
-        await NOT_IMPLEMENTED.__luaobjkeys(runId);
-        return NOT_IMPLEMENTED.__luaobjret(runId);
-    }
+class LuaThread extends LuaObject {}
 
-    async clear() {
-        await NOT_IMPLEMENTED.__luaobjclear(this.luaid);
-    }
-}
-
-class LuaThread extends LuaObject {} // TODO: Implement methods
-
-class LuaUserData extends LuaObject {} // TODO: Implement methods
+class LuaUserData extends LuaIndexableObject {}
 
 /**
  * Creates a Lua object from the provided data. Used internally by the Rust bridge code.
@@ -301,6 +318,7 @@ globalThis.lua = {
     LuaUserData,
     V8ObjectRegistry,
     objRegistryType,
+    objRegistryTypeNames,
     opCalls,
     createLuaObjectFromData,
     createStringRef,

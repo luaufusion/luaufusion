@@ -4,12 +4,11 @@ use super::bridge::{
     V8ObjectRegistryType, V8IsolateManagerServer, v8_obj_registry_type_to_i32,
 };
 use crate::base::Error;
-use crate::denobridge::bridge::V8ObjectOp;
+use crate::denobridge::bridge::{MAX_FUNCTION_ARGS, V8ObjectOp};
 use crate::denobridge::objreg::V8ObjectRegistryID;
 use crate::denobridge::value::ProxiedV8Value;
 use crate::luau::bridge::ProxyLuaClient;
 use std::rc::Rc;
-use std::cell::RefCell;
 
 /// The core struct encapsulating a V8 object being proxied *to* luau
 pub struct V8ObjectInner {
@@ -29,131 +28,92 @@ impl V8ObjectInner {
         }
     }
 
-    async fn op_call(&self, obj_id: V8ObjectRegistryID, op: V8ObjectOp, args: Vec<ProxiedV8Value>) -> Result<Vec<ProxiedV8Value>, Error> {
+    /// Do a op call with a single primitive argument (optimized)
+    async fn op_call_primitive(&self, lua: &mluau::Lua, obj_id: V8ObjectRegistryID, op: V8ObjectOp, args: mluau::Value) -> Result<mluau::MultiValue, Error> {
+        let arg = ProxiedV8Primitive::luau_to_primitive(&args)
+        .map_err(|e| format!("Failed to proxy argument to ProxiedV8Value: {}", e))?
+        .ok_or(format!("Argument is not a primitive value"))?;
+        
         match self.bridge.send(super::bridge::OpCallMessage {
             obj_id,
             op,
-            args,
+            args: vec![ProxiedV8Value::Primitive(arg)],
         })
         .await? {
-            Ok(v) => Ok(v),
+            Ok(v) => {
+                let mut proxied = mluau::MultiValue::with_capacity(v.len());
+                for ret in v {
+                    let ret = ret.proxy_to_src_lua(&lua, &self.plc, &self.bridge)
+                    .map_err(|e| format!("Failed to convert return value to Lua: {}", e))?;
+                    proxied.push_back(ret);
+                }
+                Ok(proxied)
+            },
+            Err(e) => Err(e.into()),
+        }
+    
+    }
+
+    /// Do a op call with multiple arguments
+    async fn op_call(&self, obj_id: V8ObjectRegistryID, op: V8ObjectOp, args: mluau::MultiValue) -> Result<mluau::MultiValue, Error> {
+        if args.len() > MAX_FUNCTION_ARGS as usize {
+            return Err(format!("Too many function arguments passed to V8Object op call (max {})", MAX_FUNCTION_ARGS).into());
+        }
+        let mut string_char_count = 0;
+        let mut args_proxied = Vec::with_capacity(args.len());
+        for arg in args {
+            let proxied = ProxiedV8Value::proxy_from_src_lua(&self.plc, arg)
+            .map_err(|e| format!("Failed to proxy argument to ProxiedV8Value: {}", e))?;
+            if let ProxiedV8Value::Primitive(ProxiedV8Primitive::String(ref s)) = proxied {
+                string_char_count += s.len();
+                if string_char_count > super::bridge::MAX_OWNED_V8_STRING_SIZE {
+                    return Err(format!("Too many string characters passed to V8Object op call (max {})", super::bridge::MAX_OWNED_V8_STRING_SIZE).into());
+                }
+            }
+            args_proxied.push(proxied);
+        }
+        match self.bridge.send(super::bridge::OpCallMessage {
+            obj_id,
+            op,
+            args: args_proxied,
+        })
+        .await? {
+            Ok(v) => {
+                let mut proxied = mluau::MultiValue::with_capacity(v.len());
+                let Some(lua) = self.plc.weak_lua.try_upgrade() else {
+                    return Err("Lua instance has been dropped".into());
+                };
+                for ret in v {
+                    let ret = ret.proxy_to_src_lua(&lua, &self.plc, &self.bridge)
+                    .map_err(|e| format!("Failed to convert return value to Lua: {}", e))?;
+                    proxied.push_back(ret);
+                }
+                Ok(proxied)
+            },
             Err(e) => Err(e.into()),
         }
     }
 }
 
-#[derive(Clone)]
-pub struct V8Object {
-    pub inner: Rc<RefCell<Option<V8ObjectInner>>>,
-}
-
-impl V8Object {
-    fn new(id: V8ObjectRegistryID, typ: V8ObjectRegistryType, plc: ProxyLuaClient, bridge: V8IsolateManagerServer) -> Self {
-        Self {
-            inner: Rc::new(RefCell::new(Some(V8ObjectInner::new(id, typ, plc, bridge)))),
-        }
-    }
-}
-
-impl mluau::UserData for V8Object {
-    fn add_methods<M: mluau::UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_method("id", |_, this, ()| {
-            match this.inner.borrow().as_ref() {
-                Some(inner) => Ok(inner.id.objid()),
-                None => Err(mluau::Error::external("V8Object has already been dropped")),
-            }
-        });
-
-        methods.add_method("typestr", |_, this, ()| {
-            let typ = match this.inner.borrow().as_ref() {
-                Some(inner) => inner.typ,
-                None => return Err(mluau::Error::external("V8Object has already been dropped")),
-            };
-            let typ_str = match typ {
-                V8ObjectRegistryType::ArrayBuffer => "ArrayBuffer",
-                V8ObjectRegistryType::String => "String",
-                V8ObjectRegistryType::Object => "Object",
-                V8ObjectRegistryType::Array => "Array",
-                V8ObjectRegistryType::Function => "Function",
-                V8ObjectRegistryType::Promise => "Promise",
-            };
-            Ok(typ_str.to_string())
-        });
-
-        methods.add_method("type", |_, this, ()| {
-            let typ = match this.inner.borrow().as_ref() {
-                Some(inner) => inner.typ,
-                None => return Err(mluau::Error::external("V8Object has already been dropped")),
-            };
-            Ok(v8_obj_registry_type_to_i32(typ))
-        });
-
-        methods.add_scheduler_async_method("requestdispose", async move |_, this, ()| {
-            if let Some(v) = this.inner.borrow_mut().take() {
-                let id = v.id;
-                v.op_call(id, V8ObjectOp::RequestDispose, vec![]).await
-                .map_err(|e| mluau::Error::external(format!("Failed to request dispose: {}", e)))?;
-            }
-            Ok(())
-        }); 
-    }
-}
-
-
-/*impl mluau::UserData for V8String {
-    fn add_methods<M: mluau::UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_meta_method(mluau::MetaMethod::Len, |_, this, ()| {
-            Ok(this.len)
-        });
-
-        methods.add_method("object", |_, this, ()| {
-            Ok(this.obj.clone())
-        });
-    }
-}*/
-
 macro_rules! impl_v8_obj {
     ($name:ident, $typ:expr, $ext_methods:expr) => {
         pub struct $name {
-            pub obj: V8Object,
+            pub obj: Rc<V8ObjectInner>,
+            pub len: Option<usize>,
         }
 
         impl $name {
             pub fn new(id: V8ObjectRegistryID, plc: ProxyLuaClient, bridge: V8IsolateManagerServer) -> Self {
                 Self {
-                    obj: V8Object::new(id, $typ, plc, bridge),
+                    obj: Rc::new(V8ObjectInner::new(id, $typ, plc, bridge)),
+                    len: None
                 }
             }
 
-            fn method_adder<M: mluau::UserDataMethods<Self>>(methods: &mut M) {
-                $ext_methods(methods);
-            }
-        }
-
-        impl mluau::UserData for $name {
-            fn add_methods<M: mluau::UserDataMethods<Self>>(methods: &mut M) {
-                methods.add_method("object", |_, this, ()| {
-                    Ok(this.obj.clone())
-                });
-
-                Self::method_adder(methods);
-            }
-        }
-    }
-}
-
-macro_rules! impl_v8_obj_with_len {
-    ($name:ident, $typ:expr, $ext_methods:expr) => {
-        pub struct $name {
-            pub obj: V8Object,
-            pub len: usize,
-        }
-
-        impl $name {
-            pub fn new(id: V8ObjectRegistryID, plc: ProxyLuaClient, bridge: V8IsolateManagerServer, len: usize) -> Self {
+            pub fn new_with_len(id: V8ObjectRegistryID, plc: ProxyLuaClient, bridge: V8IsolateManagerServer, len: usize) -> Self {
                 Self {
-                    obj: V8Object::new(id, $typ, plc, bridge),
-                    len,
+                    obj: Rc::new(V8ObjectInner::new(id, $typ, plc, bridge)),
+                    len: Some(len)
                 }
             }
 
@@ -165,11 +125,22 @@ macro_rules! impl_v8_obj_with_len {
         impl mluau::UserData for $name {
             fn add_methods<M: mluau::UserDataMethods<Self>>(methods: &mut M) {
                 methods.add_meta_method(mluau::MetaMethod::Len, |_, this, ()| {
-                    Ok(this.len)
+                    Ok(Some(this.len))
                 });
 
-                methods.add_method("object", |_, this, ()| {
-                    Ok(this.obj.clone())
+                methods.add_scheduler_async_method("requestdispose", async move |_, this, ()| {
+                    let id = this.obj.id;
+                    this.obj.op_call(id, V8ObjectOp::RequestDispose, mluau::MultiValue::with_capacity(0)).await
+                    .map_err(|e| mluau::Error::external(format!("Failed to request dispose: {}", e)))?;
+                    Ok(())
+                }); 
+
+                methods.add_method("id", |_, this, ()| {
+                    Ok(this.obj.id.objid())
+                });
+
+                methods.add_method("type", |_, this, ()| {
+                    Ok(v8_obj_registry_type_to_i32(this.obj.typ))
                 });
 
                 Self::method_adder(methods);
@@ -178,46 +149,14 @@ macro_rules! impl_v8_obj_with_len {
     }
 }
 
-impl_v8_obj_with_len!(V8String, V8ObjectRegistryType::String, |_m| {});
+impl_v8_obj!(V8String, V8ObjectRegistryType::String, |_m| {});
 
 impl_v8_obj!(V8ArrayBuffer, V8ObjectRegistryType::ArrayBuffer, |_m| {});
 
 impl_v8_obj!(V8ObjectObj, V8ObjectRegistryType::Object, __objmethods);
 fn __objmethods<M: mluau::UserDataMethods<V8ObjectObj>>(methods: &mut M) {
-    methods.add_scheduler_async_method("getproperties", async move |lua, this, _: ()| {
-        let _g = this.obj.inner.try_borrow()
-        .map_err(|e| mluau::Error::external(format!("Failed to borrow V8Object inner: {}", e)))?;
-        let inner = match _g.as_ref() {
-            Some(inner) => inner,
-            None => return Err(mluau::Error::external("V8Object has already been dropped")),
-        };
-        let resp = inner.op_call(inner.id, V8ObjectOp::ObjectProperties, vec![])
-        .await
-        .map_err(|e| mluau::Error::external(format!("Failed to get properties: {}", e)))?;
-        
-        if resp.len() != 1 {
-            return Err(mluau::Error::external(format!("Expected 1 return value from ObjectProperties, got {}", resp.len())));
-        }
-
-        let resp = resp.into_iter().next().unwrap();
-        let resp = resp.proxy_to_src_lua(&lua, &inner.plc, &inner.bridge)
-        .map_err(|e| mluau::Error::external(format!("Failed to convert properties to Lua: {}", e)))?;
-
-        Ok(resp)
-    });
-
-    methods.add_scheduler_async_method("getproperty", async move |lua, this, key: mluau::Value| {
-        let _g = this.obj.inner.try_borrow()
-        .map_err(|e| mluau::Error::external(format!("Failed to borrow V8Object inner: {}", e)))?;
-        let inner = match _g.as_ref() {
-            Some(inner) => inner,
-            None => return Err(mluau::Error::external("V8Object has already been dropped")),
-        };
-        let key = ProxiedV8Primitive::luau_to_primitive(&key)
-        .map_err(|e| mluau::Error::external(format!("Failed to proxy key to ProxiedV8Value: {}", e)))?
-        .ok_or(mluau::Error::external("Key is not a primitive value"))?;
-        
-        let resp = inner.op_call(inner.id, V8ObjectOp::ObjectGetProperty, vec![ProxiedV8Value::Primitive(key)])
+    methods.add_scheduler_async_method("getproperty", async move |lua, this, key: mluau::Value| {        
+        let resp = this.obj.op_call_primitive(&lua, this.obj.id, V8ObjectOp::ObjectGetProperty, key)
         .await
         .map_err(|e| mluau::Error::external(format!("Failed to get property: {}", e)))?;
 
@@ -226,8 +165,6 @@ fn __objmethods<M: mluau::UserDataMethods<V8ObjectObj>>(methods: &mut M) {
         }
 
         let resp = resp.into_iter().next().unwrap();
-        let resp = resp.proxy_to_src_lua(&lua, &inner.plc, &inner.bridge)
-        .map_err(|e| mluau::Error::external(format!("Failed to convert property to Lua: {}", e)))?;
 
         Ok(resp)
     });
@@ -235,5 +172,21 @@ fn __objmethods<M: mluau::UserDataMethods<V8ObjectObj>>(methods: &mut M) {
 
 //impl_v8_obj_stub!(V8ObjectObj, V8ObjectRegistryType::Object);
 impl_v8_obj!(V8Array, V8ObjectRegistryType::Array, |_m| {});
-impl_v8_obj!(V8Function, V8ObjectRegistryType::Function, |_m| {});
+impl_v8_obj!(V8Function, V8ObjectRegistryType::Function, __funcmethods);
+fn __funcmethods<M: mluau::UserDataMethods<V8Function>>(methods: &mut M) {
+    methods.add_scheduler_async_method("call", async move |_lua, this, args: mluau::MultiValue| {
+        let resp = this.obj.op_call(this.obj.id, V8ObjectOp::FunctionCall, args)
+        .await
+        .map_err(|e| mluau::Error::external(format!("Failed to perform function call: {}", e)))?;
+
+        if resp.len() != 1 {
+            return Err(mluau::Error::external(format!("Expected 1 return value from GetProperty, got {}", resp.len())));
+        }
+
+        let resp = resp.into_iter().next().unwrap();
+
+        Ok(resp)
+    });
+}
+
 impl_v8_obj!(V8Promise, V8ObjectRegistryType::Promise, |_m| {});

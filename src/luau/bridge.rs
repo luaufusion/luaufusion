@@ -77,9 +77,8 @@ pub enum ObjectRegistryType {
 #[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum LuauObjectOp {
     FunctionCallSync = 1,
-    //BufferRead,
-    Index = 2,
-    StringRead = 3,
+    FunctionCallAsync = 2,
+    Index = 3,
     Drop = 4,
 }
 
@@ -89,8 +88,8 @@ impl TryFrom<u8> for LuauObjectOp {
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
             1 => Ok(LuauObjectOp::FunctionCallSync),
-            2 => Ok(LuauObjectOp::Index),
-            3 => Ok(LuauObjectOp::StringRead),
+            2 => Ok(LuauObjectOp::FunctionCallAsync),
+            3 => Ok(LuauObjectOp::Index),
             4 => Ok(LuauObjectOp::Drop),
             _ => Err(format!("Invalid ObjectOp value: {}", value)),
         }
@@ -149,6 +148,33 @@ impl LuauObjectOp {
                 .map_err(|e| format!("Failed to call function: {}", e).into())
                 .map(ValueOrMultiValue::MultiValue)
             }
+            Self::FunctionCallAsync => {
+                let Some(lua) = plc.weak_lua.try_upgrade() else {
+                    return Err("Lua state has been dropped".into());
+                };
+                let obj = plc.obj_registry.get(obj_id)
+                    .map_err(|e| format!("Failed to get object from registry: {}", e))?;
+                let args = Self::create_multivalue_from_args(args, &bridge, &plc)?;
+                let func = match obj {
+                    mluau::Value::Function(f) => f,
+                    _ => return Err("Object is not a function".into()),
+                };
+
+                let th = match lua.create_thread(func) {
+                    Ok(t) => t,
+                    Err(e) => return Err(format!("Failed to create Lua thread: {}", e).into()),
+                };
+
+                let taskmgr = mlua_scheduler::taskmgr::get(&lua);
+                
+                let Some(res) = taskmgr.spawn_thread_and_wait(th, args).await
+                    .map_err(|e| format!("Failed to call async function: {}", e))? else {
+                    return Err("Async function did not return due to an unknown error".into());
+                    };
+                
+                Ok(ValueOrMultiValue::MultiValue(res.map_err(|e| e.to_string())?))
+                
+            }
             Self::Index => {
                 if args.len() != 1 {
                     return Err("Index operation requires exactly one argument".into());
@@ -168,17 +194,6 @@ impl LuauObjectOp {
                     _ => Err("Object is not indexable (not a table or userdata)".into()),
                 }?;
                 Ok(ValueOrMultiValue::Value(v))
-            }
-            Self::StringRead => {
-                // TODO: Support reading substrings with args
-                let obj = plc.obj_registry.get(obj_id)
-                    .map_err(|e| format!("Failed to get object from registry: {}", e))?;
-                let s = match obj {
-                    mluau::Value::String(s) => s,
-                    _ => return Err("Object is not a string".into()),
-                };
-
-                Ok(ValueOrMultiValue::Value(mluau::Value::String(s.clone())))
             }
             Self::Drop => {
                 if !args.is_empty() {

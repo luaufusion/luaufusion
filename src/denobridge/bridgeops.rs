@@ -3,6 +3,8 @@ use std::rc::Rc;
 
 use deno_core::{op2, v8, OpState};
 
+use crate::denobridge::bridge::{MAX_FUNCTION_ARGS, MAX_OWNED_V8_STRING_SIZE};
+use crate::denobridge::primitives::ProxiedV8Primitive;
 use crate::luau::bridge::LuauObjectOp;
 use crate::luau::objreg::LuauObjectRegistryID;
 use super::value::ProxiedV8Value;
@@ -15,11 +17,27 @@ pub(super) fn __luabind(
     scope: &mut v8::HandleScope,
     args: v8::Local<v8::Array>,
 ) -> Result<i32, deno_error::JsErrorBox> {
+    if args.length() > MAX_FUNCTION_ARGS {
+        return Err(deno_error::JsErrorBox::generic(format!("Too many function arguments passed to op bind"))); 
+    }
+
     let mut args_proxied = Vec::with_capacity(args.length() as usize);
+    let mut num_string_chars = 0;
     for i in 0..args.length() {
         let arg = args.get_index(scope, i).ok_or_else(|| deno_error::JsErrorBox::generic(format!("Failed to get argument {}", i)))?;
-        match ProxiedV8Value::proxy_from_v8(scope, arg, &state, 0) {
-            Ok(v) => args_proxied.push(v),
+        match ProxiedV8Value::proxy_from_v8(scope, arg, &state) {
+            Ok(v) => {
+                match v {
+                    ProxiedV8Value::Primitive(ProxiedV8Primitive::String(ref s)) => {
+                        num_string_chars += s.len();
+                        if num_string_chars > MAX_OWNED_V8_STRING_SIZE {
+                            return Err(deno_error::JsErrorBox::generic(format!("Too many string characters passed to op bind"))); 
+                        }
+                    },
+                    _ => {}
+                };  
+                args_proxied.push(v);
+            },
             Err(e) => {
                 return Err(deno_error::JsErrorBox::generic(format!("Failed to convert argument {}: {}", i, e)));
             }

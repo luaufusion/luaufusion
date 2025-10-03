@@ -22,6 +22,7 @@ fn main() {
             assert!(args[1] == "child", "Invalid argument");
             println!("[child] Starting child process mode");
             ConcurrentExecutor::<<V8IsolateManagerServer as ProxyBridge>::ConcurrentlyExecuteClient>::run_process_client().await;
+            println!("[child] Exiting child process mode");
             return;
         }
 
@@ -68,8 +69,11 @@ fn main() {
 
         let vfs = HashMap::from([
             ("foo.js".to_string(), r#"
-export function foo() { 
-    return 123 
+export async function foo(luafunc) { 
+    console.log("foo", `${luafunc}`);
+    console.log("fooCall", `${await luafunc.callSync()}`);
+    console.log("hi");
+    return 123 + (await luafunc.callAsync());
 }
 
 export function bar(x) {
@@ -95,7 +99,7 @@ console.log("In dir/baz.js");
 import * as foobar from "./dir/foo.js";
 import a from "./foo1.json" with { type: "json" };
 console.log("In bar.js, imported foo1.json:", a);
-export function foo2() { 
+export function foo2() {
     return 123 
 }
 
@@ -133,13 +137,19 @@ console.log("Awake now again! Time now is: " + Date.now() + ", timeNow -  Date.n
 
         // Call the v8 function now as a async script
         let lua_code = r#"
+local function myfooer()
+    print("In myfooer")
+    return 42
+end
+
 local v8 = ...
 local result = v8:run("foo.js")
 -- args to pass to foo: function() print('am here'); return task.wait(1) end, v8, buffer.create(10)
 print("Result from V8:", result)
-local propnames = result:getproperties()
 local fooprop = result:getproperty("foo")
-print("Properties of result:", propnames, fooprop)
+local res = fooprop:call(myfooer)
+print("foo prop:", fooprop, res)
+assert(res == 123 + 42, "Invalid result from foo prop call")
 
 -- Test calling multiple times to ensure caching works
 local result2 = v8:run("foo.js")
@@ -150,7 +160,9 @@ local result4 = v8:run("bar.js")
 print("Result4 from V8:", result4)
 "#;
 
-        let func = lua.load(lua_code).into_function().expect("Failed to load Lua code");
+        let func = lua.load(lua_code)
+        .set_name("main_chunk")
+        .into_function().expect("Failed to load Lua code");
         let th = lua.create_thread(func).expect("Failed to create Lua thread");
         
         let mut args = mluau::MultiValue::new();
