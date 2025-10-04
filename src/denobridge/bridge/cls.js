@@ -106,6 +106,18 @@ const getproperty = async (obj, key) => {
     return ret;
 }
 
+/**
+ * Helper method to get the type of a lua object
+ * 
+ * Returns one of "String", "Table", "Function", "UserData", "Buffer", "Thread" or "unknown"
+ */
+const objtype = (obj) => {
+    if (obj && typeof obj === "object" && luatypeSymbol in obj) {
+        return objRegistryTypeNames[obj[luatypeSymbol]];
+    }
+    return "unknown";
+}
+
 globalThis.lua = {
     V8ObjectRegistry,
     objRegistryType,
@@ -120,5 +132,6 @@ globalThis.lua = {
     requestDisposal,
     call,
     getproperty,
+    objtype
 }
 Object.freeze(globalThis.lua);
