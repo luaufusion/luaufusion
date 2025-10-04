@@ -137,7 +137,7 @@ extension!(
         crate::denobridge::bridgeops::__luaret,
     ],
     esm_entry_point = "ext:luau_bridge/cls.js",
-    esm = [ dir "src/denobridge/bridge", "cls.js" ],
+    esm = [ dir "src/denobridge/bridge", "cls.js", "objreg.js" ],
 );
 impl ExtensionTrait<()> for luau_bridge {
     fn init((): ()) -> Extension {
