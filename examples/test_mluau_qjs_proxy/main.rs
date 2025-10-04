@@ -71,18 +71,14 @@ fn main() {
             ("foo.js".to_string(), r#"
 export async function foo(luafunc) { 
     console.log("foo", `${luafunc}`);
-    console.log("fooCall", `${await luafunc.callSync()}`);
+    console.log("fooCall", `${await globalThis.lua.call(luafunc, false)}`);
     console.log("hi");
-    return 123 + (await luafunc.callAsync());
+    return 123 + (await globalThis.lua.call(luafunc, true));
 }
 
-export async function stringreftest() {
-    return globalThis.lua.createStringRef("Hello from V8");
-}
-
-export function derefStringRef(ref) {
-    console.log("Derefing string ref", ref);
-    return ref
+export function s(s) {
+    console.log("Derefing string", s);
+    return s
 }
 
 export function bar(x) {
@@ -164,19 +160,6 @@ local fooprop = result:getproperty("foo")
 local res = fooprop:call(myfooer)
 print("foo prop:", fooprop, res)
 assert(res == 123 + 42, "Invalid result from foo prop call")
-
-local stringref = result:getproperty("stringreftest"):call()
-print("String ref from V8:", stringref, stringref:typename())
-assert(stringref:typename() == "V8String", "Invalid type for stringref")
-local derefed = result:getproperty("derefStringRef"):call(stringref)
-print("Derefed string ref from V8:", derefed, typeof(derefed))
-assert(derefed == "Hello from V8", "Invalid derefed string ref")
-
-local ok, err = pcall(function() 
-    stringref:call() 
-end)
-print("Expected error calling stringref as function:", err, ok)
-assert(not ok, "Expected error calling stringref as function")
 
 -- Test calling multiple times to ensure caching works
 local result2 = v8:run("foo.js")

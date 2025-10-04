@@ -6,7 +6,7 @@ use crate::luau::objreg::LuauObjectRegistryID;
 use super::primitives::ProxiedV8Primitive;
 use super::V8IsolateManagerServer;
 use crate::luau::bridge::{
-    ObjectRegistryType, ProxyLuaClient, StringRef, i32_to_obj_registry_type, luau_value_to_obj_registry_type, obj_registry_type_to_i32
+    ObjectRegistryType, ProxyLuaClient, i32_to_obj_registry_type, luau_value_to_obj_registry_type, obj_registry_type_to_i32
 };
 use super::inner::CommonState;
 use deno_core::v8;
@@ -14,17 +14,14 @@ use deno_core::v8;
 /// A V8 value that can now be easily proxied to Luau
 #[derive(Serialize, Deserialize)]
 pub enum ProxiedV8Value {
+    // Primitive values
     Primitive(ProxiedV8Primitive),
-    Vector((f32, f32, f32)), 
-    ArrayBuffer(V8ObjectRegistryID), // Buffer ID in the buffer registry
-    StringRef((V8ObjectRegistryID, usize)), // String ID in the string registry, length
-    Object(V8ObjectRegistryID), // Object ID in the map registry
-    Array(V8ObjectRegistryID), // Array ID in the array registry
-    Function(V8ObjectRegistryID), // Function ID in the function registry
-    Promise(V8ObjectRegistryID), // Promise ID in the function registry
+
+    // v8-owned stuff
+    V8OwnedObject((V8ObjectRegistryType, V8ObjectRegistryID)), // (Type, ID) of the v8-owned object
 
     // Source-owned stuff
-    SourceOwnedObject((ObjectRegistryType, LuauObjectRegistryID, Option<usize>)), // (Type, ID, <optional length>) of the source-owned object
+    SourceOwnedObject((ObjectRegistryType, LuauObjectRegistryID)), // (Type, ID) of the source-owned object
 }
 
 impl ProxiedV8Value {
@@ -56,31 +53,18 @@ impl ProxiedV8Value {
             mluau::Value::Other(r) => unreachable!(
                 "Other({r:?}) should have been handled as a primitive"
             ), // is a primitive 
-            mluau::Value::Vector(v) => Ok(ProxiedV8Value::Vector((v.x(), v.y(), v.z()))),
+            mluau::Value::Vector(v) => unreachable!(
+                "Vector({v:?}) should have been handled as a primitive"
+            ),
             mluau::Value::UserData(ud) => {
-                // Handle string refs
-                if let Ok(ref_wrapper) = ud.borrow::<StringRef<V8IsolateManagerServer>>() {
-                    let s_len = ref_wrapper.value.as_bytes().len();
-                    let string_id = plc.obj_registry.add(mluau::Value::String(ref_wrapper.value.clone()))
-                        .map_err(|e| format!("Failed to add string to registry: {}", e))?;
-                    return Ok(ProxiedV8Value::SourceOwnedObject((ObjectRegistryType::String, string_id, Some(s_len))))
-                }
-
                 // Handle v8 objects
                 if let Ok(v8value) = ud.borrow::<V8Value>() {
-                    match v8value.typ {
-                        V8ObjectRegistryType::ArrayBuffer => return Ok(ProxiedV8Value::ArrayBuffer(v8value.id)),
-                        V8ObjectRegistryType::String => return Ok(ProxiedV8Value::StringRef((v8value.id, v8value.len.unwrap_or(0)))),
-                        V8ObjectRegistryType::Object => return Ok(ProxiedV8Value::Object(v8value.id)),
-                        V8ObjectRegistryType::Array => return Ok(ProxiedV8Value::Array(v8value.id)),
-                        V8ObjectRegistryType::Function => return Ok(ProxiedV8Value::Function(v8value.id)),
-                        V8ObjectRegistryType::Promise => return Ok(ProxiedV8Value::Promise(v8value.id)),
-                    };
+                    return Ok(ProxiedV8Value::V8OwnedObject((v8value.typ, v8value.id)));
                 }
 
                 let userdata_id = plc.obj_registry.add(mluau::Value::UserData(ud))
                     .map_err(|e| format!("Failed to add object to registry: {}", e))?;
-                Ok(ProxiedV8Value::SourceOwnedObject((ObjectRegistryType::UserData, userdata_id, None)))
+                Ok(ProxiedV8Value::SourceOwnedObject((ObjectRegistryType::UserData, userdata_id)))
             }
             mluau::Value::Error(e) => return Err(format!("Cannot proxy Lua error value: {}", e).into()),
             value => {
@@ -92,7 +76,7 @@ impl ProxiedV8Value {
                 let id = plc.obj_registry.add(value)
                     .map_err(|e| format!("Failed to add object to registry: {}", e))?; 
 
-                Ok(ProxiedV8Value::SourceOwnedObject((obj_type, id, None)))
+                Ok(ProxiedV8Value::SourceOwnedObject((obj_type, id)))
             }
         }
     }
@@ -101,44 +85,16 @@ impl ProxiedV8Value {
     pub(crate) fn proxy_to_src_lua(self, lua: &mluau::Lua, plc: &ProxyLuaClient, bridge: &V8IsolateManagerServer) -> Result<mluau::Value, mluau::Error> {
         match self {
             ProxiedV8Value::Primitive(p) => Ok(p.to_luau(lua).map_err(|e| mluau::Error::external(format!("Failed to convert ProxiedV8Primitive to Luau: {}", e)))?),
-            ProxiedV8Value::Vector((x,y,z)) => {
-                let vec = mluau::Vector::new(x, y, z);
-                Ok(mluau::Value::Vector(vec))
-            }
-            ProxiedV8Value::StringRef((string_id, len)) => {
-                let ud = V8Value::new_with_len(string_id, plc.clone(), bridge.clone(), V8ObjectRegistryType::String, len);
-                let ud = lua.create_userdata(ud)?;
-                Ok(mluau::Value::UserData(ud))
-            }
-            // v8 values (v8 values being proxied from v8 to lua)
-            ProxiedV8Value::ArrayBuffer(buf_id) => {
-                let ud = V8Value::new(buf_id, plc.clone(), bridge.clone(), V8ObjectRegistryType::ArrayBuffer);
-                let ud = lua.create_userdata(ud)?;
-                Ok(mluau::Value::UserData(ud))
-            }
-            ProxiedV8Value::Object(obj_id) => {
-                let ud = V8Value::new(obj_id, plc.clone(), bridge.clone(), V8ObjectRegistryType::Object);
-                let ud = lua.create_userdata(ud)?;
-                Ok(mluau::Value::UserData(ud))
-            }
-            ProxiedV8Value::Array(arr_id) => {
-                let ud = V8Value::new(arr_id, plc.clone(), bridge.clone(), V8ObjectRegistryType::Array);
-                let ud = lua.create_userdata(ud)?;
-                Ok(mluau::Value::UserData(ud))
-            }
-            ProxiedV8Value::Function(func_id) => {
-                let ud = V8Value::new(func_id, plc.clone(), bridge.clone(), V8ObjectRegistryType::Function);
-                let ud = lua.create_userdata(ud)?;
-                Ok(mluau::Value::UserData(ud))
-            }
-            ProxiedV8Value::Promise(promise_id) => {
-                let ud = V8Value::new(promise_id, plc.clone(), bridge.clone(), V8ObjectRegistryType::Promise);
+ 
+            // Target owned value
+            ProxiedV8Value::V8OwnedObject((typ, id)) => {
+                let ud = V8Value::new(id, plc.clone(), bridge.clone(), typ);
                 let ud = lua.create_userdata(ud)?;
                 Ok(mluau::Value::UserData(ud))
             }
 
             // Source-owned values (lua values being proxied back from v8 to lua)
-            ProxiedV8Value::SourceOwnedObject((_typ, id, _len)) => {
+            ProxiedV8Value::SourceOwnedObject((_typ, id)) => {
                 let value = plc.obj_registry.get(id)
                     .map_err(|e| mluau::Error::external(format!("Failed to get object from registry: {}", e)))?;
                 Ok(value)
@@ -152,7 +108,7 @@ impl ProxiedV8Value {
         common_state: &CommonState,
         obj: v8::Local<'s, v8::Object>,
     ) -> Result<Option<Self>, Error> {
-        let typ_key = v8::Local::new(scope, &common_state.bridge_vals.type_field);
+        let typ_key = v8::Local::new(scope, &common_state.bridge_vals.lua_type_symbol);
         let typ_val = obj.get(scope, typ_key.into());
         if let Some(typ_val) = typ_val {
             if typ_val.is_int32() {
@@ -161,7 +117,7 @@ impl ProxiedV8Value {
                     
                     // Look for luaid
                     let lua_id = {
-                        let p_obj_key = v8::Local::new(scope, &common_state.bridge_vals.id_field);
+                        let p_obj_key = v8::Local::new(scope, &common_state.bridge_vals.lua_id_symbol);
                         let p_obj_val = obj.get(scope, p_obj_key.into());
                         if let Some(p_obj_val) = p_obj_val {
                             if p_obj_val.is_big_int() {
@@ -179,22 +135,7 @@ impl ProxiedV8Value {
                         return Ok(None);
                     };
 
-                    // Look for optional length field
-                    let len = {
-                        let len_key = v8::Local::new(scope, &common_state.bridge_vals.length_field);
-                        let len_val = obj.get(scope, len_key.into());
-                        if let Some(len_val) = len_val {
-                            if len_val.is_int32() {
-                                Some(len_val.to_int32(scope).ok_or("Failed to convert length to int32")?.value() as usize)
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        }
-                    };
-
-                    return Ok(Some(Self::SourceOwnedObject((typ, LuauObjectRegistryID::from_i64(lua_id), len))))
+                    return Ok(Some(Self::SourceOwnedObject((typ, LuauObjectRegistryID::from_i64(lua_id)))))
                 }
             }
         }
@@ -212,38 +153,14 @@ impl ProxiedV8Value {
             return Ok(Self::Primitive(prim));
         }
 
-        if value.is_array() {
-            let arr = v8::Local::<v8::Array>::try_from(value).map_err(|_| "Failed to convert to array")?;
-            if arr.length() == 3 {
-                let x = arr.get_index(scope, 0).ok_or("Failed to get array index 0")?;
-                let y = arr.get_index(scope, 1).ok_or("Failed to get array index 1")?;
-                let z = arr.get_index(scope, 2).ok_or("Failed to get array index 2")?;
-                if x.is_number() && y.is_number() && z.is_number() {
-                    let x = x.to_number(scope).ok_or("Failed to convert x to number")?.value() as f32;
-                    let y = y.to_number(scope).ok_or("Failed to convert y to number")?.value() as f32;
-                    let z = z.to_number(scope).ok_or("Failed to convert z to number")?.value() as f32;
-                    return Ok(Self::Vector((x, y, z)));
-                }
-            }
-
-            let obj_id = common_state.proxy_client.obj_registry.add(scope, arr.into())
-                .map_err(|e| format!("Failed to register array: {}", e))?;
-            return Ok(Self::Array(obj_id));
+        let typ = if value.is_array() {
+            V8ObjectRegistryType::Array
         } else if value.is_array_buffer() {
-            let ab = v8::Local::<v8::ArrayBuffer>::try_from(value).map_err(|_| "Failed to convert to ArrayBuffer")?;
-            let ab_id = common_state.proxy_client.obj_registry.add(scope, ab.into())
-                .map_err(|e| format!("Failed to register ArrayBuffer: {}", e))?;
-            return Ok(Self::ArrayBuffer(ab_id));
+            V8ObjectRegistryType::ArrayBuffer
         } else if value.is_function() {
-            let func = v8::Local::<v8::Function>::try_from(value).map_err(|_| "Failed to convert to function")?;
-            let func_id = common_state.proxy_client.obj_registry.add(scope, func.into())
-                .map_err(|e| format!("Failed to register function: {}", e))?;
-            return Ok(Self::Function(func_id));
+            V8ObjectRegistryType::Function
         } else if value.is_promise() {
-            let promise = v8::Local::<v8::Promise>::try_from(value).map_err(|_| "Failed to convert to promise")?;
-            let promise_id = common_state.proxy_client.obj_registry.add(scope, promise.into())
-                .map_err(|e| format!("Failed to register promise: {}", e))?;
-            return Ok(Self::Promise(promise_id));
+            V8ObjectRegistryType::Promise
         } else if value.is_object() {
             let obj = value.to_object(scope).ok_or("Failed to convert to object")?;
 
@@ -252,27 +169,16 @@ impl ProxiedV8Value {
                 return Ok(v);
             }
 
-            // Handle string ref cases
-            {
-                let string_ref_field = v8::Local::new(scope, &common_state.bridge_vals.string_ref_field);
-                if let Some(s) = obj.get(scope, string_ref_field.into()) && !s.is_undefined() {
-                    if s.is_string() {
-                        let s = s.to_string(scope).ok_or("Failed to convert to string")?;
-                        let s_len = s.length();
-                        let sid = common_state.proxy_client.obj_registry.add(scope, s.into())
-                            .map_err(|e| format!("Failed to register string: {}", e))?;
-                        return Ok(Self::StringRef((sid, s_len)));
-                    } 
-                    return Err("string_ref field is not a string".into());
-                }
-            }
-
-            let obj_id = common_state.proxy_client.obj_registry.add(scope, obj.into())
-                .map_err(|e| format!("Failed to register object: {}", e))?;
-            return Ok(Self::Object(obj_id));
+            V8ObjectRegistryType::Object
         } else {
-            return Err("Unsupported V8 value type".into());
-        }
+            V8ObjectRegistryType::Object
+        };
+
+        // Handle source-owned objects
+        let obj_id = common_state.proxy_client.obj_registry.add(scope, value)
+            .map_err(|e| format!("Failed to register array: {}", e))?;
+
+        return Ok(Self::V8OwnedObject((typ, obj_id)));
     }
 
     /// Proxy a ProxiedV8Value to a V8 value
@@ -283,29 +189,14 @@ impl ProxiedV8Value {
     ) -> Result<v8::Local<'s, v8::Value>, Error> {
         match self {
             Self::Primitive(p) => Ok(p.to_v8(scope)?),
-            Self::Array(id) | 
-            Self::ArrayBuffer(id) | 
-            Self::Object(id) | 
-            Self::Function(id) |
-            Self::Promise(id) | 
-            Self::StringRef((id, _)) => {
+            Self::V8OwnedObject((_typ, id)) => {
                 let obj = common_state.proxy_client.obj_registry.get(scope, id, |_scope, x| Ok(x))
                     .map_err(|e| format!("Object ID not found in registry: {}", e))?;
                 Ok(obj.into())
             }
-            Self::Vector((x,y, z)) => {
-                let arr = v8::Array::new(scope, 3);
-                let x = v8::Number::new(scope, x as f64);
-                let y = v8::Number::new(scope, y as f64);
-                let z = v8::Number::new(scope, z as f64);
-                arr.set_index(scope, 0, x.into());
-                arr.set_index(scope, 1, y.into());
-                arr.set_index(scope, 2, z.into());
-                Ok(arr.into())
-            }
-            Self::SourceOwnedObject((typ, id, len)) => {
-                let oid_key = v8::Local::new(scope, &common_state.bridge_vals.id_field);
-                let otype_key = v8::Local::new(scope, &common_state.bridge_vals.type_field);
+            Self::SourceOwnedObject((typ, id)) => {
+                let oid_key = v8::Local::new(scope, &common_state.bridge_vals.lua_id_symbol);
+                let otype_key = v8::Local::new(scope, &common_state.bridge_vals.lua_type_symbol);
                 
                 let local_template = v8::Local::new(scope, (*common_state.obj_template).clone());
                 
@@ -315,29 +206,7 @@ impl ProxiedV8Value {
                 obj.set(scope, oid_key.into(), id_val.into());
                 let type_val = v8::Integer::new(scope, obj_registry_type_to_i32(typ));
                 obj.set(scope, otype_key.into(), type_val.into());
-
-                if let Some(len) = len {
-                    let len_key = v8::Local::new(scope, &common_state.bridge_vals.length_field);
-                    let len_val = v8::Integer::new(scope, len as i32);
-                    obj.set(scope, len_key.into(), len_val.into());
-                }
-                
-                let try_catch = &mut v8::TryCatch::new(scope);
-
-                let clfd = v8::Local::new(try_catch, &common_state.bridge_vals.create_lua_object_from_data);
-                let global = try_catch.get_current_context().global(try_catch);
-                let result = match clfd.call(try_catch, global.into(), &[obj.into()]) {
-                    Some(r) => r,
-                    None => {
-                        if try_catch.has_caught() {
-                            let exception = try_catch.exception().unwrap();
-                            let exception_string = exception.to_rust_string_lossy(try_catch);
-                            return Err(format!("Failed to run createLuaObjectFromData: {}", exception_string).into());
-                        }
-                        return Err("Failed to run createLuaObjectFromData".into())
-                    },
-                };
-                Ok(result)
+                Ok(obj.into())
             },
         }
     }

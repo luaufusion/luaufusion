@@ -400,13 +400,6 @@ impl<T: ProxyBridge> mluau::UserData for LangBridge<T> {
         fields.add_field("lang", T::name());
     }
     fn add_methods<M: mluau::UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_function("stringref", |_, value: mluau::String| {
-            Ok(StringRef { 
-                value,
-                _marker: std::marker::PhantomData::<T>
-            })
-        });
-
         methods.add_scheduler_async_method("run", async move |lua, this, modname: String| {
             let result = this.bridge.eval_from_source(modname).await
                 .map_err(|e| mluau::Error::external(format!("Failed to evaluate code in foreign language: {}", e)))?;
@@ -421,20 +414,6 @@ impl<T: ProxyBridge> mluau::UserData for LangBridge<T> {
 
         methods.add_method("isshutdown", |_, this, ()| {
             Ok(this.bridge.is_shutdown())
-        });
-    }
-}
-
-/// A luau value which is owned and should be sent as owned values (instead of references)
-pub struct StringRef<T: ProxyBridge> {
-    pub value: mluau::String,
-    _marker: std::marker::PhantomData<T>,
-}
-
-impl<T: ProxyBridge> mluau::UserData for StringRef<T> {
-    fn add_fields<F: mluau::UserDataFields<Self>>(fields: &mut F) {
-        fields.add_field_method_get("value", |_, this| {
-            Ok(this.value.clone())
         });
     }
 }

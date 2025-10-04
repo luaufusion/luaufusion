@@ -17,6 +17,7 @@ pub enum ProxiedV8Primitive {
     BigInt(i64),
     Number(f64),
     String(String),
+    Vector((f32, f32, f32)), 
 }
 
 impl ProxiedV8Primitive {
@@ -41,6 +42,9 @@ impl ProxiedV8Primitive {
                 }
                 Ok(Some(ProxiedV8Primitive::String(s.to_str().map_err(|e| format!("Failed to convert Lua string to Rust string: {}", e))?.to_string())))
             },
+            mluau::Value::Vector(v) => {
+                Ok(Some(ProxiedV8Primitive::Vector((v.x(), v.y(), v.z()))))
+            },
             mluau::Value::Other(r) => {
                 let s = format!("unknown({r:?})");
                 Ok(Some(ProxiedV8Primitive::String(s)))
@@ -57,6 +61,10 @@ impl ProxiedV8Primitive {
             ProxiedV8Primitive::Integer(i) => Ok(mluau::Value::Integer(*i as i64)),
             ProxiedV8Primitive::BigInt(i) => Ok(mluau::Value::Integer(*i)),
             ProxiedV8Primitive::Number(n) => Ok(mluau::Value::Number(*n)),
+            ProxiedV8Primitive::Vector((x, y, z)) => {
+                let vec = mluau::Vector::new(*x, *y, *z);
+                Ok(mluau::Value::Vector(vec))
+            },
             ProxiedV8Primitive::Undefined => Ok(mluau::Value::Nil), // Luau does not have undefined, so we map it to nil
             ProxiedV8Primitive::String(s) => {
                 let s = lua.create_string(s)
@@ -75,6 +83,16 @@ impl ProxiedV8Primitive {
             ProxiedV8Primitive::Integer(i) => Ok(v8::Integer::new(scope, *i).into()),
             ProxiedV8Primitive::BigInt(i) => Ok(v8::BigInt::new_from_i64(scope, *i).into()),
             ProxiedV8Primitive::Number(n) => Ok(v8::Number::new(scope, *n).into()),
+            ProxiedV8Primitive::Vector((x, y, z)) => {
+                let array = v8::Array::new(scope, 3);
+                let x = v8::Number::new(scope, *x as f64);
+                let y = v8::Number::new(scope, *y as f64);
+                let z = v8::Number::new(scope, *z as f64);
+                array.set_index(scope, 0, x.into());
+                array.set_index(scope, 1, y.into());
+                array.set_index(scope, 2, z.into());
+                Ok(array.into())
+            },
             ProxiedV8Primitive::String(s) => {
                 let mut try_catch = v8::TryCatch::new(scope);
                 let s = v8::String::new(try_catch.as_mut(), s);
@@ -137,6 +155,22 @@ impl ProxiedV8Primitive {
             }
             let string = s.to_rust_string_lossy(scope);
             return Ok(Some(Self::String(string)));
+        }
+
+        if value.is_array() {
+            let array = v8::Local::<v8::Array>::try_from(value)
+                .map_err(|_| "Failed to convert V8 value to Array")?;
+            if array.length() == 3 {
+                let x = array.get_index(scope, 0).ok_or("Failed to get index 0 of array")?;
+                let y = array.get_index(scope, 1).ok_or("Failed to get index 1 of array")?;
+                let z = array.get_index(scope, 2).ok_or("Failed to get index 2 of array")?;
+                if x.is_number() && y.is_number() && z.is_number() {
+                    let x = x.to_number(scope).unwrap().value() as f32;
+                    let y = y.to_number(scope).unwrap().value() as f32;
+                    let z = z.to_number(scope).unwrap().value() as f32;
+                    return Ok(Some(ProxiedV8Primitive::Vector((x, y, z))));
+                }
+            }
         }
 
         // Not a primitive

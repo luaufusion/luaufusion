@@ -34,24 +34,17 @@ pub const MIN_HEAP_LIMIT: usize = 10 * 1024 * 1024; // 10MB
 pub const MAX_FUNCTION_ARGS: u32 = 32;
 
 pub(crate) struct BridgeVals {
-    pub type_field: v8::Global<v8::String>,
-    pub id_field: v8::Global<v8::String>,
-    pub length_field: v8::Global<v8::String>,
-    pub create_lua_object_from_data: v8::Global<v8::Function>,
-    pub string_ref_field: v8::Global<v8::Symbol>,
-
     // obj registry fields (addV8Object, getV8Object and removeV8Object)
     pub obj_registry: V8ObjectRegistry,
+
+    pub lua_id_symbol: v8::Global<v8::Symbol>,
+    pub lua_type_symbol: v8::Global<v8::Symbol>,
 }
 
 impl BridgeVals {
     pub(crate) fn new<'s>(scope: &mut v8::HandleScope<'s>) -> Self {
-        let id_field = v8::String::new(scope, "luaid").unwrap();
-        let type_field = v8::String::new(scope, "luatype").unwrap();
-        let length_field = v8::String::new(scope, "length").unwrap();
-
         // The createLuaObjectFromData function is stored in globalThis.lua.createLuaObjectFromData
-        let (string_ref_field, create_lua_object_from_data, add_v8_object, get_v8_object, remove_v8_object) = {
+        let (add_v8_object, get_v8_object, remove_v8_object, luaid_symbol, luatype_symbol) = {
             // Get globalThis.lua
             let global = scope.get_current_context().global(scope);
             let lua_str = v8::String::new(scope, "lua").unwrap();
@@ -59,12 +52,6 @@ impl BridgeVals {
             //println!("lua_obj: {:?}", lua_obj.to_rust_string_lossy(scope));
             assert!(lua_obj.is_object());
             let lua_obj = lua_obj.to_object(scope).unwrap();
-
-            // get createLuaObjectFromData and __stringref
-            let clofd = v8::String::new(scope, "createLuaObjectFromData").unwrap();
-            let create_lua_object_from_data = lua_obj.get(scope, clofd.into()).unwrap();
-            assert!(create_lua_object_from_data.is_function());
-            let create_lua_object_from_data = v8::Local::<v8::Function>::try_from(create_lua_object_from_data).unwrap();
             
             // get addV8Object, getV8Object and removeV8Object from V8ObjectRegistry
             let add_v8_object = {
@@ -88,21 +75,25 @@ impl BridgeVals {
                 let removev8obj = v8::Local::<v8::Function>::try_from(removev8obj).unwrap();
                 removev8obj
             };
+            let (luaid_symbol, luatype_symbol) = {
+                let luaid_str = v8::String::new(scope, "luaidSymbol").unwrap();
+                let luaidobj = lua_obj.get(scope, luaid_str.into()).unwrap();
+                assert!(luaidobj.is_symbol());
+                let luaid_sym = v8::Local::<v8::Symbol>::try_from(luaidobj).unwrap();
 
-            // Get the stringref symbol
-            let srfk = v8::String::new(scope, "__stringref").unwrap();
-            let string_ref_field = lua_obj.get(scope, srfk.into()).unwrap();
-            assert!(string_ref_field.is_symbol());
-            let string_ref_field = v8::Local::<v8::Symbol>::try_from(string_ref_field).unwrap();
-            (string_ref_field, create_lua_object_from_data, add_v8_object, get_v8_object, remove_v8_object)
+                let luatype_str = v8::String::new(scope, "luatypeSymbol").unwrap();
+                let luatypeobj = lua_obj.get(scope, luatype_str.into()).unwrap();   
+                assert!(luatypeobj.is_symbol());
+                let luatype_sym = v8::Local::<v8::Symbol>::try_from(luatypeobj).unwrap();
+                (luaid_sym, luatype_sym)
+            };
+
+            (add_v8_object, get_v8_object, remove_v8_object, luaid_symbol, luatype_symbol)
         };
 
         Self {
-            id_field: v8::Global::new(scope, id_field),
-            type_field: v8::Global::new(scope, type_field),
-            length_field: v8::Global::new(scope, length_field),
-            string_ref_field: v8::Global::new(scope, string_ref_field),
-            create_lua_object_from_data: v8::Global::new(scope, create_lua_object_from_data),
+            lua_id_symbol: v8::Global::new(scope, luaid_symbol),
+            lua_type_symbol: v8::Global::new(scope, luatype_symbol),
             obj_registry: V8ObjectRegistry { 
                 add_v8_object: v8::Global::new(scope, add_v8_object),
                 get_v8_object: v8::Global::new(scope, get_v8_object), 

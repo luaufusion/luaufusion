@@ -15,29 +15,16 @@ pub struct V8Value {
     pub typ: V8ObjectRegistryType,
     pub plc: ProxyLuaClient,
     pub bridge: V8IsolateManagerServer,
-    pub len: Option<usize>,
 }
 
 impl V8Value {
     /// Create a new V8Value
-    pub fn new(id: V8ObjectRegistryID, plc: ProxyLuaClient, bridge: V8IsolateManagerServer, typ: V8ObjectRegistryType,) -> Self {
+    pub fn new(id: V8ObjectRegistryID, plc: ProxyLuaClient, bridge: V8IsolateManagerServer, typ: V8ObjectRegistryType) -> Self {
         Self {
             id,
             typ,
             plc,
             bridge,
-            len: None,
-        }
-    }
-
-    /// Create a new V8Value with a known fixed lengths (string refs)
-    pub fn new_with_len(id: V8ObjectRegistryID, plc: ProxyLuaClient, bridge: V8IsolateManagerServer, typ: V8ObjectRegistryType, len: usize) -> Self {
-        Self {
-            id,
-            typ,
-            plc,
-            bridge,
-            len: Some(len)
         }
     }
 
@@ -121,10 +108,6 @@ impl V8Value {
 
 impl mluau::UserData for V8Value {
     fn add_methods<M: mluau::UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_meta_method(mluau::MetaMethod::Len, |_, this, ()| {
-            Ok(this.len)
-        });
-
         methods.add_scheduler_async_method("requestdispose", async move |_, this, ()| {
             let id = this.id;
             this.op_call(id, V8ObjectOp::RequestDispose, mluau::MultiValue::with_capacity(0)).await
