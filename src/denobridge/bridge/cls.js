@@ -303,9 +303,9 @@ const v8objreg = new V8ObjectRegistry();
 const __stringref = Symbol("luaufusion.stringref");
 const createStringRef = (string) => {
     if(typeof string !== "string") throw new Error("Invalid string provided to createStringRef");
-    return {
-        __stringref: string
-    }
+    return Object.freeze({
+        [__stringref]: string
+    })
 }
 
 globalThis.lua = {

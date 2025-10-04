@@ -76,6 +76,15 @@ export async function foo(luafunc) {
     return 123 + (await luafunc.callAsync());
 }
 
+export async function stringreftest() {
+    return globalThis.lua.createStringRef("Hello from V8");
+}
+
+export function derefStringRef(ref) {
+    console.log("Derefing string ref", ref);
+    return ref
+}
+
 export function bar(x) {
     return x * 2;
 }
@@ -150,6 +159,13 @@ local fooprop = result:getproperty("foo")
 local res = fooprop:call(myfooer)
 print("foo prop:", fooprop, res)
 assert(res == 123 + 42, "Invalid result from foo prop call")
+
+local stringref = result:getproperty("stringreftest"):call()
+print("String ref from V8:", stringref, stringref:typename())
+assert(stringref:typename() == "V8String", "Invalid type for stringref")
+local derefed = result:getproperty("derefStringRef"):call(stringref)
+print("Derefed string ref from V8:", derefed, typeof(derefed))
+assert(derefed == "Hello from V8", "Invalid derefed string ref")
 
 -- Test calling multiple times to ensure caching works
 local result2 = v8:run("foo.js")

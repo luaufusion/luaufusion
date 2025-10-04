@@ -1,10 +1,10 @@
 use serde::{Deserialize, Serialize};
-use crate::base::Error;
+use crate::denobridge::bridge::V8ObjectRegistryType;
+use crate::{base::Error, denobridge::luauobjs::V8Value};
 use crate::denobridge::objreg::V8ObjectRegistryID;
 use crate::luau::objreg::LuauObjectRegistryID;
 use super::primitives::ProxiedV8Primitive;
 use super::V8IsolateManagerServer;
-use super::luauobjs::{V8Array, V8ArrayBuffer, V8Function, V8ObjectObj, V8Promise, V8String};
 use crate::luau::bridge::{
     ObjectRegistryType, ProxyLuaClient, StringRef, i32_to_obj_registry_type, luau_value_to_obj_registry_type, obj_registry_type_to_i32
 };
@@ -58,11 +58,24 @@ impl ProxiedV8Value {
             ), // is a primitive 
             mluau::Value::Vector(v) => Ok(ProxiedV8Value::Vector((v.x(), v.y(), v.z()))),
             mluau::Value::UserData(ud) => {
+                // Handle string refs
                 if let Ok(ref_wrapper) = ud.borrow::<StringRef<V8IsolateManagerServer>>() {
                     let s_len = ref_wrapper.value.as_bytes().len();
                     let string_id = plc.obj_registry.add(mluau::Value::String(ref_wrapper.value.clone()))
                         .map_err(|e| format!("Failed to add string to registry: {}", e))?;
                     return Ok(ProxiedV8Value::SourceOwnedObject((ObjectRegistryType::String, string_id, Some(s_len))))
+                }
+
+                // Handle v8 objects
+                if let Ok(v8value) = ud.borrow::<V8Value>() {
+                    match v8value.typ {
+                        V8ObjectRegistryType::ArrayBuffer => return Ok(ProxiedV8Value::ArrayBuffer(v8value.id)),
+                        V8ObjectRegistryType::String => return Ok(ProxiedV8Value::StringRef((v8value.id, v8value.len.unwrap_or(0)))),
+                        V8ObjectRegistryType::Object => return Ok(ProxiedV8Value::Object(v8value.id)),
+                        V8ObjectRegistryType::Array => return Ok(ProxiedV8Value::Array(v8value.id)),
+                        V8ObjectRegistryType::Function => return Ok(ProxiedV8Value::Function(v8value.id)),
+                        V8ObjectRegistryType::Promise => return Ok(ProxiedV8Value::Promise(v8value.id)),
+                    };
                 }
 
                 let userdata_id = plc.obj_registry.add(mluau::Value::UserData(ud))
@@ -92,35 +105,34 @@ impl ProxiedV8Value {
                 let vec = mluau::Vector::new(x, y, z);
                 Ok(mluau::Value::Vector(vec))
             }
-
-            // v8 values (v8 values being proxied from v8 to lua)
-            ProxiedV8Value::ArrayBuffer(buf_id) => {
-                let ud = V8ArrayBuffer::new(buf_id, plc.clone(), bridge.clone());
+            ProxiedV8Value::StringRef((string_id, len)) => {
+                let ud = V8Value::new_with_len(string_id, plc.clone(), bridge.clone(), V8ObjectRegistryType::String, len);
                 let ud = lua.create_userdata(ud)?;
                 Ok(mluau::Value::UserData(ud))
             }
-            ProxiedV8Value::StringRef((string_id, len)) => {
-                let ud = V8String::new_with_len(string_id, plc.clone(), bridge.clone(), len);
+            // v8 values (v8 values being proxied from v8 to lua)
+            ProxiedV8Value::ArrayBuffer(buf_id) => {
+                let ud = V8Value::new(buf_id, plc.clone(), bridge.clone(), V8ObjectRegistryType::ArrayBuffer);
                 let ud = lua.create_userdata(ud)?;
                 Ok(mluau::Value::UserData(ud))
             }
             ProxiedV8Value::Object(obj_id) => {
-                let ud = V8ObjectObj::new(obj_id, plc.clone(), bridge.clone());
+                let ud = V8Value::new(obj_id, plc.clone(), bridge.clone(), V8ObjectRegistryType::Object);
                 let ud = lua.create_userdata(ud)?;
                 Ok(mluau::Value::UserData(ud))
             }
             ProxiedV8Value::Array(arr_id) => {
-                let ud = V8Array::new(arr_id, plc.clone(), bridge.clone());
+                let ud = V8Value::new(arr_id, plc.clone(), bridge.clone(), V8ObjectRegistryType::Array);
                 let ud = lua.create_userdata(ud)?;
                 Ok(mluau::Value::UserData(ud))
             }
             ProxiedV8Value::Function(func_id) => {
-                let ud = V8Function::new(func_id, plc.clone(), bridge.clone());
+                let ud = V8Value::new(func_id, plc.clone(), bridge.clone(), V8ObjectRegistryType::Function);
                 let ud = lua.create_userdata(ud)?;
                 Ok(mluau::Value::UserData(ud))
             }
             ProxiedV8Value::Promise(promise_id) => {
-                let ud = V8Promise::new(promise_id, plc.clone(), bridge.clone());
+                let ud = V8Value::new(promise_id, plc.clone(), bridge.clone(), V8ObjectRegistryType::Promise);
                 let ud = lua.create_userdata(ud)?;
                 Ok(mluau::Value::UserData(ud))
             }
