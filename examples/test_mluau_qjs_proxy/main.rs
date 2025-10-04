@@ -128,6 +128,11 @@ console.log("Time now is: " + timeNow);
 await new Promise(resolve => setTimeout(resolve, 0));
 console.log("Awake now again! Time now is: " + Date.now() + ", timeNow -  Date.now()", Date.now() - timeNow);
 //console.log(WebAssembly);
+
+export function keysGetter(obj) {
+    console.log("In keysGetter", obj);
+    return Object.keys(obj).join(", ");
+}
 "#.to_string()),
         ]);
 
@@ -180,6 +185,9 @@ local result3 = v8:run("bar.js")
 print("Result3 from V8:", result3)
 local result4 = v8:run("bar.js")
 print("Result4 from V8:", result4)
+
+local keysGetter = result4:getproperty("keysGetter")
+print("keys getter", keysGetter:call(result4))
 "#;
 
         let func = lua.load(lua_code)
