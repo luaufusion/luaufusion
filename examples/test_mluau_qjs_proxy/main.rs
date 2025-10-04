@@ -196,6 +196,7 @@ print("keys getter", keysGetter:call(result4))
         let th = lua.create_thread(func).expect("Failed to create Lua thread");
         
         let mut args = mluau::MultiValue::new();
+        let bridgy = bridge.bridge().clone();
         args.push_back(bridge.into_lua(&lua).expect("Failed to push QuickJS runtime to Lua"));
 
         let output = task_mgr
@@ -206,5 +207,8 @@ print("keys getter", keysGetter:call(result4))
             .expect("Lua thread returned an error");
         
         println!("Output: {:?}", output);
+
+        bridgy.shutdown().await.expect("Failed to shutdown bridge");
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await; // Wait a bit for the child process to exit
     });
 }

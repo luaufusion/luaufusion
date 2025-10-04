@@ -40,4 +40,7 @@ pub trait ProxyBridge: Clone + 'static {
 
     /// Shuts down the bridge and its resources
     async fn shutdown(&self) -> Result<(), Error>;
+
+    /// Returns true if the bridge has been shutdown
+    fn is_shutdown(&self) -> bool;
 }

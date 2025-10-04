@@ -438,6 +438,7 @@ impl ConcurrentlyExecute for V8IsolateManagerClient {
                     }
                 }
                 _ = inner.cancellation_token.cancelled() => {
+                    println!("V8 isolate manager received shutdown message");
                     break;
                 }
                 _ = inner.deno.run_event_loop(PollEventLoopOptions {
@@ -514,13 +515,6 @@ impl ConcurrentlyExecute for V8IsolateManagerClient {
 pub struct V8IsolateManagerServerInner {
     executor: Arc<ConcurrentExecutor<V8IsolateManagerClient>>,
     messenger: Arc<MultiSender<V8IsolateManagerMessage>>,
-}
-
-impl Drop for V8IsolateManagerServerInner {
-    fn drop(&mut self) {
-        let _ = self.messenger.server(self.executor.server_context()).send(V8IsolateManagerMessage::Shutdown);
-        let _ = self.executor.shutdown();
-    }
 }
 
 #[derive(Clone)]
@@ -623,7 +617,14 @@ impl ProxyBridge for V8IsolateManagerServer {
     }
 
     async fn shutdown(&self) -> Result<(), crate::base::Error> {
-        self.send(ShutdownMessage).await
+        let _ = self.send(ShutdownMessage).await;
+        self.executor.shutdown().await?;
+        self.executor.wait().await?;
+        Ok(())
+    }
+
+    fn is_shutdown(&self) -> bool {
+        self.executor.get_state().cancel_token.is_cancelled()
     }
 }
 

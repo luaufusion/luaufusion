@@ -254,7 +254,7 @@ dependencies = [
 [[package]]
 name = "concurrentlyexec"
 version = "0.1.0"
-source = "git+https://github.com/mluau-quickjs-proxy/concurrentlyexecute#85f52fca677ed2c28d7f6654b1e7b227a20e89c0"
+source = "git+https://github.com/mluau-quickjs-proxy/concurrentlyexecute#b345cf3d15e3b4ccf85ba04965d5392e06f1a1d7"
 dependencies = [
  "bincode 2.0.1",
  "futures-util",

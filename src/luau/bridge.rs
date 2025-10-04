@@ -367,6 +367,10 @@ impl<T: ProxyBridge> LangBridge<T> {
         Self { bridge, plc }
     }
 
+    pub fn bridge(&self) -> &T {
+        &self.bridge
+    }
+
     pub async fn new_from_bridge(
         lua: &mluau::Lua,
         heap_limit: usize,
@@ -404,17 +408,19 @@ impl<T: ProxyBridge> mluau::UserData for LangBridge<T> {
         });
 
         methods.add_scheduler_async_method("run", async move |lua, this, modname: String| {
-            /*let mut args_converted = Vec::with_capacity(args.len());
-            for arg in args {
-                match this.bridge.from_source_lua_value(&lua, &this.plc, arg) {
-                    Ok(v) => args_converted.push(v),
-                    Err(e) => return Err(mluau::Error::external(format!("Failed to convert argument to foreign language value: {}", e))),
-                }
-            }*/
             let result = this.bridge.eval_from_source(modname).await
                 .map_err(|e| mluau::Error::external(format!("Failed to evaluate code in foreign language: {}", e)))?;
             this.bridge.to_source_lua_value(&lua, result, &this.plc)
                 .map_err(|e| mluau::Error::external(format!("Failed to convert return value to Lua value: {}", e)))
+        });
+
+        methods.add_scheduler_async_method("shutdown", async move |_, this, ()| {
+            this.bridge.shutdown().await
+                .map_err(|e| mluau::Error::external(format!("Failed to shutdown foreign language bridge: {}", e)))
+        });
+
+        methods.add_method("isshutdown", |_, this, ()| {
+            Ok(this.bridge.is_shutdown())
         });
     }
 }
