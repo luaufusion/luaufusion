@@ -167,6 +167,12 @@ local derefed = result:getproperty("derefStringRef"):call(stringref)
 print("Derefed string ref from V8:", derefed, typeof(derefed))
 assert(derefed == "Hello from V8", "Invalid derefed string ref")
 
+local ok, err = pcall(function() 
+    stringref:call() 
+end)
+print("Expected error calling stringref as function:", err, ok)
+assert(not ok, "Expected error calling stringref as function")
+
 -- Test calling multiple times to ensure caching works
 local result2 = v8:run("foo.js")
 print("Result2 from V8:", result2)
