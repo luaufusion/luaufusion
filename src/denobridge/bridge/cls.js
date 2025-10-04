@@ -1,6 +1,10 @@
 import { __luabind, __luarun, __luaret } from "ext:core/ops";
 import { V8ObjectRegistry } from "./objreg.js";
 
+// Constants for objreg and stringref
+const v8objreg = new V8ObjectRegistry();
+const __stringref = Symbol("luaufusion.stringref");
+
 // Enum for opcalls
 const opCalls = {
     FunctionCallSync: 1,
@@ -249,9 +253,6 @@ const createLuaObjectFromData = (data) => {
     }
 }
 
-const v8objreg = new V8ObjectRegistry();
-
-const __stringref = Symbol("luaufusion.stringref");
 const createStringRef = (string) => {
     if(typeof string !== "string") throw new Error("Invalid string provided to createStringRef");
     return Object.freeze({
