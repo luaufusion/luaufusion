@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use crate::denobridge::bridge::V8ObjectRegistryType;
+use crate::denobridge::psuedoprimitive::ProxiedV8PsuedoPrimitive;
 use crate::{base::Error, denobridge::luauobjs::V8Value};
 use crate::denobridge::objreg::V8ObjectRegistryID;
 use crate::luau::objreg::LuauObjectRegistryID;
@@ -14,21 +15,41 @@ use deno_core::v8;
 /// A V8 value that can now be easily proxied to Luau
 #[derive(Serialize, Deserialize)]
 pub enum ProxiedV8Value {
-    // Primitive values
+    /// Primitive values
     Primitive(ProxiedV8Primitive),
 
-    // v8-owned stuff
+    /// Psuedoprimitive values
+    Psuedoprimitive(ProxiedV8PsuedoPrimitive),
+
+    /// v8-owned stuff
     V8OwnedObject((V8ObjectRegistryType, V8ObjectRegistryID)), // (Type, ID) of the v8-owned object
 
-    // Source-owned stuff
+    /// Source-owned stuff
     SourceOwnedObject((ObjectRegistryType, LuauObjectRegistryID)), // (Type, ID) of the source-owned object
 }
 
 impl ProxiedV8Value {
+    /// Returns the number of bytes used by this proxied value
+    /// 
+    /// Note that only large objects (primitive string and psuedoprimitive stringbyte)
+    /// are counted here, as other types are always small
+    pub fn effective_size(&self) -> usize {
+        match self {
+            Self::Primitive(p) => p.effective_size(),
+            Self::Psuedoprimitive(p) => p.effective_size(),
+            Self::V8OwnedObject(_) => 0, // Just a reference
+            Self::SourceOwnedObject(_) => 0, // Just a reference
+        }
+    }
+
     /// Proxies a Luau value to a ProxiedV8Value
-    pub(crate) fn proxy_from_src_lua(plc: &ProxyLuaClient, value: mluau::Value) -> Result<Self, Error> {
-        if let Some(prim) = ProxiedV8Primitive::luau_to_primitive(&value)? {
+    pub(crate) fn from_luau(plc: &ProxyLuaClient, value: mluau::Value) -> Result<Self, Error> {
+        if let Some(prim) = ProxiedV8Primitive::from_luau(&value)? {
             return Ok(ProxiedV8Value::Primitive(prim));
+        }
+
+        if let Some(psuedo) = ProxiedV8PsuedoPrimitive::from_luau(&value)? {
+            return Ok(ProxiedV8Value::Psuedoprimitive(psuedo));
         }
         
         match value {
@@ -48,13 +69,13 @@ impl ProxiedV8Value {
                 "Number should have been handled as a primitive"
             ), // is a primitive
             mluau::Value::String(_s) => unreachable!(
-                "String should have been handled as a primitive"
+                "String should have been handled as a primitive/psuedoprimitive"
             ), // is a primitive
             mluau::Value::Other(r) => unreachable!(
                 "Other({r:?}) should have been handled as a primitive"
             ), // is a primitive 
             mluau::Value::Vector(v) => unreachable!(
-                "Vector({v:?}) should have been handled as a primitive"
+                "Vector({v:?}) should have been handled as a psuedoprimitive"
             ),
             mluau::Value::UserData(ud) => {
                 // Handle v8 objects
@@ -82,10 +103,10 @@ impl ProxiedV8Value {
     }
 
     /// Proxy a ProxiedV8Value to a Luau value
-    pub(crate) fn proxy_to_src_lua(self, lua: &mluau::Lua, plc: &ProxyLuaClient, bridge: &V8IsolateManagerServer) -> Result<mluau::Value, mluau::Error> {
+    pub(crate) fn to_luau(self, lua: &mluau::Lua, plc: &ProxyLuaClient, bridge: &V8IsolateManagerServer) -> Result<mluau::Value, mluau::Error> {
         match self {
             ProxiedV8Value::Primitive(p) => Ok(p.to_luau(lua).map_err(|e| mluau::Error::external(format!("Failed to convert ProxiedV8Primitive to Luau: {}", e)))?),
- 
+            ProxiedV8Value::Psuedoprimitive(p) => Ok(p.to_luau(lua).map_err(|e| mluau::Error::external(format!("Failed to convert ProxiedV8PsuedoPrimitive to Luau: {}", e)))?),
             // Target owned value
             ProxiedV8Value::V8OwnedObject((typ, id)) => {
                 let ud = V8Value::new(id, plc.clone(), bridge.clone(), typ);
@@ -144,13 +165,17 @@ impl ProxiedV8Value {
     }
 
     /// Given a v8 value, convert it to a ProxiedV8Value
-    pub(super) fn proxy_from_v8<'s>(
+    pub(super) fn from_v8<'s>(
         scope: &mut v8::HandleScope<'s>, 
         value: v8::Local<'s, v8::Value>,
         common_state: &CommonState,
     ) -> Result<Self, Error> {
-        if let Some(prim) = ProxiedV8Primitive::v8_to_primitive(scope, value)? {
+        if let Some(prim) = ProxiedV8Primitive::from_v8(scope, value)? {
             return Ok(Self::Primitive(prim));
+        }
+
+        if let Some(psuedo) = ProxiedV8PsuedoPrimitive::from_v8(scope, value)? {
+            return Ok(Self::Psuedoprimitive(psuedo));
         }
 
         let typ = if value.is_array() {
@@ -182,13 +207,14 @@ impl ProxiedV8Value {
     }
 
     /// Proxy a ProxiedV8Value to a V8 value
-    pub(super) fn proxy_to_v8<'s>(
+    pub(super) fn to_v8<'s>(
         self,
         scope: &mut v8::HandleScope<'s>, 
         common_state: &CommonState,
     ) -> Result<v8::Local<'s, v8::Value>, Error> {
         match self {
             Self::Primitive(p) => Ok(p.to_v8(scope)?),
+            Self::Psuedoprimitive(p) => Ok(p.to_v8(scope)?),
             Self::V8OwnedObject((_typ, id)) => {
                 let obj = common_state.proxy_client.obj_registry.get(scope, id, |_scope, x| Ok(x))
                     .map_err(|e| format!("Object ID not found in registry: {}", e))?;

@@ -1072,6 +1072,7 @@ dependencies = [
  "mlua_scheduler",
  "mluau",
  "serde",
+ "serde_bytes",
  "serde_json",
  "thiserror",
  "tokio",

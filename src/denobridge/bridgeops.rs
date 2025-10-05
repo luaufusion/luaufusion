@@ -4,7 +4,6 @@ use std::rc::Rc;
 use deno_core::{op2, v8, OpState};
 
 use crate::denobridge::bridge::{MAX_FUNCTION_ARGS, MAX_OWNED_V8_STRING_SIZE};
-use crate::denobridge::primitives::ProxiedV8Primitive;
 use crate::luau::bridge::LuauObjectOp;
 use crate::luau::objreg::LuauObjectRegistryID;
 use super::value::ProxiedV8Value;
@@ -25,17 +24,15 @@ pub(super) fn __luabind(
     let mut num_string_chars = 0;
     for i in 0..args.length() {
         let arg = args.get_index(scope, i).ok_or_else(|| deno_error::JsErrorBox::generic(format!("Failed to get argument {}", i)))?;
-        match ProxiedV8Value::proxy_from_v8(scope, arg, &state) {
+        match ProxiedV8Value::from_v8(scope, arg, &state) {
             Ok(v) => {
-                match v {
-                    ProxiedV8Value::Primitive(ProxiedV8Primitive::String(ref s)) => {
-                        num_string_chars += s.len();
-                        if num_string_chars > MAX_OWNED_V8_STRING_SIZE {
-                            return Err(deno_error::JsErrorBox::generic(format!("Too many string characters passed to op bind"))); 
-                        }
-                    },
-                    _ => {}
-                };  
+                let sz = v.effective_size();
+                if sz > 0 {
+                    num_string_chars += sz;
+                    if num_string_chars > MAX_OWNED_V8_STRING_SIZE {
+                        return Err(deno_error::JsErrorBox::generic(format!("Too many string characters passed to op bind"))); 
+                    }
+                }
                 args_proxied.push(v);
             },
             Err(e) => {
@@ -122,7 +119,7 @@ pub(super) fn __luaret<'s>(
             // Proxy every return value to V8
             let mut results = vec![];
             for ret in resp {
-                match ret.proxy_to_v8(scope, state) {
+                match ret.to_v8(scope, state) {
                     Ok(v8_ret) => results.push(v8_ret),
                     Err(e) => {
                         return Err(deno_error::JsErrorBox::generic(format!("Failed to convert return value: {}", e)));

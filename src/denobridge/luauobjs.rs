@@ -41,7 +41,7 @@ impl V8Value {
 
     /// Do a op call with a single primitive argument (optimized)
     async fn op_call_primitive(&self, lua: &mluau::Lua, obj_id: V8ObjectRegistryID, op: V8ObjectOp, args: mluau::Value) -> Result<mluau::MultiValue, Error> {
-        let arg = ProxiedV8Primitive::luau_to_primitive(&args)
+        let arg = ProxiedV8Primitive::from_luau(&args)
         .map_err(|e| format!("Failed to proxy argument to ProxiedV8Value: {}", e))?
         .ok_or(format!("Argument is not a primitive value"))?;
         
@@ -54,7 +54,7 @@ impl V8Value {
             Ok(v) => {
                 let mut proxied = mluau::MultiValue::with_capacity(v.len());
                 for ret in v {
-                    let ret = ret.proxy_to_src_lua(&lua, &self.plc, &self.bridge)
+                    let ret = ret.to_luau(&lua, &self.plc, &self.bridge)
                     .map_err(|e| format!("Failed to convert return value to Lua: {}", e))?;
                     proxied.push_back(ret);
                 }
@@ -73,10 +73,11 @@ impl V8Value {
         let mut string_char_count = 0;
         let mut args_proxied = Vec::with_capacity(args.len());
         for arg in args {
-            let proxied = ProxiedV8Value::proxy_from_src_lua(&self.plc, arg)
+            let proxied = ProxiedV8Value::from_luau(&self.plc, arg)
             .map_err(|e| format!("Failed to proxy argument to ProxiedV8Value: {}", e))?;
-            if let ProxiedV8Value::Primitive(ProxiedV8Primitive::String(ref s)) = proxied {
-                string_char_count += s.len();
+            let sz = proxied.effective_size();
+            if sz > 0 {
+                string_char_count += sz;
                 if string_char_count > super::bridge::MAX_OWNED_V8_STRING_SIZE {
                     return Err(format!("Too many string characters passed to V8Object op call (max {})", super::bridge::MAX_OWNED_V8_STRING_SIZE).into());
                 }
@@ -95,7 +96,7 @@ impl V8Value {
                     return Err("Lua instance has been dropped".into());
                 };
                 for ret in v {
-                    let ret = ret.proxy_to_src_lua(&lua, &self.plc, &self.bridge)
+                    let ret = ret.to_luau(&lua, &self.plc, &self.bridge)
                     .map_err(|e| format!("Failed to convert return value to Lua: {}", e))?;
                     proxied.push_back(ret);
                 }

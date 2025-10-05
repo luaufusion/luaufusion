@@ -250,7 +250,7 @@ impl V8ObjectOp {
 
                 let mut v8_args = Vec::with_capacity(args.len());
                 for arg in args {
-                    let v8_arg = match arg.proxy_to_v8(&mut context_scope, &inner.common_state) {
+                    let v8_arg = match arg.to_v8(&mut context_scope, &inner.common_state) {
                         Ok(v) => v,
                         Err(e) => return Err(format!("Failed to convert argument to V8: {}", e).into()),
                     };
@@ -295,7 +295,7 @@ impl V8ObjectOp {
                 let prop_names = obj.get(&mut context_scope, key)
                     .ok_or("Failed to get property names")?;
                 
-                let prop_names = ProxiedV8Value::proxy_from_v8(&mut context_scope, prop_names.into(), &inner.common_state)
+                let prop_names = ProxiedV8Value::from_v8(&mut context_scope, prop_names.into(), &inner.common_state)
                     .map_err(|e| format!("Failed to proxy property names: {}", e))?;
 
                 Ok(OpCallRet::ProxiedMulti(vec![prop_names]))
@@ -359,7 +359,7 @@ impl ConcurrentlyExecute for V8IsolateManagerClient {
                                     let main_ctx = v8::Local::new(&mut scope, main_ctx);
                                     let context_scope = &mut v8::ContextScope::new(&mut scope, main_ctx);
                                     let namespace_obj = v8::Local::new(context_scope, namespace_obj);
-                                    match ProxiedV8Value::proxy_from_v8(context_scope, namespace_obj.into(), &inner.common_state) {
+                                    match ProxiedV8Value::from_v8(context_scope, namespace_obj.into(), &inner.common_state) {
                                         Ok(v) => v,
                                         Err(e) => {
                                             let _ = resp.client(&client_ctx).send(Err(format!("Failed to proxy module namespace: {}", e).into()));
@@ -447,7 +447,7 @@ impl ConcurrentlyExecute for V8IsolateManagerClient {
                             let main_ctx = v8::Local::new(&mut scope, main_ctx);
                             let mut context_scope = &mut v8::ContextScope::new(&mut scope, main_ctx);
                             let res = v8::Local::new(&mut context_scope, res);
-                            let res = ProxiedV8Value::proxy_from_v8(context_scope, res, &inner.common_state);
+                            let res = ProxiedV8Value::from_v8(context_scope, res, &inner.common_state);
                             match res {
                                 Ok(v) => {
                                     let _ = resp.client(&client_ctx).send(Ok(vec![v]));
@@ -487,7 +487,7 @@ impl ConcurrentlyExecute for V8IsolateManagerClient {
                             let props = namespace_obj.get_own_property_names(context_scope, GetPropertyNamesArgs::default()).unwrap();
                             println!("Got namespace object: {:?}", props.to_rust_string_lossy(context_scope));
                         }
-                        match ProxiedV8Value::proxy_from_v8(context_scope, namespace_obj.into(), &inner.common_state) {
+                        match ProxiedV8Value::from_v8(context_scope, namespace_obj.into(), &inner.common_state) {
                             Ok(v) => v,
                             Err(e) => {
                                 let _ = resp.client(&client_ctx).send(Err(format!("Failed to proxy module namespace: {}", e).into()));
@@ -596,11 +596,11 @@ impl ProxyBridge for V8IsolateManagerServer {
     }
 
     fn to_source_lua_value(&self, lua: &mluau::Lua, value: Self::ValueType, plc: &ProxyLuaClient) -> Result<mluau::Value, Error> {
-        Ok(value.proxy_to_src_lua(lua, plc, self).map_err(|e| e.to_string())?)
+        Ok(value.to_luau(lua, plc, self).map_err(|e| e.to_string())?)
     }
 
     fn from_source_lua_value(&self, _lua: &mluau::Lua, plc: &ProxyLuaClient, value: mluau::Value) -> Result<Self::ValueType, crate::base::Error> {
-        Ok(ProxiedV8Value::proxy_from_src_lua(plc, value).map_err(|e| e.to_string())?)
+        Ok(ProxiedV8Value::from_luau(plc, value).map_err(|e| e.to_string())?)
     }
 
     async fn eval_from_source(&self, modname: String) -> Result<Self::ValueType, crate::base::Error> {

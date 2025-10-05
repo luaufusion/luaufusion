@@ -3,6 +3,7 @@
 pub mod bridge; // bridge client/server
 pub mod objreg; // object registry for v8 non-primitive objects
 pub mod primitives; // primitive types that can be proxied
+pub mod psuedoprimitive; // psuedoprimitive types that are not fully primitive (not immutable in both v8 and luau) but are copied between v8 and luau
 pub mod value; // proxied values
 pub mod modloader; // module loader for luaufusion based on deno staticmoduleloader for vfs support
 pub mod luauobjs; // luau objects that proxy to v8

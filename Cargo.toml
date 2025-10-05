@@ -21,6 +21,7 @@ deno_console = { version = "0.214", optional = true }
 deno_permissions = { version = "0.76", optional = true }
 thiserror = { version = "2", optional = true }
 base64-simd = { version = "0.8", optional = true }
+serde_bytes = "0.11.19"
 
 
 [features]
