@@ -48,7 +48,7 @@ impl ProxiedV8Value {
             return Ok(ProxiedV8Value::Primitive(prim));
         }
 
-        if let Some(psuedo) = ProxiedV8PsuedoPrimitive::from_luau(&value)? {
+        if let Some(psuedo) = ProxiedV8PsuedoPrimitive::from_luau(plc, &value)? {
             return Ok(ProxiedV8Value::Psuedoprimitive(psuedo));
         }
         
@@ -106,7 +106,7 @@ impl ProxiedV8Value {
     pub(crate) fn to_luau(self, lua: &mluau::Lua, plc: &ProxyLuaClient, bridge: &V8IsolateManagerServer) -> Result<mluau::Value, mluau::Error> {
         match self {
             ProxiedV8Value::Primitive(p) => Ok(p.to_luau(lua).map_err(|e| mluau::Error::external(format!("Failed to convert ProxiedV8Primitive to Luau: {}", e)))?),
-            ProxiedV8Value::Psuedoprimitive(p) => Ok(p.to_luau(lua).map_err(|e| mluau::Error::external(format!("Failed to convert ProxiedV8PsuedoPrimitive to Luau: {}", e)))?),
+            ProxiedV8Value::Psuedoprimitive(p) => Ok(p.to_luau(lua, plc, bridge).map_err(|e| mluau::Error::external(format!("Failed to convert ProxiedV8PsuedoPrimitive to Luau: {}", e)))?),
             // Target owned value
             ProxiedV8Value::V8OwnedObject((typ, id)) => {
                 let ud = V8Value::new(id, plc.clone(), bridge.clone(), typ);
@@ -174,7 +174,7 @@ impl ProxiedV8Value {
             return Ok(Self::Primitive(prim));
         }
 
-        if let Some(psuedo) = ProxiedV8PsuedoPrimitive::from_v8(scope, value)? {
+        if let Some(psuedo) = ProxiedV8PsuedoPrimitive::from_v8(scope, value, common_state)? {
             return Ok(Self::Psuedoprimitive(psuedo));
         }
 
@@ -214,7 +214,7 @@ impl ProxiedV8Value {
     ) -> Result<v8::Local<'s, v8::Value>, Error> {
         match self {
             Self::Primitive(p) => Ok(p.to_v8(scope)?),
-            Self::Psuedoprimitive(p) => Ok(p.to_v8(scope)?),
+            Self::Psuedoprimitive(p) => Ok(p.to_v8(scope, common_state)?),
             Self::V8OwnedObject((_typ, id)) => {
                 let obj = common_state.proxy_client.obj_registry.get(scope, id, |_scope, x| Ok(x))
                     .map_err(|e| format!("Object ID not found in registry: {}", e))?;

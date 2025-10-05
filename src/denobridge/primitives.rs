@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use crate::{base::Error, denobridge::bridge::MAX_OWNED_V8_STRING_SIZE};
 use deno_core::v8;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, PartialEq, Eq, Hash, Clone, Debug)]
 /// A primitive value that is primitive across v8 and luau (immutable and can be cloned between luau and v8)
 /// 
 /// Note that primitives do not have to be cheap to clone (for example, strings are primitives but can be
@@ -16,7 +16,6 @@ pub enum ProxiedV8Primitive {
     Boolean(bool),
     Integer(i32),
     BigInt(i64),
-    Number(f64),
     String(String),
 }
 
@@ -44,8 +43,6 @@ impl ProxiedV8Primitive {
                     Ok(Some(ProxiedV8Primitive::BigInt(*i)))
                 }
             },
-
-            mluau::Value::Number(n) => Ok(Some(ProxiedV8Primitive::Number(*n))),
             mluau::Value::String(s) => {
                 if s.as_bytes().len() > MAX_OWNED_V8_STRING_SIZE {
                     return Err(format!("String too large to be a primitive (max {} bytes)", MAX_OWNED_V8_STRING_SIZE).into());
@@ -72,7 +69,6 @@ impl ProxiedV8Primitive {
             ProxiedV8Primitive::Boolean(b) => Ok(mluau::Value::Boolean(b)),
             ProxiedV8Primitive::Integer(i) => Ok(mluau::Value::Integer(i as i64)),
             ProxiedV8Primitive::BigInt(i) => Ok(mluau::Value::Integer(i)),
-            ProxiedV8Primitive::Number(n) => Ok(mluau::Value::Number(n)),
             ProxiedV8Primitive::Undefined => Ok(mluau::Value::Nil), // Luau does not have undefined, so we map it to nil
             ProxiedV8Primitive::String(s) => {
                 let s = lua.create_string(s)
@@ -90,7 +86,6 @@ impl ProxiedV8Primitive {
             ProxiedV8Primitive::Boolean(b) => Ok(v8::Boolean::new(scope, b).into()),
             ProxiedV8Primitive::Integer(i) => Ok(v8::Integer::new(scope, i).into()),
             ProxiedV8Primitive::BigInt(i) => Ok(v8::BigInt::new_from_i64(scope, i).into()),
-            ProxiedV8Primitive::Number(n) => Ok(v8::Number::new(scope, n).into()),
             ProxiedV8Primitive::String(s) => {
                 let mut try_catch = v8::TryCatch::new(scope);
                 let s = v8::String::new(try_catch.as_mut(), &s);
@@ -141,10 +136,7 @@ impl ProxiedV8Primitive {
             }
             return Ok(Some(ProxiedV8Primitive::BigInt(i)));
         }
-        if value.is_number() {
-            let n = value.to_number(scope).unwrap().value();
-            return Ok(Some(ProxiedV8Primitive::Number(n)));
-        }
+
         if value.is_string() {
             let s = value.to_string(scope).ok_or("Failed to convert to string")?;
             let s_len = s.length();

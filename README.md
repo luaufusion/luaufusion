@@ -2,20 +2,29 @@
 
 A proxy between Luau (via mluau crate) to v8 (via deno_core + rusty_v8) and other languages.
 
+# V8Bridge
+
 ## Types
 
-There are three main types of proxy types within LuauFusion: primitives, object references and owned values.
+There are three main types of proxy types within LuauFusion: primitives, psuedoprimitives and references.
 
-- **Primitives** are simple values that are copied directly between Luau and the foreign language. These include:
+- **Primitives** are simple values that are immutable, hashable and can be copied directly between Luau and the foreign language. These include:
   - Nil / null 
   - Undefined
   - Boolean
   - Integer 
-  - BigInt (a bigint not within the range of a 64-bit signed integer will be converted to a owned string)
-  - Number (floating point etc.)
-  - Strings (not to be confused with string references, see "Owned Strings" below, js+luau)
+  - BigInt (a bigint not within the range of a 64-bit signed integer will be converted to a string)
+  - String (UTF-8 only, reason: immutable and hashable)
 
 In the v8 bridge, these are represented as a ``ProxiedV8Primitive`` enum.
+
+- **Psuedoprimitives** are more complex values that are still copied between Luau and the foreign language, but are either not hashable or not immutable on either side of the proxy bridge (and as such, send a snapshot of the current data). These include:
+  - Number (floating point etc., reason: not hashable, numbers on luau+js side)
+  - Vectors (which are vectors in luau and arrays of 3 numbers in js)
+  - Byte sequences (which are strings with non-UTF8 characters in luau and Uint8Array's in js)
+  - Static Maps (which are maps containing only primitive keys but with arbitrary values, reason: not immutable or hashable, Maps on js side and *frozen* tables on luau side as normal tables will be treated as references)
+
+These are represented as a ``ProxiedV8PsuedoPrimitive`` enum in the v8 bridge.
 
 - **Object references** are references to objects that live in the other runtime. These include:
   - Objects (js) / Luau tables (luau)
@@ -23,13 +32,8 @@ In the v8 bridge, these are represented as a ``ProxiedV8Primitive`` enum.
   - Functions (js+luau)
   - ArrayBuffers / Buffers (js+luau)
   - JS Promises (js)
-  - String references (normal (owned/primitive) strings do exist as well, see "Strings" below, js+luau)
 
-### Strings
-
-Strings are special in that they can be represented as both a primitive and a object reference.
-
-From Luau, a string is always a owned/primitive unless marked as a 'string reference' using ``LangBridge:stringref(string)``. A owned/primitive string is cloned into the target runtime as a 'normal' string and is as such a primitive with lower overhead than a string reference which has to be stored in a object registry and converted to a object/userdata/whatever.
+These are internally represented as a ``ProxiedV8Value`` enum in the v8 bridge. In the v8 side, these are objects with 2 symbols for id and type, and in the luau side these are userdata with a metatable.
 
 ### Operations across the bridge
 

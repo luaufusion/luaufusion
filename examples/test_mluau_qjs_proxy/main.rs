@@ -112,9 +112,9 @@ export function baz(x) {
     return x * 2;
 }
 // Sleep for 2 seconds
-console.log("In bar.js, sleeping for 10 seconds...");
+console.log("In bar.js, sleeping for 5 seconds...");
 console.log(typeof Deno.core.queueUserTimer)
-await new Promise(resolve => setTimeout(resolve, 10000));
+await new Promise(resolve => setTimeout(resolve, 5000));
 console.log("Awake now!");
 console.log(`In foo2.js ${structuredClone} ${structuredClone([1,2,3,4,{},JSON.stringify({a:1,b:2})])}`);
 
@@ -128,6 +128,12 @@ console.log("Awake now again! Time now is: " + Date.now() + ", timeNow -  Date.n
 export function keysGetter(obj) {
     console.log("In keysGetter", obj);
     return Object.keys(obj).join(", ");
+}
+
+export function staticmaptest(m) {
+    console.log("In staticmaptest", m);
+    m.set("v8", "is pog");
+    return m;
 }
 "#.to_string()),
         ]);
@@ -171,6 +177,17 @@ print("Result4 from V8:", result4)
 
 local keysGetter = result4:getproperty("keysGetter")
 print("keys getter", keysGetter:call(result4))
+
+local staticmaptest = result4:getproperty("staticmaptest")
+local smap = table.freeze({
+    abc = 123,
+    luau = "is great",
+})
+local smap = staticmaptest:call(smap)
+for k, v in smap do
+    print("staticmap key/value", k, v)
+end
+assert(smap.v8 == "is pog", "Invalid static map value for v8 key")
 "#;
 
         let func = lua.load(lua_code)

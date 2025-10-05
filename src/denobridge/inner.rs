@@ -31,7 +31,7 @@ pub(super) enum FunctionRunState {
 }
 
 #[derive(Clone)]
-pub(super) struct CommonState {
+pub(crate) struct CommonState {
     pub(super) list: Rc<RefCell<HashMap<i32, FunctionRunState>>>,
     pub(super) bridge: LuaBridgeServiceClient<V8IsolateManagerServer>,
     pub(super) obj_template: Rc<v8::Global<v8::ObjectTemplate>>,
