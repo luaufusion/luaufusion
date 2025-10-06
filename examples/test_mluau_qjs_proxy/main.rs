@@ -133,6 +133,7 @@ export function keysGetter(obj) {
 export function staticmaptest(m) {
     console.log("In staticmaptest", m);
     m.set("v8", "is pog");
+    m.set("v8arr", [1,2,3,4,5]);
     return m;
 }
 "#.to_string()),
@@ -187,6 +188,11 @@ local smap = table.freeze({
 local smap = staticmaptest:call(smap)
 for k, v in smap do
     print("staticmap key/value", k, v)
+    if type(v) == "table" then
+        for k2, v2 in v do
+            print("  nested key/value", k2, v2)
+        end
+    end
 end
 assert(smap.v8 == "is pog", "Invalid static map value for v8 key")
 "#;

@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use crate::MAX_PROXY_DEPTH;
 use crate::denobridge::bridge::V8ObjectRegistryType;
 use crate::denobridge::psuedoprimitive::ProxiedV8PsuedoPrimitive;
 use crate::{base::Error, denobridge::luauobjs::V8Value};
@@ -33,22 +34,29 @@ impl ProxiedV8Value {
     /// 
     /// Note that only large objects (primitive string and psuedoprimitive stringbyte)
     /// are counted here, as other types are always small
-    pub fn effective_size(&self) -> usize {
+    pub fn effective_size(&self, depth: usize) -> usize {
+        if depth >= MAX_PROXY_DEPTH {
+            return MAX_PROXY_DEPTH; // Prevent excessively deep recursion
+        }
         match self {
             Self::Primitive(p) => p.effective_size(),
-            Self::Psuedoprimitive(p) => p.effective_size(),
+            Self::Psuedoprimitive(p) => p.effective_size(depth),
             Self::V8OwnedObject(_) => 1, // Just a reference
             Self::SourceOwnedObject(_) => 1, // Just a reference
         }
     }
 
     /// Proxies a Luau value to a ProxiedV8Value
-    pub(crate) fn from_luau(plc: &ProxyLuaClient, value: mluau::Value) -> Result<Self, Error> {
+    pub(crate) fn from_luau(plc: &ProxyLuaClient, value: mluau::Value, depth: usize) -> Result<Self, Error> {
+        if depth >= MAX_PROXY_DEPTH {
+            return Err("Maximum proxy depth exceeded when converting Luau to ProxiedV8Value".into());
+        } // Prevent excessively deep recursion
+
         if let Some(prim) = ProxiedV8Primitive::from_luau(&value)? {
             return Ok(ProxiedV8Value::Primitive(prim));
         }
 
-        if let Some(psuedo) = ProxiedV8PsuedoPrimitive::from_luau(plc, &value)? {
+        if let Some(psuedo) = ProxiedV8PsuedoPrimitive::from_luau(plc, &value, depth)? {
             return Ok(ProxiedV8Value::Psuedoprimitive(psuedo));
         }
         
@@ -104,6 +112,9 @@ impl ProxiedV8Value {
 
     /// Proxy a ProxiedV8Value to a Luau value
     pub(crate) fn to_luau(self, lua: &mluau::Lua, plc: &ProxyLuaClient, bridge: &V8IsolateManagerServer, depth: usize) -> Result<mluau::Value, mluau::Error> {
+        if depth >= MAX_PROXY_DEPTH {
+            return Err(mluau::Error::external("Maximum proxy depth exceeded when converting ProxiedV8Value to Luau"));
+        } // Prevent excessively deep recursion
         match self {
             ProxiedV8Value::Primitive(p) => Ok(p.to_luau(lua).map_err(|e| mluau::Error::external(format!("Failed to convert ProxiedV8Primitive to Luau: {}", e)))?),
             ProxiedV8Value::Psuedoprimitive(p) => Ok(p.to_luau(lua, plc, bridge, depth).map_err(|e| mluau::Error::external(format!("Failed to convert ProxiedV8PsuedoPrimitive to Luau: {}", e)))?),
@@ -169,12 +180,17 @@ impl ProxiedV8Value {
         scope: &mut v8::PinScope<'s, '_>,
         value: v8::Local<'s, v8::Value>,
         common_state: &CommonState,
+        depth: usize
     ) -> Result<Self, Error> {
+        if depth >= MAX_PROXY_DEPTH {
+            return Err("Maximum proxy depth exceeded when converting V8 to ProxiedV8Value".into());
+        } // Prevent excessively deep recursion
+
         if let Some(prim) = ProxiedV8Primitive::from_v8(scope, value)? {
             return Ok(Self::Primitive(prim));
         }
 
-        if let Some(psuedo) = ProxiedV8PsuedoPrimitive::from_v8(scope, value, common_state)? {
+        if let Some(psuedo) = ProxiedV8PsuedoPrimitive::from_v8(scope, value, common_state, depth)? {
             return Ok(Self::Psuedoprimitive(psuedo));
         }
 
@@ -213,6 +229,9 @@ impl ProxiedV8Value {
         common_state: &CommonState,
         depth: usize,
     ) -> Result<v8::Local<'s, v8::Value>, Error> {
+        if depth >= MAX_PROXY_DEPTH {
+            return Err("Maximum proxy depth exceeded when converting ProxiedV8Value to V8".into());
+        } // Prevent excessively deep recursion
         match self {
             Self::Primitive(p) => Ok(p.to_v8(scope)?),
             Self::Psuedoprimitive(p) => Ok(p.to_v8(scope, common_state, depth)?),

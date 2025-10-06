@@ -26,8 +26,6 @@ use super::inner::V8IsolateManagerInner;
 
 /// Max size for a owned v8 string
 pub const MAX_OWNED_V8_STRING_SIZE: usize = 1024 * 16; // 16KB
-/// Minimum stack size for V8 isolates
-pub const MIN_STACK_SIZE: usize = 1024 * 1024 * 15; // 15MB minimum memory
 /// Minimum heap size for V8 isolates
 pub const MIN_HEAP_LIMIT: usize = 10 * 1024 * 1024; // 10MB
 /// Maximum number of elements in a staticlist
@@ -106,10 +104,6 @@ impl BridgeVals {
 
 }
 
-/// Marker struct for V8 objects in the object registry
-#[derive(Clone, Copy)]
-pub struct V8BridgeObject;
-
 #[derive(Clone, Copy, Serialize, Deserialize)]
 pub enum V8ObjectRegistryType {
     ArrayBuffer,
@@ -131,6 +125,7 @@ pub fn v8_obj_registry_type_to_i32(typ: V8ObjectRegistryType) -> i32 {
     }
 }
 
+#[allow(dead_code)]
 pub fn i32_to_v8_obj_registry_type(i: i32) -> Option<V8ObjectRegistryType> {
     match i {
         0 => Some(V8ObjectRegistryType::ArrayBuffer),
@@ -297,13 +292,23 @@ impl V8ObjectOp {
                 let prop_names = obj.get(&mut context_scope, key)
                     .ok_or("Failed to get property names")?;
                 
-                let prop_names = ProxiedV8Value::from_v8(&mut context_scope, prop_names.into(), &inner.common_state)
+                let prop_names = ProxiedV8Value::from_v8(&mut context_scope, prop_names.into(), &inner.common_state, 0)
                     .map_err(|e| format!("Failed to proxy property names: {}", e))?;
 
                 Ok(OpCallRet::ProxiedMulti(vec![prop_names]))
             }
-            _ => {
-                Err("Not implemented yet".into())
+            V8ObjectOp::RequestDispose => {
+                let main_ctx = inner.deno.main_context();
+                let isolate = inner.deno.v8_isolate();
+                let scope = std::pin::pin!(v8::HandleScope::new(isolate));
+                let mut scope = &mut scope.init();
+                let main_ctx = v8::Local::new(&mut scope, main_ctx);
+                let mut context_scope = &mut v8::ContextScope::new(scope, main_ctx);
+
+                match inner.common_state.proxy_client.obj_registry.remove(&mut context_scope, obj_id) {
+                    Ok(_) => Ok(OpCallRet::ProxiedMulti(vec![])),
+                    Err(e) => Err(format!("Failed to remove V8 object from registry: {}", e).into()),
+                }
             }
         }
     }
@@ -362,7 +367,7 @@ impl ConcurrentlyExecute for V8IsolateManagerClient {
                                     let main_ctx = v8::Local::new(&mut scope, main_ctx);
                                     let context_scope = &mut v8::ContextScope::new(scope, main_ctx);
                                     let namespace_obj = v8::Local::new(context_scope, namespace_obj);
-                                    match ProxiedV8Value::from_v8(context_scope, namespace_obj.into(), &inner.common_state) {
+                                    match ProxiedV8Value::from_v8(context_scope, namespace_obj.into(), &inner.common_state, 0) {
                                         Ok(v) => v,
                                         Err(e) => {
                                             let _ = resp.client(&client_ctx).send(Err(format!("Failed to proxy module namespace: {}", e).into()));
@@ -451,7 +456,7 @@ impl ConcurrentlyExecute for V8IsolateManagerClient {
                             let main_ctx = v8::Local::new(&mut scope, main_ctx);
                             let mut context_scope = &mut v8::ContextScope::new(scope, main_ctx);
                             let res = v8::Local::new(&mut context_scope, res);
-                            let res = ProxiedV8Value::from_v8(context_scope, res, &inner.common_state);
+                            let res = ProxiedV8Value::from_v8(context_scope, res, &inner.common_state, 0);
                             match res {
                                 Ok(v) => {
                                     let _ = resp.client(&client_ctx).send(Ok(vec![v]));
@@ -492,7 +497,7 @@ impl ConcurrentlyExecute for V8IsolateManagerClient {
                             let props = namespace_obj.get_own_property_names(context_scope, GetPropertyNamesArgs::default()).unwrap();
                             println!("Got namespace object: {:?}", props.to_rust_string_lossy(context_scope));
                         }
-                        match ProxiedV8Value::from_v8(context_scope, namespace_obj.into(), &inner.common_state) {
+                        match ProxiedV8Value::from_v8(context_scope, namespace_obj.into(), &inner.common_state, 0) {
                             Ok(v) => v,
                             Err(e) => {
                                 let _ = resp.client(&client_ctx).send(Err(format!("Failed to proxy module namespace: {}", e).into()));
@@ -605,7 +610,7 @@ impl ProxyBridge for V8IsolateManagerServer {
     }
 
     fn from_source_lua_value(&self, _lua: &mluau::Lua, plc: &ProxyLuaClient, value: mluau::Value) -> Result<Self::ValueType, crate::base::Error> {
-        Ok(ProxiedV8Value::from_luau(plc, value).map_err(|e| e.to_string())?)
+        Ok(ProxiedV8Value::from_luau(plc, value, 0).map_err(|e| e.to_string())?)
     }
 
     async fn eval_from_source(&self, modname: String) -> Result<Self::ValueType, crate::base::Error> {

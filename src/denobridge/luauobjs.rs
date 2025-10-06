@@ -73,9 +73,9 @@ impl V8Value {
         let mut string_char_count = 0;
         let mut args_proxied = Vec::with_capacity(args.len());
         for arg in args {
-            let proxied = ProxiedV8Value::from_luau(&self.plc, arg)
+            let proxied = ProxiedV8Value::from_luau(&self.plc, arg, 0)
             .map_err(|e| format!("Failed to proxy argument to ProxiedV8Value: {}", e))?;
-            let sz = proxied.effective_size();
+            let sz = proxied.effective_size(0);
             if sz > 0 {
                 string_char_count += sz;
                 if string_char_count > super::bridge::MAX_OWNED_V8_STRING_SIZE {

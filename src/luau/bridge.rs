@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use crate::{base::ProxyBridge, luau::objreg::{LuauObjectRegistryID, ObjRegistryLuau}};
 use concurrentlyexec::{ClientContext, ConcurrentExecutorState, MultiReceiver, MultiSender, OneshotSender, ProcessOpts};
 use mlua_scheduler::LuaSchedulerAsyncUserData;
-use mluau::ObjectLike;
+use mluau::{LuaSerdeExt, ObjectLike};
 use serde::{Deserialize, Serialize};
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use mluau::WeakLua;
@@ -51,6 +51,7 @@ pub fn i32_to_obj_registry_type(val: i32) -> Option<ObjectRegistryType> {
 /// This struct is not thread safe and must be kept on the Lua side
 pub struct ProxyLuaClient {
     pub(crate) weak_lua: WeakLua,
+    pub(crate) array_mt: mluau::Table,
     pub(crate) obj_registry: ObjRegistryLuau,
 }
 
@@ -59,6 +60,7 @@ impl ProxyLuaClient {
     pub fn new(lua: &mluau::Lua) -> Result<Self, mluau::Error> {
         Ok(Self {
             weak_lua: lua.weak(),
+            array_mt: lua.array_metatable(),
             obj_registry: ObjRegistryLuau::new(lua)?,
         })
     }

@@ -24,9 +24,9 @@ pub(super) fn __luabind(
     let mut num_string_chars = 0;
     for i in 0..args.length() {
         let arg = args.get_index(scope, i).ok_or_else(|| deno_error::JsErrorBox::generic(format!("Failed to get argument {}", i)))?;
-        match ProxiedV8Value::from_v8(scope, arg, &state) {
+        match ProxiedV8Value::from_v8(scope, arg, &state, 0) {
             Ok(v) => {
-                let sz = v.effective_size();
+                let sz = v.effective_size(0);
                 if sz > 0 {
                     num_string_chars += sz;
                     if num_string_chars > MAX_OWNED_V8_STRING_SIZE {
