@@ -26,7 +26,7 @@ impl ProxiedV8Primitive {
     pub fn effective_size(&self) -> usize {
         match self {
             Self::String(b) => b.len(),
-            _ => 0,
+            _ => 1, // Other types are always small, so ignore
         }
     }
 

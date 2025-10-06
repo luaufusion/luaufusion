@@ -19,10 +19,10 @@ impl ProxiedV8PsuedoPrimitive {
     /// Note that only stringbytes is counted here, as vectors are always 12 bytes
     pub fn effective_size(&self) -> usize {
         match self {
-            Self::Number(_) => 0, // Always 8 bytes, so ignore
-            Self::Vector(_) => 0, // Always 12 bytes, so ignore
+            Self::Number(_) => 1, // Always 8 bytes, so ignore
+            Self::Vector(_) => 1, // Always 12 bytes, so ignore
             Self::StaticMap(map) => {
-                let mut size = 0;
+                let mut size = 1; // Base overhead
                 for (k, v) in map {
                     size += k.effective_size();
                     size += v.effective_size();
