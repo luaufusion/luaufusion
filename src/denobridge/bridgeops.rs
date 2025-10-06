@@ -119,7 +119,7 @@ pub(super) fn __luaret<'s>(
             // Proxy every return value to V8
             let mut results = vec![];
             for ret in resp {
-                match ret.to_v8(scope, state) {
+                match ret.to_v8(scope, state, 0) {
                     Ok(v8_ret) => results.push(v8_ret),
                     Err(e) => {
                         return Err(deno_error::JsErrorBox::generic(format!("Failed to convert return value: {}", e)));

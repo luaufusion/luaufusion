@@ -182,6 +182,7 @@ local staticmaptest = result4:getproperty("staticmaptest")
 local smap = table.freeze({
     abc = 123,
     luau = "is great",
+    meow = table.freeze({ nested = "object" }),
 })
 local smap = staticmaptest:call(smap)
 for k, v in smap do

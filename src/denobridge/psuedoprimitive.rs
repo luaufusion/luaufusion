@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use deno_core::v8;
 use serde::{Deserialize, Serialize};
-use crate::{base::Error, denobridge::{V8IsolateManagerServer, bridge::MAX_OWNED_V8_STRING_SIZE, inner::CommonState, primitives::ProxiedV8Primitive, value::ProxiedV8Value}, luau::bridge::ProxyLuaClient};
+use crate::{MAX_PROXY_DEPTH, base::Error, denobridge::{V8IsolateManagerServer, bridge::MAX_OWNED_V8_STRING_SIZE, inner::CommonState, primitives::ProxiedV8Primitive, value::ProxiedV8Value}, luau::bridge::ProxyLuaClient};
 
 #[derive(Serialize, Deserialize)]
 /// A psuedoprimitive is a type that is not fully primitive (not immutable/hashable in both v8 and luau) but is copied between v8 and luau
@@ -74,7 +74,7 @@ impl ProxiedV8PsuedoPrimitive {
     }
 
     /// ProxiedV8PsuedoPrimitive -> Luau
-    pub(crate) fn to_luau(self, lua: &mluau::Lua, plc: &ProxyLuaClient, bridge: &V8IsolateManagerServer) -> Result<mluau::Value, Error> {
+    pub(crate) fn to_luau(self, lua: &mluau::Lua, plc: &ProxyLuaClient, bridge: &V8IsolateManagerServer, depth: usize) -> Result<mluau::Value, Error> {
         match self {
             Self::Number(n) => Ok(mluau::Value::Number(n)),
             Self::Vector((x, y, z)) => {
@@ -87,10 +87,13 @@ impl ProxiedV8PsuedoPrimitive {
                 Ok(mluau::Value::String(s))
             }
             Self::StaticMap(smap) => {
+                if depth >= MAX_PROXY_DEPTH {
+                    return Err("Maximum proxy depth exceeded when converting psuedoprimitive to Lua".into());
+                }
                 let table = lua.create_table().map_err(|e| format!("Failed to create Lua table: {}", e))?;
                 for (k, v) in smap {
                     let k = k.to_luau(lua)?;
-                    let v = v.to_luau(lua, plc, bridge).map_err(|e| format!("Failed to convert value to Lua: {}", e))?;
+                    let v = v.to_luau(lua, plc, bridge, depth + 1).map_err(|e| format!("Failed to convert value to Lua: {}", e))?;
                     table.set(k, v).map_err(|e| format!("Failed to set key/value in Lua table: {}", e))?;
                 }
                 Ok(mluau::Value::Table(table))
@@ -99,7 +102,7 @@ impl ProxiedV8PsuedoPrimitive {
     }
 
     /// ProxiedV8PsuedoPrimitive -> V8
-    pub(crate) fn to_v8<'s>(self, scope: &mut v8::HandleScope<'s>, common_state: &CommonState) -> Result<v8::Local<'s, v8::Value>, Error> {
+    pub(crate) fn to_v8<'s>(self, scope: &mut v8::HandleScope<'s>, common_state: &CommonState, depth: usize) -> Result<v8::Local<'s, v8::Value>, Error> {
         match self {
             Self::Number(n) => {
                 let num = v8::Number::new(scope, n);
@@ -127,10 +130,13 @@ impl ProxiedV8PsuedoPrimitive {
                 return Ok(uint8_array.into());
             }
             Self::StaticMap(smap) => {
+                if depth >= MAX_PROXY_DEPTH {
+                    return Err("Maximum proxy depth exceeded when converting psuedoprimitive to V8".into());
+                }
                 let map = v8::Map::new(scope);
                 for (k, v) in smap {
                     let k = k.to_v8(scope)?;
-                    let v = v.to_v8(scope, common_state)?;
+                    let v = v.to_v8(scope, common_state, depth+1)?;
                     map.set(scope, k, v)
                     .ok_or("Failed to set key/value in V8 Map")?;
                 }

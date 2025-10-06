@@ -250,7 +250,7 @@ impl V8ObjectOp {
 
                 let mut v8_args = Vec::with_capacity(args.len());
                 for arg in args {
-                    let v8_arg = match arg.to_v8(&mut context_scope, &inner.common_state) {
+                    let v8_arg = match arg.to_v8(&mut context_scope, &inner.common_state, 0) {
                         Ok(v) => v,
                         Err(e) => return Err(format!("Failed to convert argument to V8: {}", e).into()),
                     };
@@ -596,7 +596,7 @@ impl ProxyBridge for V8IsolateManagerServer {
     }
 
     fn to_source_lua_value(&self, lua: &mluau::Lua, value: Self::ValueType, plc: &ProxyLuaClient) -> Result<mluau::Value, Error> {
-        Ok(value.to_luau(lua, plc, self).map_err(|e| e.to_string())?)
+        Ok(value.to_luau(lua, plc, self, 0).map_err(|e| e.to_string())?)
     }
 
     fn from_source_lua_value(&self, _lua: &mluau::Lua, plc: &ProxyLuaClient, value: mluau::Value) -> Result<Self::ValueType, crate::base::Error> {

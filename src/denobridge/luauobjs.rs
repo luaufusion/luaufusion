@@ -54,7 +54,7 @@ impl V8Value {
             Ok(v) => {
                 let mut proxied = mluau::MultiValue::with_capacity(v.len());
                 for ret in v {
-                    let ret = ret.to_luau(&lua, &self.plc, &self.bridge)
+                    let ret = ret.to_luau(&lua, &self.plc, &self.bridge, 0)
                     .map_err(|e| format!("Failed to convert return value to Lua: {}", e))?;
                     proxied.push_back(ret);
                 }
@@ -96,7 +96,7 @@ impl V8Value {
                     return Err("Lua instance has been dropped".into());
                 };
                 for ret in v {
-                    let ret = ret.to_luau(&lua, &self.plc, &self.bridge)
+                    let ret = ret.to_luau(&lua, &self.plc, &self.bridge, 0)
                     .map_err(|e| format!("Failed to convert return value to Lua: {}", e))?;
                     proxied.push_back(ret);
                 }
