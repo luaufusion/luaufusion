@@ -1,12 +1,34 @@
 #[cfg(feature = "embedder_json")]
 use serde_json::Value as JsonValue;
+#[cfg(feature = "embedder_json")]
+use serde_json::value::RawValue as JsonRawValue;
 
 #[cfg(feature = "embedder_json")]
 use crate::{MAX_PROXY_DEPTH, base::Error, denobridge::value::ProxiedV8Value, denobridge::primitives::ProxiedV8Primitive};
 
-/// Converts a serde_json::Value to a ProxiedV8Value
+/// Converts a serde_json::value::JsonRawValue to a ProxiedV8Value directly
+/// 
+/// If `check_chars_limit` is true, will check that the total number of string characters
+/// does not exceed MAX_OWNED_V8_STRING_SIZE (this is useful if the JSON is coming from
+/// an untrusted source, such as over the network).
 #[cfg(feature = "embedder_json")]
-pub fn json_to_proxied_v8(value: JsonValue, depth: usize) -> Result<ProxiedV8Value, Error> {
+pub fn json_raw_to_proxied_v8(value: &JsonRawValue, check_chars_limit: bool, depth: usize) -> Result<ProxiedV8Value, Error> {
+    if depth >= MAX_PROXY_DEPTH {
+        return Err("Maximum proxy depth exceeded when converting JSON to ProxiedV8Value".into());
+    }
+
+    let v: JsonValue = serde_json::from_str(value.get())
+        .map_err(|e| format!("Failed to parse JsonRawValue: {}", e))?;
+    json_to_proxied_v8(v, check_chars_limit, depth)
+}
+
+/// Converts a serde_json::Value to a ProxiedV8Value directly
+/// 
+/// If `check_chars_limit` is true, will check that the total number of string characters
+/// does not exceed MAX_OWNED_V8_STRING_SIZE (this is useful if the JSON is coming from
+/// an untrusted source, such as over the network).
+#[cfg(feature = "embedder_json")]
+pub fn json_to_proxied_v8(value: JsonValue, check_chars_limit: bool, depth: usize) -> Result<ProxiedV8Value, Error> {
     if depth >= MAX_PROXY_DEPTH {
         return Err("Maximum proxy depth exceeded when converting JSON to ProxiedV8Value".into());
     }
@@ -18,12 +40,15 @@ pub fn json_to_proxied_v8(value: JsonValue, depth: usize) -> Result<ProxiedV8Val
             let mut parray = Vec::with_capacity(a.len());
             let mut num_string_chars = 0;
             for v in a {
-                let pv = json_to_proxied_v8(v, depth + 1)?;
-                let sz = pv.effective_size(0);
-                if sz > 0 {
-                    num_string_chars += sz;
-                    if num_string_chars > crate::denobridge::bridge::MAX_OWNED_V8_STRING_SIZE {
-                        return Err(format!("Too many string characters in array when converting JSON to ProxiedV8Value (max {} bytes)", crate::denobridge::bridge::MAX_OWNED_V8_STRING_SIZE).into());
+                let pv = json_to_proxied_v8(v, check_chars_limit, depth + 1)?;
+
+                if check_chars_limit {
+                    let sz = pv.effective_size(0);
+                    if sz > 0 {
+                        num_string_chars += sz;
+                        if num_string_chars > crate::denobridge::bridge::MAX_OWNED_V8_STRING_SIZE {
+                            return Err(format!("Too many string characters in array when converting JSON to ProxiedV8Value (max {} bytes)", crate::denobridge::bridge::MAX_OWNED_V8_STRING_SIZE).into());
+                        }
                     }
                 }
                 parray.push(pv);
@@ -54,14 +79,20 @@ pub fn json_to_proxied_v8(value: JsonValue, depth: usize) -> Result<ProxiedV8Val
             let mut s_chars = 0;
             for (k, v) in o {
                 let pk = ProxiedV8Primitive::String(k);
-                s_chars += pk.effective_size();
-                if s_chars > crate::denobridge::bridge::MAX_OWNED_V8_STRING_SIZE {
-                    return Err(format!("Too many string characters in object keys when converting JSON to ProxiedV8Value (max {} bytes)", crate::denobridge::bridge::MAX_OWNED_V8_STRING_SIZE).into());
+                if check_chars_limit {
+                    s_chars += pk.effective_size();
+                    if s_chars > crate::denobridge::bridge::MAX_OWNED_V8_STRING_SIZE {
+                        return Err(format!("Too many string characters in object keys when converting JSON to ProxiedV8Value (max {} bytes)", crate::denobridge::bridge::MAX_OWNED_V8_STRING_SIZE).into());
+                    }
                 }
-                let pv = json_to_proxied_v8(v, depth + 1)?;
-                s_chars += pv.effective_size(0);
-                if s_chars > crate::denobridge::bridge::MAX_OWNED_V8_STRING_SIZE {
-                    return Err(format!("Too many string characters in object when converting JSON to ProxiedV8Value (max {} bytes)", crate::denobridge::bridge::MAX_OWNED_V8_STRING_SIZE).into());
+                
+                let pv = json_to_proxied_v8(v, check_chars_limit, depth + 1)?;
+
+                if check_chars_limit {
+                    s_chars += pv.effective_size(0);
+                    if s_chars > crate::denobridge::bridge::MAX_OWNED_V8_STRING_SIZE {
+                        return Err(format!("Too many string characters in object when converting JSON to ProxiedV8Value (max {} bytes)", crate::denobridge::bridge::MAX_OWNED_V8_STRING_SIZE).into());
+                    }
                 }
                 smap.insert(pk, pv);
             }

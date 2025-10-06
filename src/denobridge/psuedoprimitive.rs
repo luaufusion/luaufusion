@@ -62,11 +62,8 @@ impl ProxiedV8PsuedoPrimitive {
                 Ok(Some(Self::StringBytes(serde_bytes::ByteBuf::from(s.as_bytes().to_vec()))))
             },
             mluau::Value::Table(t) => {
-                if !t.is_readonly() {
-                    return Ok(None); // Non-readonly tables are not psuedoprimitives, but rather are references
-                }
-
-                if t.metatable() == Some(plc.array_mt.clone()) {
+                let mt = t.metatable();
+                if mt == Some(plc.array_mt.clone()) {
                     let mut list = Vec::new();
                     t.for_each(|_: mluau::Value, v| {
                         let v = ProxiedV8Value::from_luau(plc, v, depth+1)
@@ -77,24 +74,26 @@ impl ProxiedV8PsuedoPrimitive {
                     .map_err(|e| format!("Failed to iterate over array: {}", e))?;
 
                     return Ok(Some(Self::StaticList(list)));
+                } else if mt == Some(plc.map_mt.clone()) {
+                    let mut smap = HashMap::new();
+                    t.for_each(|k, v| {
+                        let k = ProxiedV8Primitive::from_luau(&k)
+                            .map_err(|e| mluau::Error::external(e.to_string()))?;
+                        let v = ProxiedV8Value::from_luau(plc, v, depth + 1)
+                            .map_err(|e| mluau::Error::external(e.to_string()))?;
+                        if let Some(k) = k {
+                            smap.insert(k, v);
+                        } else {
+                            return Err(mluau::Error::external("Table key is not a ProxiedV8Primitive"));
+                        }
+                        Ok(())
+                    })
+                    .map_err(|e| format!("Failed to iterate over table: {}", e))?;
+
+                    Ok(Some(Self::StaticMap(smap)))
+                } else {
+                    Ok(None) // Not a recognized psuedoprimitive table
                 }
-
-                let mut smap = HashMap::new();
-                t.for_each(|k, v| {
-                    let k = ProxiedV8Primitive::from_luau(&k)
-                        .map_err(|e| mluau::Error::external(e.to_string()))?;
-                    let v = ProxiedV8Value::from_luau(plc, v, depth + 1)
-                        .map_err(|e| mluau::Error::external(e.to_string()))?;
-                    if let Some(k) = k {
-                        smap.insert(k, v);
-                    } else {
-                        return Err(mluau::Error::external("Table key is not a ProxiedV8Primitive"));
-                    }
-                    Ok(())
-                })
-                .map_err(|e| format!("Failed to iterate over table: {}", e))?;
-
-                Ok(Some(Self::StaticMap(smap)))
             }
             _ => Ok(None),
         }
@@ -135,6 +134,7 @@ impl ProxiedV8PsuedoPrimitive {
                     let v = v.to_luau(lua, plc, bridge, depth + 1).map_err(|e| format!("Failed to convert value to Lua: {}", e))?;
                     table.set(k, v).map_err(|e| format!("Failed to set key/value in Lua table: {}", e))?;
                 }
+                table.set_metatable(Some(plc.map_mt.clone())).map_err(|e| format!("Failed to set metatable on Lua map: {}", e))?;
                 Ok(mluau::Value::Table(table))
             }
         }

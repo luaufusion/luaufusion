@@ -1,6 +1,10 @@
 use serde::{Deserialize, Serialize};
 use crate::MAX_PROXY_DEPTH;
 use crate::denobridge::bridge::V8ObjectRegistryType;
+#[cfg(feature = "embedder_json")]
+use crate::denobridge::embedder_api::{json_raw_to_proxied_v8, json_to_proxied_v8};
+#[cfg(feature = "embedder_json")]
+use crate::luau::embedder_api::{EmbeddableJson, EmbeddableJsonInner};
 use crate::denobridge::psuedoprimitive::ProxiedV8PsuedoPrimitive;
 use crate::{base::Error, denobridge::luauobjs::V8Value};
 use crate::denobridge::objreg::V8ObjectRegistryID;
@@ -89,6 +93,23 @@ impl ProxiedV8Value {
                 // Handle v8 objects
                 if let Ok(v8value) = ud.borrow::<V8Value>() {
                     return Ok(ProxiedV8Value::V8OwnedObject((v8value.typ, v8value.id)));
+                }
+
+                // Handle EmbeddableJson
+                #[cfg(feature = "embedder_json")]
+                if let Ok(ev) = ud.borrow::<EmbeddableJson>() {
+                    let Some(json) = ev.take() else {
+                        return Err("EmbeddableJson has already been taken".into());
+                    };
+
+                    match json {
+                        EmbeddableJsonInner::Raw(raw) => {
+                            return json_raw_to_proxied_v8(&raw, ev.check_chars_limit, depth + 1);
+                        },
+                        EmbeddableJsonInner::Owned(v) => {
+                            return json_to_proxied_v8(v, ev.check_chars_limit, depth + 1);
+                        },
+                    }
                 }
 
                 let userdata_id = plc.obj_registry.add(mluau::Value::UserData(ud))

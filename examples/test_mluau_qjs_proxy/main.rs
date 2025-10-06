@@ -5,7 +5,7 @@ use mlua_scheduler::{taskmgr::NoopHooks, LuaSchedulerAsync, XRc};
 use mluau::IntoLua;
 use mluau_quickjs_proxy::base::ProxyBridge;
 use mluau_quickjs_proxy::denobridge::V8IsolateManagerServer;
-use mluau_quickjs_proxy::luau::bridge::LangBridge;
+use mluau_quickjs_proxy::luau::langbridge::LangBridge;
 
 const HEAP_LIMIT: usize = 10 * 1024 * 1024; // 10 MB
 
@@ -136,6 +136,10 @@ export function staticmaptest(m) {
     m.set("v8arr", [1,2,3,4,5]);
     return m;
 }
+
+export function testEmbedderJson(evj) {
+    console.log("In testEmbedderJson", evj);
+}
 "#.to_string()),
         ]);
 
@@ -152,6 +156,12 @@ export function staticmaptest(m) {
             vfs
         ).await.expect("Failed to create Lua-V8 bridge");
 
+        let test_embedder_json = r#"{"embeddedJson":"embedded22","mynestedMap":{"a":{"b":123}}}"#;
+        let ev = mluau_quickjs_proxy::luau::embedder_api::EmbeddableJson::new_raw(
+            serde_json::value::RawValue::from_string(test_embedder_json.to_string()).expect("Failed to convert"), 
+            true
+        );
+
         // Call the v8 function now as a async script
         let lua_code = r#"
 local function myfooer()
@@ -159,7 +169,7 @@ local function myfooer()
     return 42
 end
 
-local v8 = ...
+local v8, ed = ...
 local result = v8:run("foo.js")
 -- args to pass to foo: function() print('am here'); return task.wait(1) end, v8, buffer.create(10)
 print("Result from V8:", result)
@@ -180,11 +190,13 @@ local keysGetter = result4:getproperty("keysGetter")
 print("keys getter", keysGetter:call(result4))
 
 local staticmaptest = result4:getproperty("staticmaptest")
-local smap = table.freeze({
+local smap = setmetatable({
     abc = 123,
     luau = "is great",
-    meow = table.freeze({ nested = "object" }),
-})
+    meow = setmetatable({ nested = "object" }, v8:map_metatable()),
+    myarr = setmetatable({'a','b','c'}, v8:array_metatable())
+}, v8:map_metatable())
+
 local smap = staticmaptest:call(smap)
 for k, v in smap do
     print("staticmap key/value", k, v)
@@ -195,6 +207,9 @@ for k, v in smap do
     end
 end
 assert(smap.v8 == "is pog", "Invalid static map value for v8 key")
+
+local testEmbedderJson = result4:getproperty("testEmbedderJson")
+testEmbedderJson:call(ed)
 "#;
 
         let func = lua.load(lua_code)
@@ -205,6 +220,7 @@ assert(smap.v8 == "is pog", "Invalid static map value for v8 key")
         let mut args = mluau::MultiValue::new();
         let bridgy = bridge.bridge().clone();
         args.push_back(bridge.into_lua(&lua).expect("Failed to push QuickJS runtime to Lua"));
+        args.push_back(ev.into_lua(&lua).expect("Failed to push embeddable json"));
 
         let output = task_mgr
             .spawn_thread_and_wait(th, args)
