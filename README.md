@@ -62,9 +62,9 @@ Note: unless explicitly stated, all type conversions are lossless and bidirectio
 | byte sequence                        | Uint8Array             | Psuedoprimitive |
 | table w/ array_metatable             | Array                  | Psuedoprimitive |
 | table w/ map_metatable               | Map                    | Psuedoprimitive |
-| userdata (``V8Value``)               | <underlying js value>  | Reference  |
-| object with luaid/luatype symbols    | <underlying lua value> | Reference  |
-| embedded json* (``EmbeddableJson``)  | <json value>           | Psuedoprimitive/Primitive (depending on JSON) [1] |
+| userdata (``V8Value``)               | underlying js value    | Reference  |
+| object with luaid/luatype symbols    | underlying lua value   | Reference  |
+| embedded json* (``EmbeddableJson``)  | json value             | Psuedoprimitive/Primitive (depending on JSON) [1] |
 
 [1] Note that embedded json is not a bidirectional conversion. Returning the Map from JS to Luau will result in a StaticMap, not a ``EmbeddableJson`` and may even fail if the JSON is too large to be sent outside of embedded json's.
 
