@@ -13,7 +13,7 @@ use super::inner::{CommonState, FunctionRunState};
 #[op2(fast)]
 pub(super) fn __luabind(
     #[state] state: &CommonState,
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::Local<v8::Array>,
 ) -> Result<i32, deno_error::JsErrorBox> {
     if args.length() > MAX_FUNCTION_ARGS {
@@ -103,7 +103,7 @@ pub(super) async fn __luarun(
 #[op2]
 pub(super) fn __luaret<'s>(
     #[state] state: &CommonState,
-    scope: &mut v8::HandleScope<'s>,
+    scope: &'s mut v8::PinScope,
     run_id: i32,
 ) -> Result<v8::Local<'s, v8::Array>, deno_error::JsErrorBox> {
     let func_state = {

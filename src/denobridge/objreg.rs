@@ -28,8 +28,9 @@ pub struct V8ObjectRegistry {
 
 impl V8ObjectRegistry {
     /// Adds a value to the V8 object registry and returns its ID
-    pub fn add(&self, scope: &mut v8::HandleScope, obj: v8::Local<v8::Value>) -> Result<V8ObjectRegistryID, String> {
-        let try_catch = &mut v8::TryCatch::new(scope);
+    pub fn add(&self, scope: &mut v8::PinScope, obj: v8::Local<v8::Value>) -> Result<V8ObjectRegistryID, String> {
+        let try_catch = std::pin::pin!(v8::TryCatch::new(scope));
+        let try_catch = &mut try_catch.init();
         let undefined = v8::undefined(try_catch);
         let add_v8_object = v8::Local::new(try_catch, &self.add_v8_object);
         // The function is bound, so recv is undefined
@@ -60,11 +61,12 @@ impl V8ObjectRegistry {
     /// May be undefined if the ID does not exist
     pub fn get<'a, R>(
         &self, 
-        scope: &mut v8::HandleScope<'a>, 
+        scope: &mut v8::PinScope<'a, '_>, 
         id: V8ObjectRegistryID, 
-        funct: impl FnOnce(&mut v8::HandleScope<'a>, v8::Local<'a, v8::Value>) -> Result<R, String>
+        funct: impl FnOnce(&mut v8::PinScope<'a, '_>, v8::Local<'a, v8::Value>) -> Result<R, String>
     ) -> Result<R, String> {
-        let try_catch = &mut v8::TryCatch::new(scope);
+        let try_catch = std::pin::pin!(v8::TryCatch::new(scope));
+        let try_catch = &mut try_catch.init();
         let undefined = v8::undefined(try_catch);
         let get_v8_object = v8::Local::new(try_catch, &self.get_v8_object);
         let id_value = v8::Integer::new(try_catch, id.objid() as i32);
@@ -88,8 +90,9 @@ impl V8ObjectRegistry {
     }
 
     /// Removes a value from the V8 object registry by ID
-    pub fn remove(&self, scope: &mut v8::HandleScope, id: V8ObjectRegistryID) -> Result<(), String> {
-        let try_catch = &mut v8::TryCatch::new(scope);
+    pub fn remove(&self, scope: &mut v8::PinScope, id: V8ObjectRegistryID) -> Result<(), String> {
+        let try_catch = std::pin::pin!(v8::TryCatch::new(scope));
+        let try_catch = &mut try_catch.init();
         let undefined = v8::undefined(try_catch);
         let remove_v8_object = v8::Local::new(try_catch, &self.remove_v8_object);
         let id_value = v8::Integer::new(try_catch, id.objid() as i32);

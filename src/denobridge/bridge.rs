@@ -42,7 +42,7 @@ pub(crate) struct BridgeVals {
 }
 
 impl BridgeVals {
-    pub(crate) fn new<'s>(scope: &mut v8::HandleScope<'s>) -> Self {
+    pub(crate) fn new<'s>(scope: &mut v8::PinScope<'s, '_>) -> Self {
         // The createLuaObjectFromData function is stored in globalThis.lua.createLuaObjectFromData
         let (add_v8_object, get_v8_object, remove_v8_object, luaid_symbol, luatype_symbol) = {
             // Get globalThis.lua
@@ -232,9 +232,10 @@ impl V8ObjectOp {
             Self::FunctionCall => {
                     let main_ctx = inner.deno.main_context();
                     let isolate = inner.deno.v8_isolate();
-                    let mut scope = v8::HandleScope::new(isolate);
+                    let scope = std::pin::pin!(v8::HandleScope::new(isolate));
+                    let mut scope = &mut scope.init();
                     let main_ctx = v8::Local::new(&mut scope, main_ctx);
-                    let mut context_scope = &mut v8::ContextScope::new(&mut scope, main_ctx);
+                    let mut context_scope = &mut v8::ContextScope::new(scope, main_ctx);
 
                 let func = match inner.common_state.proxy_client.obj_registry.get(context_scope, obj_id, |tc, v| {
                     if !v.is_function() {
@@ -262,9 +263,10 @@ impl V8ObjectOp {
             Self::ObjectGetProperty => {
                 let main_ctx = inner.deno.main_context();
                 let isolate = inner.deno.v8_isolate();
-                let mut scope = v8::HandleScope::new(isolate);
+                let scope = std::pin::pin!(v8::HandleScope::new(isolate));
+                let mut scope = &mut scope.init();
                 let main_ctx = v8::Local::new(&mut scope, main_ctx);
-                let mut context_scope = &mut v8::ContextScope::new(&mut scope, main_ctx);
+                let mut context_scope = &mut v8::ContextScope::new(scope, main_ctx);
 
                 if args.len() != 1 {
                     return Err("ObjectGetProperty requires exactly one argument".into());
@@ -355,9 +357,10 @@ impl ConcurrentlyExecute for V8IsolateManagerClient {
                                 let proxied = {
                                     let main_ctx = inner.deno.main_context();
                                     let isolate = inner.deno.v8_isolate();
-                                    let mut scope = v8::HandleScope::new(isolate);
+                                    let scope = std::pin::pin!(v8::HandleScope::new(isolate));
+                                    let mut scope = &mut scope.init();
                                     let main_ctx = v8::Local::new(&mut scope, main_ctx);
-                                    let context_scope = &mut v8::ContextScope::new(&mut scope, main_ctx);
+                                    let context_scope = &mut v8::ContextScope::new(scope, main_ctx);
                                     let namespace_obj = v8::Local::new(context_scope, namespace_obj);
                                     match ProxiedV8Value::from_v8(context_scope, namespace_obj.into(), &inner.common_state) {
                                         Ok(v) => v,
@@ -443,9 +446,10 @@ impl ConcurrentlyExecute for V8IsolateManagerClient {
                         Ok(res) => {
                             let main_ctx = inner.deno.main_context();
                             let isolate = inner.deno.v8_isolate();
-                            let mut scope = v8::HandleScope::new(isolate);
+                            let scope = std::pin::pin!(v8::HandleScope::new(isolate));
+                            let mut scope = &mut scope.init();
                             let main_ctx = v8::Local::new(&mut scope, main_ctx);
-                            let mut context_scope = &mut v8::ContextScope::new(&mut scope, main_ctx);
+                            let mut context_scope = &mut v8::ContextScope::new(scope, main_ctx);
                             let res = v8::Local::new(&mut context_scope, res);
                             let res = ProxiedV8Value::from_v8(context_scope, res, &inner.common_state);
                             match res {
@@ -479,9 +483,10 @@ impl ConcurrentlyExecute for V8IsolateManagerClient {
                     let proxied = {
                         let main_ctx = inner.deno.main_context();
                         let isolate = inner.deno.v8_isolate();
-                        let mut scope = v8::HandleScope::new(isolate);
+                        let scope = std::pin::pin!(v8::HandleScope::new(isolate));
+                        let mut scope = &mut scope.init();
                         let main_ctx = v8::Local::new(&mut scope, main_ctx);
-                        let context_scope = &mut v8::ContextScope::new(&mut scope, main_ctx);
+                        let context_scope = &mut v8::ContextScope::new(scope, main_ctx);
                         let namespace_obj = v8::Local::new(context_scope, namespace_obj);
                         {
                             let props = namespace_obj.get_own_property_names(context_scope, GetPropertyNamesArgs::default()).unwrap();

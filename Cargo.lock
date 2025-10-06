@@ -100,9 +100,9 @@ dependencies = [
 
 [[package]]
 name = "bindgen"
-version = "0.71.1"
+version = "0.72.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5f58bf3d7db68cfbac37cfc485a8d711e87e064c3d0fe0435b92f7a407f9d6b3"
+checksum = "993776b509cfb49c750f11b8f07a46fa23e0a1386ffc01fb1e7d343efc387895"
 dependencies = [
  "bitflags",
  "cexpr",
@@ -184,6 +184,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d71b6127be86fdcfddb610f7182ac57211d4b18a3e9c82eb2d17662f2227ad6a"
 
 [[package]]
+name = "calendrical_calculations"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "53c5d386a9f2c8b97e1a036420bcf937db4e5c9df33eb0232025008ced6104c0"
+dependencies = [
+ "core_maths",
+ "displaydoc",
+]
+
+[[package]]
 name = "capacity_builder"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -252,6 +262,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "combine"
+version = "4.6.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ba5a308b75df32fe02788e748662718f03fde005016435c444eea572398219fd"
+dependencies = [
+ "bytes",
+ "memchr",
+]
+
+[[package]]
 name = "concurrentlyexec"
 version = "0.1.0"
 source = "git+https://github.com/mluau-quickjs-proxy/concurrentlyexecute#b345cf3d15e3b4ccf85ba04965d5392e06f1a1d7"
@@ -271,6 +291,15 @@ name = "cooked-waker"
 version = "5.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "147be55d677052dabc6b22252d5dd0fd4c29c8c27aa4f2fbef0f94aa003b406f"
+
+[[package]]
+name = "core_maths"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77745e017f5edba1a9c1d854f6f3a52dac8a12dd5af5d2f54aecf61e43d80d30"
+dependencies = [
+ "libm",
+]
 
 [[package]]
 name = "crc32fast"
@@ -314,18 +343,18 @@ dependencies = [
 
 [[package]]
 name = "deno_console"
-version = "0.214.0"
+version = "0.218.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "74189b98d1245bcef3a7565cbfe5cad4ab3d2ad9393aa48067fab89efe85a99b"
+checksum = "fee9561138115fb7d17bebf9a84d7afe6910b5acbe4f977c5dc4d8287ce97d73"
 dependencies = [
  "deno_core",
 ]
 
 [[package]]
 name = "deno_core"
-version = "0.355.0"
+version = "0.362.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "775d2fde80a2ec3116d179703b38346a931bb9626f4a826148d5fe8631cab29f"
+checksum = "be08f717b55b73bbb9a96e8c6854f8693d34f5c4dd41c7284c338d923709473c"
 dependencies = [
  "anyhow",
  "az",
@@ -393,9 +422,9 @@ dependencies = [
 
 [[package]]
 name = "deno_ops"
-version = "0.231.0"
+version = "0.238.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9ca530772bbcbc9ad389ad7bcd86623b2ec555f68a2d062d23cc008915cbe781"
+checksum = "18cde9a34023084eec749c6264bb5be7f3c8e843dbc8b75874c6da3b8b200f02"
 dependencies = [
  "indexmap",
  "proc-macro-rules",
@@ -423,9 +452,9 @@ dependencies = [
 
 [[package]]
 name = "deno_permissions"
-version = "0.76.0"
+version = "0.77.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be64061edbde18271ca3931795cddbc3c501c3d20da2d3dbe71cc285238202b6"
+checksum = "2cbb004d77f65f3033b14a3c2af3691e11108bfa3dac3cb668cc3b5e7a0429ef"
 dependencies = [
  "capacity_builder",
  "chrono",
@@ -474,9 +503,9 @@ dependencies = [
 
 [[package]]
 name = "deno_url"
-version = "0.214.0"
+version = "0.218.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a4f02fd80dda41f1e278c69170b802004c0094ceef2dde68bc117a69dc5702cf"
+checksum = "5187db23b5349bb27c935c0cdafc54bf41775317dc69a63cc23cb41b9c3f94b3"
 dependencies = [
  "deno_core",
  "deno_error",
@@ -485,11 +514,43 @@ dependencies = [
 
 [[package]]
 name = "deno_webidl"
-version = "0.214.0"
+version = "0.218.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b29a947a96dc0f672741669470f0260eba20d198436143b40afb9bda97723f07"
+checksum = "d65c0a14139d9f3ae92c07f759f73b58f6b56dba0ed5f4786bf531f8a68cb870"
 dependencies = [
  "deno_core",
+]
+
+[[package]]
+name = "diplomat"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ced081520ee8cf2b8c5b64a1a901eccd7030ece670dac274afe64607d6499b71"
+dependencies = [
+ "diplomat_core",
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "diplomat-runtime"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "098f9520ec5c190943b083bca3ea4cc4e67dc5f85a37062e528ecf1d25f04eb4"
+
+[[package]]
+name = "diplomat_core"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ad619d9fdee0e731bb6f8f7d797b6ecfdc2395e363f554d2f6377155955171eb"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "serde",
+ "smallvec",
+ "strck",
+ "syn",
 ]
 
 [[package]]
@@ -729,6 +790,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "icu_calendar"
+version = "2.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1f6c40ba6481ed7ddd358437af0f000eb9f661345845977d9d1b38e606374e1f"
+dependencies = [
+ "calendrical_calculations",
+ "displaydoc",
+ "icu_calendar_data",
+ "icu_locale",
+ "icu_locale_core",
+ "icu_provider",
+ "tinystr",
+ "writeable",
+ "zerovec",
+]
+
+[[package]]
+name = "icu_calendar_data"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7219c8639ab936713a87b571eed2bc2615aa9137e8af6eb221446ee5644acc18"
+
+[[package]]
 name = "icu_collections"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -738,6 +822,22 @@ dependencies = [
  "potential_utf",
  "yoke",
  "zerofrom",
+ "zerovec",
+]
+
+[[package]]
+name = "icu_locale"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ae5921528335e91da1b6c695dbf1ec37df5ac13faa3f91e5640be93aa2fbefd"
+dependencies = [
+ "displaydoc",
+ "icu_collections",
+ "icu_locale_core",
+ "icu_locale_data",
+ "icu_provider",
+ "potential_utf",
+ "tinystr",
  "zerovec",
 ]
 
@@ -753,6 +853,12 @@ dependencies = [
  "writeable",
  "zerovec",
 ]
+
+[[package]]
+name = "icu_locale_data"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4fdef0c124749d06a743c69e938350816554eb63ac979166590e2b4ee4252765"
 
 [[package]]
 name = "icu_normalizer"
@@ -907,6 +1013,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4a5f13b858c8d314ee3e8f639011f7ccefe71f97f96e50151fb991f267928e2c"
 
 [[package]]
+name = "ixdtf"
+version = "0.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33ef2d119044a672ceb96e59608dffe8677f29dc6ec48ed693a4b9ac84751e9b"
+dependencies = [
+ "displaydoc",
+]
+
+[[package]]
+name = "jiff-tzdb"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c1283705eb0a21404d2bfd6eef2a7593d240bc42a0bdb39db0ad6fa2ec026524"
+
+[[package]]
 name = "jobserver"
 version = "0.1.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -941,6 +1062,12 @@ dependencies = [
  "cfg-if",
  "windows-link 0.2.0",
 ]
+
+[[package]]
+name = "libm"
+version = "0.2.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f9fbbcab51052fe104eb5e5d351cf728d30a5be1fe14d9be8a3b097481fb97de"
 
 [[package]]
 name = "linux-raw-sys"
@@ -1238,6 +1365,7 @@ version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "84df19adbe5b5a0782edcab45899906947ab039ccf4573713735ee7de1e6b08a"
 dependencies = [
+ "serde",
  "zerovec",
 ]
 
@@ -1440,6 +1568,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
+name = "ry_temporal_capi"
+version = "0.0.11-ry.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cdfddefd45ee4814bd83d94b7196c95ef6af159f4a0035a6c67bd59edcff14ee"
+dependencies = [
+ "diplomat",
+ "diplomat-runtime",
+ "icu_calendar",
+ "icu_locale",
+ "num-traits",
+ "temporal_rs",
+ "writeable",
+]
+
+[[package]]
 name = "ryu"
 version = "1.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1517,9 +1660,9 @@ dependencies = [
 
 [[package]]
 name = "serde_v8"
-version = "0.264.0"
+version = "0.271.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c34707712f3815e73e1c8319bba06e5bc105bb65fe812ea2e7279ffb905f6312"
+checksum = "4046e43ba5435ecd4412ded9c0e44845f2e7bdd6a89d9e0fcd2b862edeb0324d"
 dependencies = [
  "deno_error",
  "num-bigint",
@@ -1595,6 +1738,15 @@ name = "static_assertions"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
+
+[[package]]
+name = "strck"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "42316e70da376f3d113a68d138a60d8a9883c604fe97942721ec2068dab13a9f"
+dependencies = [
+ "unicode-ident",
+]
 
 [[package]]
 name = "stringcase"
@@ -1685,6 +1837,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "temporal_rs"
+version = "0.0.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7807e330b12e288b847a3e2a2b0dcd41ca764d0f90f9e8940f02c6ddd68cd2d7"
+dependencies = [
+ "combine",
+ "core_maths",
+ "icu_calendar",
+ "icu_locale",
+ "ixdtf",
+ "jiff-tzdb",
+ "num-traits",
+ "timezone_provider",
+ "tinystr",
+ "tzif",
+ "writeable",
+]
+
+[[package]]
 name = "termcolor"
 version = "1.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1711,6 +1882,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "timezone_provider"
+version = "0.0.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f357f8e2cddee6a7b56b69fbb4cab30a7e82914c80ee7f9a5eb799ee3de3f24d"
+dependencies = [
+ "tinystr",
+ "zerotrie",
+ "zerovec",
 ]
 
 [[package]]
@@ -1773,6 +1955,15 @@ name = "typeid"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bc7d623258602320d5c55d1bc22793b57daff0ec7efc270ea7d55ce1d5f5471c"
+
+[[package]]
+name = "tzif"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e5e762ac355f0c204d09ae644b3d59423d5ddfc5603997d60c8c56f24e429a9d"
+dependencies = [
+ "combine",
+]
 
 [[package]]
 name = "unic-char-property"
@@ -1876,9 +2067,9 @@ dependencies = [
 
 [[package]]
 name = "v8"
-version = "137.3.0"
+version = "140.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "33995a1fee055ff743281cde33a41f0d618ee0bdbe8bdf6859e11864499c2595"
+checksum = "8827809a2884fb68530d678a8ef15b1ed1344bbf844879194d68c140c6f844f9"
 dependencies = [
  "bindgen",
  "bitflags",
@@ -1887,6 +2078,7 @@ dependencies = [
  "home",
  "miniz_oxide",
  "paste",
+ "ry_temporal_capi",
  "which 6.0.3",
 ]
 

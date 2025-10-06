@@ -102,7 +102,7 @@ impl ProxiedV8PsuedoPrimitive {
     }
 
     /// ProxiedV8PsuedoPrimitive -> V8
-    pub(crate) fn to_v8<'s>(self, scope: &mut v8::HandleScope<'s>, common_state: &CommonState, depth: usize) -> Result<v8::Local<'s, v8::Value>, Error> {
+    pub(crate) fn to_v8<'s>(self, scope: &mut v8::PinScope<'s, '_>, common_state: &CommonState, depth: usize) -> Result<v8::Local<'s, v8::Value>, Error> {
         match self {
             Self::Number(n) => {
                 let num = v8::Number::new(scope, n);
@@ -147,7 +147,7 @@ impl ProxiedV8PsuedoPrimitive {
 
     /// V8 -> ProxiedV8PsuedoPrimitive
     pub(crate) fn from_v8<'s>(
-        scope: &mut v8::HandleScope<'s>,
+        scope: &mut v8::PinScope<'s, '_>,
         value: v8::Local<'s, v8::Value>,
         common_state: &CommonState,
     ) -> Result<Option<Self>, Error> {

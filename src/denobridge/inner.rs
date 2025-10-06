@@ -89,7 +89,8 @@ impl V8IsolateManagerInner {
 
         let obj_template = Rc::new({
             let isolate = deno.v8_isolate();
-            let scope = &mut v8::HandleScope::new(isolate);
+            let scope = std::pin::pin!(v8::HandleScope::new(isolate));
+            let scope = &mut scope.init();
             let template = Self::create_obj_template(scope);
             v8::Global::new(scope, template)
         });
@@ -97,7 +98,8 @@ impl V8IsolateManagerInner {
         let bridge_vals = {
             let main_ctx = deno.main_context();
             let isolate = deno.v8_isolate();
-            let scope = &mut v8::HandleScope::new(isolate);
+            let scope = std::pin::pin!(v8::HandleScope::new(isolate));
+            let scope = &mut scope.init();
             let main_ctx = v8::Local::new(scope, main_ctx);
             let scope = &mut v8::ContextScope::new(scope, main_ctx);
             BridgeVals::new(scope)
@@ -126,7 +128,7 @@ impl V8IsolateManagerInner {
         }
     }
 
-    fn create_obj_template<'s>(scope: &mut v8::HandleScope<'s, ()>) -> v8::Local<'s, v8::ObjectTemplate> {
+    fn create_obj_template<'s>(scope: &mut v8::PinScope<'s, '_, ()>) -> v8::Local<'s, v8::ObjectTemplate> {
         let template = v8::ObjectTemplate::new(scope);
         
         template

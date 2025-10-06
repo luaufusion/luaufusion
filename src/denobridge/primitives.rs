@@ -79,7 +79,7 @@ impl ProxiedV8Primitive {
     }
 
     /// ProxiedV8Primitive -> V8
-    pub(crate) fn to_v8<'s>(self, scope: &mut v8::HandleScope<'s>) -> Result<v8::Local<'s, v8::Value>, Error> {
+    pub(crate) fn to_v8<'s>(self, scope: &mut v8::PinScope<'s, '_>,) -> Result<v8::Local<'s, v8::Value>, Error> {
         match self {
             ProxiedV8Primitive::Nil => Ok(v8::null(scope).into()),
             ProxiedV8Primitive::Undefined => Ok(v8::undefined(scope).into()),
@@ -87,14 +87,15 @@ impl ProxiedV8Primitive {
             ProxiedV8Primitive::Integer(i) => Ok(v8::Integer::new(scope, i).into()),
             ProxiedV8Primitive::BigInt(i) => Ok(v8::BigInt::new_from_i64(scope, i).into()),
             ProxiedV8Primitive::String(s) => {
-                let mut try_catch = v8::TryCatch::new(scope);
-                let s = v8::String::new(try_catch.as_mut(), &s);
+                let try_catch = std::pin::pin!(v8::TryCatch::new(scope));
+                let try_catch = &mut try_catch.init();
+                let s = v8::String::new(try_catch, &s);
                 match s {
                     Some(s) => Ok(s.into()),
                     None => {
                         if try_catch.has_caught() {
                             let exception = try_catch.exception().unwrap();
-                            let exception_str = exception.to_rust_string_lossy(try_catch.as_mut());
+                            let exception_str = exception.to_rust_string_lossy(try_catch);
                             return Err(format!("Failed to create V8 string from ProxiedV8Primitive: {}", exception_str).into());
                         } 
                         return Err("Failed to create V8 string from ProxiedV8Primitive".into());
@@ -106,7 +107,7 @@ impl ProxiedV8Primitive {
 
     /// V8 -> ProxiedV8Primitive
     pub(crate) fn from_v8<'s>(
-        scope: &mut v8::HandleScope<'s>,
+        scope: &mut v8::PinScope<'s, '_>,
         value: v8::Local<'s, v8::Value>,
     ) -> Result<Option<Self>, Error> {
         if value.is_null() {

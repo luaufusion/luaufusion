@@ -125,7 +125,7 @@ impl ProxiedV8Value {
 
     // Helper function to extract a SourceOwnedObject from a V8 object, if it is one
     fn proxy_source_owned_object_from_v8<'s>(
-        scope: &mut v8::HandleScope<'s>,
+        scope: &mut v8::PinScope<'s, '_>,
         common_state: &CommonState,
         obj: v8::Local<'s, v8::Object>,
     ) -> Result<Option<Self>, Error> {
@@ -166,7 +166,7 @@ impl ProxiedV8Value {
 
     /// Given a v8 value, convert it to a ProxiedV8Value
     pub(super) fn from_v8<'s>(
-        scope: &mut v8::HandleScope<'s>, 
+        scope: &mut v8::PinScope<'s, '_>,
         value: v8::Local<'s, v8::Value>,
         common_state: &CommonState,
     ) -> Result<Self, Error> {
@@ -209,7 +209,7 @@ impl ProxiedV8Value {
     /// Proxy a ProxiedV8Value to a V8 value
     pub(super) fn to_v8<'s>(
         self,
-        scope: &mut v8::HandleScope<'s>, 
+        scope: &mut v8::PinScope<'s, '_>,
         common_state: &CommonState,
         depth: usize,
     ) -> Result<v8::Local<'s, v8::Value>, Error> {
