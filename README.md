@@ -22,13 +22,13 @@ In the v8 bridge, these are represented as a ``ProxiedV8Primitive`` enum.
   - Number (floating point etc., reason: not hashable, numbers on luau+js side)
   - Vectors (which are vectors in luau and arrays of 3 numbers in js)
   - Byte sequences (which are strings with non-UTF8 characters in luau and Uint8Array's in js)
-  - Static Maps (which are maps containing only primitive keys but with arbitrary values, reason: not immutable or hashable, Maps on js side and *frozen* tables on luau side as normal tables will be treated as references)
+  - Static Lists (which are arrays containing arbitrary values, reason: not immutable or hashable, Arrays on js side and *frozen* tables with array metatable on luau side as normal tables will be treated as references)
+  - Static Maps (which are maps containing only primitive keys but with arbitrary values, reason: not immutable or hashable, Maps on js side and *frozen* tables without array metatable on luau side as normal tables will be treated as references)
 
 These are represented as a ``ProxiedV8PsuedoPrimitive`` enum in the v8 bridge.
 
 - **Object references** are references to objects that live in the other runtime. These include:
-  - Objects (js) / Luau tables (luau)
-  - Arrays (js)
+  - Objects (js) / Unfrozen Luau tables (luau)
   - Functions (js+luau)
   - ArrayBuffers / Buffers (js+luau)
   - JS Promises (js)
@@ -45,6 +45,28 @@ There are only 3 operations that can be performed across the bridge:
 
 Using these 3 operations, you can do anything you want across the bridge. For example, to set a property on an Luau table from JS, you could have the Luau layer pass a function to JS that takes a table, key and value as arguments and sets the property on the table. Then you can call that function from JS with the table reference, key and value as arguments.
 
-### Passing multiple values between runtimes
+### Pitfalls
 
-You can pass multiple values between runtimes using function arguments (via callback functions etc.). When passing function arguments to opcalls, the bridge will convert the arguments into a list of proxied values and send those all over.
+1. StaticLists (arrays) are snapshots of the data at the time of passing. If you modify the StaticList on either side, it will not be reflected on the other side. For example, if you send the array `[1,2,3]` from JS to Luau, then modify the array in JS to `[1,2,3,4]`, the Luau side will still see `{1,2,3}`.
+2. StaticMaps (maps) are also snapshots of the data at the time of passing. If you modify the StaticMap on either side, it will not be reflected on the other side. For example, if you send a map containing a=1, b=2 from JS to Luau, then modify the map in JS to a=1, b=2, c=3, the Luau side will still see `{a=1, b=2}`.
+
+If you want a mutable array or map, you will want to wrap the object in an object to make it a object reference. As an example:
+
+**Luau**
+
+```lua
+local myarr = table.freeze({1,2,3}) 
+setmetatable(myarr, array_metatable) -- Make it a StaticList
+local obj = { arr = myarr } -- Wrap in an object to make it a reference
+myjsfunc:call(obj) -- Pass the object reference to JS
+```
+
+**JS**
+
+```js
+let map = new Map();
+map.set("a", 1);
+map.set("b", 2);
+let obj = { map: map }; // Wrap in an object to make it a reference
+return obj // Assuming this is a js function called from Luau, return the object reference to Luau
+```

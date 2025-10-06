@@ -12,7 +12,6 @@ pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
 pub fn luau_value_to_obj_registry_type(val: &mluau::Value) -> Option<ObjectRegistryType> {
     match val {
-        mluau::Value::String(_) => Some(ObjectRegistryType::String),
         mluau::Value::Table(_) => Some(ObjectRegistryType::Table),
         mluau::Value::Function(_) => Some(ObjectRegistryType::Function),
         mluau::Value::UserData(_) => Some(ObjectRegistryType::UserData),
@@ -24,23 +23,21 @@ pub fn luau_value_to_obj_registry_type(val: &mluau::Value) -> Option<ObjectRegis
 
 pub fn obj_registry_type_to_i32(typ: ObjectRegistryType) -> i32 {
     match typ {
-        ObjectRegistryType::String => 0,
-        ObjectRegistryType::Table => 1,
-        ObjectRegistryType::Function => 2,
-        ObjectRegistryType::UserData => 3,
-        ObjectRegistryType::Buffer => 4,
-        ObjectRegistryType::Thread => 5,
+        ObjectRegistryType::Table => 0,
+        ObjectRegistryType::Function => 1,
+        ObjectRegistryType::UserData => 2,
+        ObjectRegistryType::Buffer => 3,
+        ObjectRegistryType::Thread => 4,
     }
 }
 
 pub fn i32_to_obj_registry_type(val: i32) -> Option<ObjectRegistryType> {
     match val {
-        0 => Some(ObjectRegistryType::String),
-        1 => Some(ObjectRegistryType::Table),
-        2 => Some(ObjectRegistryType::Function),
-        3 => Some(ObjectRegistryType::UserData),
-        4 => Some(ObjectRegistryType::Buffer),
-        5 => Some(ObjectRegistryType::Thread),
+        0 => Some(ObjectRegistryType::Table),
+        1 => Some(ObjectRegistryType::Function),
+        2 => Some(ObjectRegistryType::UserData),
+        3 => Some(ObjectRegistryType::Buffer),
+        4 => Some(ObjectRegistryType::Thread),
         _ => None,
     }
 }
@@ -68,7 +65,6 @@ impl ProxyLuaClient {
 
 #[derive(Clone, Copy, Serialize, Deserialize)]
 pub enum ObjectRegistryType {
-    String,
     Table,
     Function,
     UserData,

@@ -194,9 +194,7 @@ impl ProxiedV8Value {
             return Ok(Self::Psuedoprimitive(psuedo));
         }
 
-        let typ = if value.is_array() {
-            V8ObjectRegistryType::Array
-        } else if value.is_array_buffer() {
+        let typ = if value.is_array_buffer() {
             V8ObjectRegistryType::ArrayBuffer
         } else if value.is_function() {
             V8ObjectRegistryType::Function

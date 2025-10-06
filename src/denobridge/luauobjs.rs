@@ -32,8 +32,6 @@ impl V8Value {
         match self.typ {
             V8ObjectRegistryType::Function => "V8Function",
             V8ObjectRegistryType::Object => "V8Object",
-            V8ObjectRegistryType::Array => "V8Array",
-            V8ObjectRegistryType::String => "V8String",
             V8ObjectRegistryType::ArrayBuffer => "V8ArrayBuffer",
             V8ObjectRegistryType::Promise => "V8Promise",
         }

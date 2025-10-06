@@ -107,9 +107,7 @@ impl BridgeVals {
 #[derive(Clone, Copy, Serialize, Deserialize)]
 pub enum V8ObjectRegistryType {
     ArrayBuffer,
-    String,
     Object,
-    Array,
     Function,
     Promise,
 }
@@ -117,11 +115,9 @@ pub enum V8ObjectRegistryType {
 pub fn v8_obj_registry_type_to_i32(typ: V8ObjectRegistryType) -> i32 {
     match typ {
         V8ObjectRegistryType::ArrayBuffer => 0,
-        V8ObjectRegistryType::String => 1,
-        V8ObjectRegistryType::Object => 2,
-        V8ObjectRegistryType::Array => 3,
-        V8ObjectRegistryType::Function => 4,
-        V8ObjectRegistryType::Promise => 5,
+        V8ObjectRegistryType::Object => 1,
+        V8ObjectRegistryType::Function => 2,
+        V8ObjectRegistryType::Promise => 3,
     }
 }
 
@@ -129,9 +125,7 @@ pub fn v8_obj_registry_type_to_i32(typ: V8ObjectRegistryType) -> i32 {
 pub fn i32_to_v8_obj_registry_type(i: i32) -> Option<V8ObjectRegistryType> {
     match i {
         0 => Some(V8ObjectRegistryType::ArrayBuffer),
-        1 => Some(V8ObjectRegistryType::String),
         2 => Some(V8ObjectRegistryType::Object),
-        3 => Some(V8ObjectRegistryType::Array),
         4 => Some(V8ObjectRegistryType::Function),
         5 => Some(V8ObjectRegistryType::Promise),
         _ => None,

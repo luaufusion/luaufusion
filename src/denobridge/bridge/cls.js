@@ -17,12 +17,11 @@ const opCalls = {
 
 // Enum for object registry types
 const objRegistryType = {
-    String: 0,
-    Table: 1,
-    Function: 2,
-    UserData: 3,
-    Buffer: 4,
-    Thread: 5
+    Table: 0,
+    Function: 1,
+    UserData: 2,
+    Buffer: 3,
+    Thread: 4
 }
 Object.freeze(objRegistryType);
 const objRegistryTypeNames = {};
