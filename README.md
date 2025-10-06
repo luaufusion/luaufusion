@@ -45,6 +45,29 @@ There are only 3 operations that can be performed across the bridge:
 
 Using these 3 operations, you can do anything you want across the bridge. For example, to set a property on an Luau table from JS, you could have the Luau layer pass a function to JS that takes a table, key and value as arguments and sets the property on the table. Then you can call that function from JS with the table reference, key and value as arguments.
 
+### Value Conversion Table
+
+Note: unless explicitly stated, all type conversions are lossless and bidirectional.
+
+| Luau Type                            | JS Type                | Type      |
+|--------------------------------------|------------------------|-----------|
+| nil                                  | undefined              | Primitive |
+| null (``v8:null()``)                 | null                   | Primitive |
+| boolean                              | boolean                | Primitive |
+| integer (i32)                        | integer (i32)          | Primitive |
+| integer (i64)                        | bigint (i64)           | Primitive |
+| string (UTF-8)                       | string (UTF-8)         | Primitive |
+| number (non-integer)                 | number (f64)           | Psuedoprimitive |
+| vector                               | array of 3 numbers     | Psuedoprimitive |
+| byte sequence                        | Uint8Array             | Psuedoprimitive |
+| table w/ array_metatable             | Array                  | Psuedoprimitive |
+| table w/ map_metatable               | Map                    | Psuedoprimitive |
+| userdata (``V8Value``)               | <underlying js value>  | Reference  |
+| object with luaid/luatype symbols    | <underlying lua value> | Reference  |
+| embedded json* (``EmbeddableJson``)  | <json value>           | Psuedoprimitive/Primitive (depending on JSON) [1] |
+
+[1] Note that embedded json is not a bidirectional conversion. Returning the Map from JS to Luau will result in a StaticMap, not a ``EmbeddableJson`` and may even fail if the JSON is too large to be sent outside of embedded json's.
+
 ### Pitfalls
 
 1. StaticLists (arrays) are snapshots of the data at the time of passing. If you modify the StaticList on either side, it will not be reflected on the other side. For example, if you send the array `[1,2,3]` from JS to Luau, then modify the array in JS to `[1,2,3,4]`, the Luau side will still see `{1,2,3}`.

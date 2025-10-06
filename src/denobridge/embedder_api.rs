@@ -34,7 +34,7 @@ pub fn json_to_proxied_v8(value: JsonValue, check_chars_limit: bool, depth: usiz
     }
 
     match value {
-        JsonValue::Null => Ok(ProxiedV8Value::Primitive(ProxiedV8Primitive::Nil)),
+        JsonValue::Null => Ok(ProxiedV8Value::Primitive(ProxiedV8Primitive::Null)),
         JsonValue::Bool(b) => Ok(ProxiedV8Value::Primitive(ProxiedV8Primitive::Boolean(b))),
         JsonValue::Array(a) => {
             let mut parray = Vec::with_capacity(a.len());

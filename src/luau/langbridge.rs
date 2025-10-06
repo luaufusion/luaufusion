@@ -56,6 +56,10 @@ impl<T: ProxyBridge> mluau::UserData for LangBridge<T> {
         methods.add_method("map_metatable", |_, this, ()| {
             Ok(this.plc.map_mt.clone())
         });
+        // For convenience, expose null
+        methods.add_method("null", |_, _, ()| {
+            Ok(mluau::Value::NULL)
+        });
 
         methods.add_scheduler_async_method("run", async move |lua, this, modname: String| {
             let result = this.bridge.eval_from_source(modname).await

@@ -11,7 +11,7 @@ use deno_core::v8;
 /// 
 /// Only primitives can be used with object.getProperty etc.
 pub enum ProxiedV8Primitive {
-    Nil,
+    Null,
     Undefined,
     Boolean(bool),
     Integer(i32),
@@ -32,8 +32,12 @@ impl ProxiedV8Primitive {
 
     /// Luau -> ProxiedV8Primitive
     pub(crate) fn from_luau(value: &mluau::Value) -> Result<Option<Self>, Error> {
+        if value.is_null() {
+            return Ok(Some(ProxiedV8Primitive::Null));
+        }
+
         match value {
-            mluau::Value::Nil => Ok(Some(ProxiedV8Primitive::Nil)),
+            mluau::Value::Nil => Ok(Some(ProxiedV8Primitive::Undefined)),
             mluau::Value::Boolean(b) => Ok(Some(ProxiedV8Primitive::Boolean(*b))),
             mluau::Value::LightUserData(s) => Ok(Some(ProxiedV8Primitive::BigInt(s.0 as i64))),
             mluau::Value::Integer(i) => {
@@ -65,11 +69,11 @@ impl ProxiedV8Primitive {
     /// ProxiedV8Primitive -> Luau
     pub(crate) fn to_luau(self, lua: &mluau::Lua) -> Result<mluau::Value, Error> {
         match self {
-            ProxiedV8Primitive::Nil => Ok(mluau::Value::Nil),
+            ProxiedV8Primitive::Undefined => Ok(mluau::Value::Nil),
+            ProxiedV8Primitive::Null => Ok(mluau::Value::NULL),
             ProxiedV8Primitive::Boolean(b) => Ok(mluau::Value::Boolean(b)),
             ProxiedV8Primitive::Integer(i) => Ok(mluau::Value::Integer(i as i64)),
             ProxiedV8Primitive::BigInt(i) => Ok(mluau::Value::Integer(i)),
-            ProxiedV8Primitive::Undefined => Ok(mluau::Value::Nil), // Luau does not have undefined, so we map it to nil
             ProxiedV8Primitive::String(s) => {
                 let s = lua.create_string(s)
                 .map_err(|e| format!("Failed to create Lua string: {}", e))?;
@@ -81,7 +85,7 @@ impl ProxiedV8Primitive {
     /// ProxiedV8Primitive -> V8
     pub(crate) fn to_v8<'s>(self, scope: &mut v8::PinScope<'s, '_>,) -> Result<v8::Local<'s, v8::Value>, Error> {
         match self {
-            ProxiedV8Primitive::Nil => Ok(v8::null(scope).into()),
+            ProxiedV8Primitive::Null => Ok(v8::null(scope).into()),
             ProxiedV8Primitive::Undefined => Ok(v8::undefined(scope).into()),
             ProxiedV8Primitive::Boolean(b) => Ok(v8::Boolean::new(scope, b).into()),
             ProxiedV8Primitive::Integer(i) => Ok(v8::Integer::new(scope, i).into()),
@@ -111,7 +115,7 @@ impl ProxiedV8Primitive {
         value: v8::Local<'s, v8::Value>,
     ) -> Result<Option<Self>, Error> {
         if value.is_null() {
-            return Ok(Some(ProxiedV8Primitive::Nil));
+            return Ok(Some(ProxiedV8Primitive::Null));
         }
         if value.is_undefined() {
             return Ok(Some(ProxiedV8Primitive::Undefined));

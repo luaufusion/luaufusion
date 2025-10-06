@@ -156,7 +156,7 @@ export function testEmbedderJson(evj) {
             vfs
         ).await.expect("Failed to create Lua-V8 bridge");
 
-        let test_embedder_json = r#"{"embeddedJson":"embedded22","mynestedMap":{"a":{"b":123}}}"#;
+        let test_embedder_json = r#"{"embeddedJson":"embedded22","mynestedMap":{"a":{"b":123,"c":null}}}"#;
         let ev = mluau_quickjs_proxy::luau::embedder_api::EmbeddableJson::new_raw(
             serde_json::value::RawValue::from_string(test_embedder_json.to_string()).expect("Failed to convert"), 
             true
@@ -194,7 +194,8 @@ local smap = setmetatable({
     abc = 123,
     luau = "is great",
     meow = setmetatable({ nested = "object" }, v8:map_metatable()),
-    myarr = setmetatable({'a','b','c'}, v8:array_metatable())
+    myarr = setmetatable({'a','b','c'}, v8:array_metatable()),
+    null = v8:null(),
 }, v8:map_metatable())
 
 local smap = staticmaptest:call(smap)
