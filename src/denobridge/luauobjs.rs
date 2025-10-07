@@ -4,7 +4,7 @@ use super::bridge::{
     V8ObjectRegistryType, V8IsolateManagerServer, v8_obj_registry_type_to_i32,
 };
 use crate::base::Error;
-use crate::denobridge::bridge::{MAX_FUNCTION_ARGS, V8ObjectOp};
+use crate::denobridge::bridge::V8ObjectOp;
 use crate::denobridge::objreg::V8ObjectRegistryID;
 use crate::denobridge::value::ProxiedV8Value;
 use crate::luau::bridge::ProxyLuaClient;
@@ -39,7 +39,7 @@ impl V8Value {
 
     /// Do a op call with a single primitive argument (optimized)
     async fn op_call_primitive(&self, lua: &mluau::Lua, obj_id: V8ObjectRegistryID, op: V8ObjectOp, args: mluau::Value) -> Result<mluau::MultiValue, Error> {
-        let arg = ProxiedV8Primitive::from_luau(&args)
+        let arg = ProxiedV8Primitive::from_luau(&args, &self.plc)
         .map_err(|e| format!("Failed to proxy argument to ProxiedV8Value: {}", e))?
         .ok_or(format!("Argument is not a primitive value"))?;
         
@@ -65,20 +65,16 @@ impl V8Value {
 
     /// Do a op call with multiple arguments
     async fn op_call(&self, obj_id: V8ObjectRegistryID, op: V8ObjectOp, args: mluau::MultiValue) -> Result<mluau::MultiValue, Error> {
-        if args.len() > MAX_FUNCTION_ARGS as usize {
-            return Err(format!("Too many function arguments passed to V8Object op call (max {})", MAX_FUNCTION_ARGS).into());
-        }
-        let mut string_char_count = 0;
+        self.plc.ed.check_function_args_len(args.len())?;
+        
         let mut args_proxied = Vec::with_capacity(args.len());
         for arg in args {
             let proxied = ProxiedV8Value::from_luau(&self.plc, arg, 0)
             .map_err(|e| format!("Failed to proxy argument to ProxiedV8Value: {}", e))?;
             let sz = proxied.effective_size(0);
             if sz > 0 {
-                string_char_count += sz;
-                if string_char_count > super::bridge::MAX_OWNED_V8_STRING_SIZE {
-                    return Err(format!("Too many string characters passed to V8Object op call (max {})", super::bridge::MAX_OWNED_V8_STRING_SIZE).into());
-                }
+                self.plc.ed.check_constructed_value_len(sz, "ProxiedV8Value from_luau")
+                .map_err(|e| format!("Argument: {}", e))?;
             }
             args_proxied.push(proxied);
         }

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::{base::ProxyBridge, luau::bridge::ProxyLuaClient};
+use crate::{base::ProxyBridge, luau::{bridge::ProxyLuaClient, embedder_api::EmbedderData}};
 use concurrentlyexec::{ConcurrentExecutorState, ProcessOpts};
 use mlua_scheduler::LuaSchedulerAsyncUserData;
 
@@ -22,16 +22,16 @@ impl<T: ProxyBridge> LangBridge<T> {
 
     pub async fn new_from_bridge(
         lua: &mluau::Lua,
-        heap_limit: usize,
+        ed: EmbedderData,
         process_opts: ProcessOpts,
         cs_state: ConcurrentExecutorState<T::ConcurrentlyExecuteClient>,
         vfs: HashMap<String, String>,
     ) -> Result<Self, crate::base::Error> {
-        let plc = ProxyLuaClient::new(lua)
+        let plc = ProxyLuaClient::new(lua, ed.clone())
             .map_err(|e| format!("Failed to create ProxyLuaClient: {}", e))?;
         let bridge_vals = T::new(
             cs_state,
-            heap_limit, // No heap limit
+            ed.clone(), // No heap limit
             process_opts,
             plc.clone(),
             vfs
@@ -39,7 +39,7 @@ impl<T: ProxyBridge> LangBridge<T> {
 
         Ok(Self {
             bridge: bridge_vals,
-            plc
+            plc,
         })
     }
 }

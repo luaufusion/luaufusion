@@ -5,6 +5,7 @@ use mlua_scheduler::{taskmgr::NoopHooks, LuaSchedulerAsync, XRc};
 use mluau::IntoLua;
 use mluau_quickjs_proxy::base::ProxyBridge;
 use mluau_quickjs_proxy::denobridge::V8IsolateManagerServer;
+use mluau_quickjs_proxy::luau::embedder_api::EmbedderData;
 use mluau_quickjs_proxy::luau::langbridge::LangBridge;
 
 const HEAP_LIMIT: usize = 10 * 1024 * 1024; // 10 MB
@@ -145,7 +146,10 @@ export function testEmbedderJson(evj) {
 
         let bridge = LangBridge::<V8IsolateManagerServer>::new_from_bridge(
             &lua, 
-            HEAP_LIMIT,
+            EmbedderData {
+                heap_limit: HEAP_LIMIT,
+                ..Default::default()
+            },
             ProcessOpts {
                 debug_print: false,
                 start_timeout: std::time::Duration::from_secs(10),
@@ -153,13 +157,12 @@ export function testEmbedderJson(evj) {
                 cmd_envs: vec![],
             },
             ConcurrentExecutorState::new(1),
-            vfs
+            vfs,
         ).await.expect("Failed to create Lua-V8 bridge");
 
         let test_embedder_json = r#"{"embeddedJson":"embedded22","mynestedMap":{"a":{"b":123,"c":null}}}"#;
-        let ev = mluau_quickjs_proxy::luau::embedder_api::EmbeddableJson::new_raw(
+        let ev = mluau_quickjs_proxy::luau::embedder_api::LangTransferValue::new_raw(
             serde_json::value::RawValue::from_string(test_embedder_json.to_string()).expect("Failed to convert"), 
-            true
         );
 
         // Call the v8 function now as a async script

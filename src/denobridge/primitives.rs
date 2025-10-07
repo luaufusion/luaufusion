@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use crate::{base::Error, denobridge::bridge::MAX_OWNED_V8_STRING_SIZE};
+use crate::{base::Error, luau::{bridge::ProxyLuaClient, embedder_api::EmbedderData}};
 use deno_core::v8;
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, Hash, Clone, Debug)]
@@ -31,7 +31,7 @@ impl ProxiedV8Primitive {
     }
 
     /// Luau -> ProxiedV8Primitive
-    pub(crate) fn from_luau(value: &mluau::Value) -> Result<Option<Self>, Error> {
+    pub(crate) fn from_luau(value: &mluau::Value, plc: &ProxyLuaClient) -> Result<Option<Self>, Error> {
         if value.is_null() {
             return Ok(Some(ProxiedV8Primitive::Null));
         }
@@ -48,9 +48,7 @@ impl ProxiedV8Primitive {
                 }
             },
             mluau::Value::String(s) => {
-                if s.as_bytes().len() > MAX_OWNED_V8_STRING_SIZE {
-                    return Err(format!("String too large to be a primitive (max {} bytes)", MAX_OWNED_V8_STRING_SIZE).into());
-                }
+                plc.ed.check_value_len(s.as_bytes().len(), "ProxiedV8Primitive -> LuaString")?;
 
                 if let Ok(s) = s.to_str() {
                     return Ok(Some(ProxiedV8Primitive::String(s.to_string())));
@@ -83,7 +81,7 @@ impl ProxiedV8Primitive {
     }
 
     /// ProxiedV8Primitive -> V8
-    pub(crate) fn to_v8<'s>(self, scope: &mut v8::PinScope<'s, '_>,) -> Result<v8::Local<'s, v8::Value>, Error> {
+    pub(crate) fn to_v8<'s>(self, scope: &mut v8::PinScope<'s, '_>) -> Result<v8::Local<'s, v8::Value>, Error> {
         match self {
             ProxiedV8Primitive::Null => Ok(v8::null(scope).into()),
             ProxiedV8Primitive::Undefined => Ok(v8::undefined(scope).into()),
@@ -113,6 +111,7 @@ impl ProxiedV8Primitive {
     pub(crate) fn from_v8<'s>(
         scope: &mut v8::PinScope<'s, '_>,
         value: v8::Local<'s, v8::Value>,
+        ed: &EmbedderData,
     ) -> Result<Option<Self>, Error> {
         if value.is_null() {
             return Ok(Some(ProxiedV8Primitive::Null));
@@ -145,9 +144,7 @@ impl ProxiedV8Primitive {
         if value.is_string() {
             let s = value.to_string(scope).ok_or("Failed to convert to string")?;
             let s_len = s.length();
-            if s_len > MAX_OWNED_V8_STRING_SIZE {
-                return Err(format!("String too large to be a primitive (max {} bytes)", MAX_OWNED_V8_STRING_SIZE).into());
-            }
+            ed.check_value_len(s_len, "ProxiedV8Primitive -> V8String")?;
             let string = s.to_rust_string_lossy(scope);
             return Ok(Some(Self::String(string)));
         }

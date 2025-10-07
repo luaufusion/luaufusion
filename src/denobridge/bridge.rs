@@ -22,14 +22,11 @@ use crate::luau::bridge::{
 };
 
 use crate::base::{ProxyBridge, Error};
+use crate::luau::embedder_api::EmbedderData;
 use super::inner::V8IsolateManagerInner;
 
-/// Max size for a owned v8 string
-pub const MAX_OWNED_V8_STRING_SIZE: usize = 1024 * 16; // 16KB
 /// Minimum heap size for V8 isolates
 pub const MIN_HEAP_LIMIT: usize = 10 * 1024 * 1024; // 10MB
-/// Maximum number of elements in a staticlist
-pub const MAX_FUNCTION_ARGS: u32 = 32;
 
 pub(crate) struct BridgeVals {
     // obj registry fields (addV8Object, getV8Object and removeV8Object)
@@ -313,7 +310,7 @@ pub struct V8IsolateManagerClient {}
 
 #[derive(Serialize, Deserialize)]
 pub struct V8BootstrapData {
-    heap_limit: usize,
+    ed: EmbedderData,
     messenger_tx: OneshotSender<MultiSender<V8IsolateManagerMessage>>,
     lua_bridge_tx: MultiSender<LuaBridgeMessage<V8IsolateManagerServer>>,
     vfs: HashMap<String, String>,
@@ -330,7 +327,7 @@ impl ConcurrentlyExecute for V8IsolateManagerClient {
 
         let mut inner = V8IsolateManagerInner::new(
             LuaBridgeServiceClient::new(client_ctx.clone(), data.lua_bridge_tx),
-            data.heap_limit,
+            data.ed,
             FusionModuleLoader::new(data.vfs.into_iter().map(|(x, y)| (x, y.into())))
         );
 
@@ -528,7 +525,7 @@ impl V8IsolateManagerServer {
     /// Create a new V8 isolate manager server
     async fn new(
         cs_state: ConcurrentExecutorState<V8IsolateManagerClient>, 
-        heap_limit: usize, 
+        ed: EmbedderData, 
         process_opts: ProcessOpts,
         plc: ProxyLuaClient,
         vfs: HashMap<String, String>,
@@ -540,7 +537,7 @@ impl V8IsolateManagerServer {
                 let (tx, rx) = cei.create_multi();
                 let (msg_tx, msg_rx) = cei.create_oneshot();
                 (V8BootstrapData {
-                    heap_limit,
+                    ed,
                     messenger_tx: msg_tx,
                     lua_bridge_tx: tx,
                     vfs
@@ -587,12 +584,12 @@ impl ProxyBridge for V8IsolateManagerServer {
 
     async fn new(
         cs_state: ConcurrentExecutorState<Self::ConcurrentlyExecuteClient>, 
-        heap_limit: usize, 
+        ed: EmbedderData,
         process_opts: ProcessOpts,
         plc: ProxyLuaClient,
         vfs: HashMap<String, String>,
     ) -> Result<Self, crate::base::Error> {
-        Self::new(cs_state, heap_limit, process_opts, plc, vfs).await        
+        Self::new(cs_state, ed, process_opts, plc, vfs).await        
     }
 
     fn get_executor(&self) -> Arc<ConcurrentExecutor<Self::ConcurrentlyExecuteClient>> {

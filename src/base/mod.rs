@@ -3,11 +3,7 @@ use std::{collections::HashMap, sync::Arc};
 use concurrentlyexec::{ConcurrentExecutor, ConcurrentExecutorState, ConcurrentlyExecute, ProcessOpts};
 use serde::{Deserialize, Serialize};
 
-use crate::luau::bridge::ProxyLuaClient;
-
-pub const MAX_INTERN_SIZE: usize = 1024 * 512; // 512 KB
-pub const MAX_OBJECT_REGISTRY_SIZE: usize = 2048; // 2048 objects
-pub const MAX_BUFFER_SIZE: usize = 4096; // For now, 4096 bytes max buffer size
+use crate::luau::{bridge::ProxyLuaClient, embedder_api::EmbedderData};
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
@@ -20,7 +16,7 @@ pub trait ProxyBridge: Clone + 'static {
 
     async fn new(
         cs_state: ConcurrentExecutorState<Self::ConcurrentlyExecuteClient>, 
-        heap_limit: usize, 
+        ed: EmbedderData, 
         process_opts: ProcessOpts,
         plc: ProxyLuaClient,
         vfs: HashMap<String, String>,

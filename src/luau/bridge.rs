@@ -1,4 +1,4 @@
-use crate::{base::ProxyBridge, luau::objreg::{LuauObjectRegistryID, ObjRegistryLuau}};
+use crate::{base::ProxyBridge, luau::{embedder_api::EmbedderData, objreg::{LuauObjectRegistryID, ObjRegistryLuau}}};
 use concurrentlyexec::{ClientContext, MultiReceiver, MultiSender, OneshotSender};
 use mluau::{LuaSerdeExt, ObjectLike};
 use serde::{Deserialize, Serialize};
@@ -48,11 +48,12 @@ pub struct ProxyLuaClient {
     pub(crate) array_mt: mluau::Table,
     pub(crate) map_mt: mluau::Table,
     pub(crate) obj_registry: ObjRegistryLuau,
+    pub(crate) ed: EmbedderData,
 }
 
 impl ProxyLuaClient {
     /// Creates a new proxy Lua client
-    pub fn new(lua: &mluau::Lua) -> Result<Self, mluau::Error> {
+    pub fn new(lua: &mluau::Lua, ed: EmbedderData) -> Result<Self, mluau::Error> {
         let map_mt = lua.create_table()?;
         map_mt.set("__metatable", false)?;
         Ok(Self {
@@ -60,6 +61,7 @@ impl ProxyLuaClient {
             array_mt: lua.array_metatable(),
             map_mt,
             obj_registry: ObjRegistryLuau::new(lua)?,
+            ed
         })
     }
 }

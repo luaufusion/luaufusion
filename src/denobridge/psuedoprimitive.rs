@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use deno_core::v8;
 use serde::{Deserialize, Serialize};
-use crate::{MAX_PROXY_DEPTH, base::Error, denobridge::{V8IsolateManagerServer, bridge::MAX_OWNED_V8_STRING_SIZE, inner::CommonState, primitives::ProxiedV8Primitive, value::ProxiedV8Value}, luau::bridge::ProxyLuaClient};
+use crate::{MAX_PROXY_DEPTH, base::Error, denobridge::{V8IsolateManagerServer, inner::CommonState, primitives::ProxiedV8Primitive, value::ProxiedV8Value}, luau::bridge::ProxyLuaClient};
 
 #[derive(Serialize, Deserialize)]
 /// A psuedoprimitive is a type that is not fully primitive (not immutable/hashable in both v8 and luau) but is copied between v8 and luau
@@ -55,10 +55,7 @@ impl ProxiedV8PsuedoPrimitive {
                 Ok(Some(Self::Vector((v.x(), v.y(), v.z()))))
             },
             mluau::Value::String(s) => {
-                if s.as_bytes().len() > MAX_OWNED_V8_STRING_SIZE {
-                    return Err(format!("String too large to be a primitive (max {} bytes)", MAX_OWNED_V8_STRING_SIZE).into());
-                }
-
+                plc.ed.check_value_len(s.as_bytes().len(), "ProxiedV8PsuedoPrimitive -> LuaString")?;
                 Ok(Some(Self::StringBytes(serde_bytes::ByteBuf::from(s.as_bytes().to_vec()))))
             },
             mluau::Value::Table(t) => {
@@ -68,6 +65,7 @@ impl ProxiedV8PsuedoPrimitive {
                     t.for_each(|_: mluau::Value, v| {
                         let v = ProxiedV8Value::from_luau(plc, v, depth+1)
                             .map_err(|e| mluau::Error::external(e.to_string()))?;
+
                         list.push(v);
                         Ok(())
                     })
@@ -77,15 +75,16 @@ impl ProxiedV8PsuedoPrimitive {
                 } else if mt == Some(plc.map_mt.clone()) {
                     let mut smap = HashMap::new();
                     t.for_each(|k, v| {
-                        let k = ProxiedV8Primitive::from_luau(&k)
+                        let k = ProxiedV8Primitive::from_luau(&k, plc)
                             .map_err(|e| mluau::Error::external(e.to_string()))?;
+                        let Some(k) = k else {
+                            return Err(mluau::Error::external("Table key is not a ProxiedV8Primitive"));
+                        };
+                        
                         let v = ProxiedV8Value::from_luau(plc, v, depth + 1)
                             .map_err(|e| mluau::Error::external(e.to_string()))?;
-                        if let Some(k) = k {
-                            smap.insert(k, v);
-                        } else {
-                            return Err(mluau::Error::external("Table key is not a ProxiedV8Primitive"));
-                        }
+                        
+                        smap.insert(k, v);
                         Ok(())
                     })
                     .map_err(|e| format!("Failed to iterate over table: {}", e))?;
@@ -108,6 +107,7 @@ impl ProxiedV8PsuedoPrimitive {
                 Ok(mluau::Value::Vector(vec))
             },
             Self::StringBytes(s) => {
+                plc.ed.check_value_len(s.len(), "ProxiedV8Primitive -> StringBytes")?;
                 let s = lua.create_string(s)
                 .map_err(|e| format!("Failed to create Lua string: {}", e))?;
                 Ok(mluau::Value::String(s))
@@ -159,9 +159,7 @@ impl ProxiedV8PsuedoPrimitive {
             },
             Self::StringBytes(b) => {
                 // Proxy as a Uint8Array to v8
-                if b.len() > MAX_OWNED_V8_STRING_SIZE {
-                    return Err(format!("[to_v8] Byte sequence too large to be a primitive (max {} bytes)", MAX_OWNED_V8_STRING_SIZE).into());
-                }
+                common_state.ed.check_value_len(b.len(), "ProxiedV8Primitive -> StringBytes")?;
 
                 let bs = v8::ArrayBuffer::new_backing_store_from_bytes(b.into_vec());
                 let array_buffer = v8::ArrayBuffer::with_backing_store(scope, &bs.make_shared());
@@ -215,9 +213,8 @@ impl ProxiedV8PsuedoPrimitive {
             let uint8_array = v8::Local::<v8::Uint8Array>::try_from(value)
                 .map_err(|_| "Failed to convert V8 value to Uint8Array")?;
             let length = uint8_array.byte_length();
-            if length > MAX_OWNED_V8_STRING_SIZE {
-                return Err(format!("Uint8Array too large to be a primitive (max {} bytes)", MAX_OWNED_V8_STRING_SIZE).into());
-            }
+            common_state.ed.check_value_len(length, "ProxiedV8Primitive -> V8Uint8Array")?;
+
             let mut buf = vec![0u8; length as usize];
             uint8_array.copy_contents(&mut buf);
             return Ok(Some(Self::StringBytes(serde_bytes::ByteBuf::from(buf))));
@@ -226,6 +223,8 @@ impl ProxiedV8PsuedoPrimitive {
         if value.is_array() {
             let array = v8::Local::<v8::Array>::try_from(value)
                 .map_err(|_| "Failed to convert V8 value to Array")?;
+            common_state.ed.check_value_len(array.length() as usize, "ProxiedV8Primitive -> V8Array")?;
+
             if array.length() == 3 {
                 let x = array.get_index(scope, 0).ok_or("Failed to get index 0 of array")?;
                 let y = array.get_index(scope, 1).ok_or("Failed to get index 1 of array")?;
@@ -239,14 +238,9 @@ impl ProxiedV8PsuedoPrimitive {
             }
 
             let mut list = Vec::new();
-            let mut num_string_chars = 0;
             for i in 0..array.length() {
                 let v = array.get_index(scope, i).ok_or("Failed to get index of array")?;
                 let v = ProxiedV8Value::from_v8(scope, v, common_state, depth+1)?;
-                num_string_chars += v.effective_size(0);
-                if num_string_chars > MAX_OWNED_V8_STRING_SIZE {
-                    return Err(format!("Too many string characters in array when converting to psuedoprimitive (max {} bytes)", MAX_OWNED_V8_STRING_SIZE).into());
-                }
                 list.push(v);
             }
             return Ok(Some(Self::StaticList(list)));
@@ -258,20 +252,14 @@ impl ProxiedV8PsuedoPrimitive {
             let mut smap = HashMap::new();
             let entries = map.as_array(scope);
             let length = entries.length();
-            let mut num_string_chars = 0;
+            common_state.ed.check_value_len(length as usize, "ProxiedV8Primitive -> V8Map")?;
+
             for i in (0..length).step_by(2) {
                 let key = entries.get_index(scope, i).ok_or("Failed to get index of map entries")?;
                 let value = entries.get_index(scope, i + 1).ok_or("Failed to get value of map entries")?;
-                let k = ProxiedV8Primitive::from_v8(scope, key)?.ok_or("Map key is not a ProxiedV8Primitive")?;
-                num_string_chars += k.effective_size(); // Check key size first
-                if num_string_chars > MAX_OWNED_V8_STRING_SIZE {
-                    return Err(format!("Too many string characters in map keys when converting to psuedoprimitive (max {} bytes)", MAX_OWNED_V8_STRING_SIZE).into());
-                }
+                let k = ProxiedV8Primitive::from_v8(scope, key, &common_state.ed)?.ok_or("Map key is not a ProxiedV8Primitive")?;
                 let v = ProxiedV8Value::from_v8(scope, value, common_state, depth+1)?;
-                num_string_chars += v.effective_size(0); // Then check value size
-                if num_string_chars > MAX_OWNED_V8_STRING_SIZE {
-                    return Err(format!("Too many string characters in map when converting to psuedoprimitive (max {} bytes)", MAX_OWNED_V8_STRING_SIZE).into());
-                }
+
                 smap.insert(k, v);
             }
             return Ok(Some(Self::StaticMap(smap)));

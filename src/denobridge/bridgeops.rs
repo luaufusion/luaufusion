@@ -3,7 +3,6 @@ use std::rc::Rc;
 
 use deno_core::{op2, v8, OpState};
 
-use crate::denobridge::bridge::{MAX_FUNCTION_ARGS, MAX_OWNED_V8_STRING_SIZE};
 use crate::luau::bridge::LuauObjectOp;
 use crate::luau::objreg::LuauObjectRegistryID;
 use super::value::ProxiedV8Value;
@@ -16,23 +15,17 @@ pub(super) fn __luabind(
     scope: &mut v8::PinScope,
     args: v8::Local<v8::Array>,
 ) -> Result<i32, deno_error::JsErrorBox> {
-    if args.length() > MAX_FUNCTION_ARGS {
-        return Err(deno_error::JsErrorBox::generic(format!("Too many function arguments passed to op bind"))); 
-    }
+    state.ed.check_function_args_len(args.length() as usize)
+    .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
 
     let mut args_proxied = Vec::with_capacity(args.length() as usize);
-    let mut num_string_chars = 0;
     for i in 0..args.length() {
         let arg = args.get_index(scope, i).ok_or_else(|| deno_error::JsErrorBox::generic(format!("Failed to get argument {}", i)))?;
         match ProxiedV8Value::from_v8(scope, arg, &state, 0) {
             Ok(v) => {
                 let sz = v.effective_size(0);
-                if sz > 0 {
-                    num_string_chars += sz;
-                    if num_string_chars > MAX_OWNED_V8_STRING_SIZE {
-                        return Err(deno_error::JsErrorBox::generic(format!("Too many string characters passed to op bind"))); 
-                    }
-                }
+                state.ed.check_constructed_value_len(sz, "ProxiedV8Value from_v8")
+                .map_err(|e| deno_error::JsErrorBox::generic(format!("Argument {}: {}", i, e)))?;
                 args_proxied.push(v);
             },
             Err(e) => {

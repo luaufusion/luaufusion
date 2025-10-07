@@ -4,7 +4,7 @@ use crate::denobridge::bridge::V8ObjectRegistryType;
 #[cfg(feature = "embedder_json")]
 use crate::denobridge::embedder_api::{json_raw_to_proxied_v8, json_to_proxied_v8};
 #[cfg(feature = "embedder_json")]
-use crate::luau::embedder_api::{EmbeddableJson, EmbeddableJsonInner};
+use crate::luau::embedder_api::{LangTransferValue, LangTransferValueInner};
 use crate::denobridge::psuedoprimitive::ProxiedV8PsuedoPrimitive;
 use crate::{base::Error, denobridge::luauobjs::V8Value};
 use crate::denobridge::objreg::V8ObjectRegistryID;
@@ -56,7 +56,7 @@ impl ProxiedV8Value {
             return Err("Maximum proxy depth exceeded when converting Luau to ProxiedV8Value".into());
         } // Prevent excessively deep recursion
 
-        if let Some(prim) = ProxiedV8Primitive::from_luau(&value)? {
+        if let Some(prim) = ProxiedV8Primitive::from_luau(&value, plc)? {
             return Ok(ProxiedV8Value::Primitive(prim));
         }
 
@@ -95,20 +95,23 @@ impl ProxiedV8Value {
                     return Ok(ProxiedV8Value::V8OwnedObject((v8value.typ, v8value.id)));
                 }
 
-                // Handle EmbeddableJson
-                #[cfg(feature = "embedder_json")]
-                if let Ok(ev) = ud.borrow::<EmbeddableJson>() {
+                // Handle LangTransferValue
+                if let Ok(ev) = ud.borrow::<LangTransferValue>() {
                     let Some(json) = ev.take() else {
-                        return Err("EmbeddableJson has already been taken".into());
+                        return Err("LangTransferValue has already been taken".into());
                     };
 
                     match json {
-                        EmbeddableJsonInner::Raw(raw) => {
-                            return json_raw_to_proxied_v8(&raw, ev.check_chars_limit, depth + 1);
+                        #[cfg(feature = "embedder_json")]
+                        LangTransferValueInner::RawJson(raw) => {
+                            return json_raw_to_proxied_v8(&raw, depth + 1);
                         },
-                        EmbeddableJsonInner::Owned(v) => {
-                            return json_to_proxied_v8(v, ev.check_chars_limit, depth + 1);
+                        LangTransferValueInner::Json(v) => {
+                            return json_to_proxied_v8(v, depth + 1);
                         },
+                        LangTransferValueInner::Transfer(lv) => {
+                            return ProxiedV8Value::from_luau(plc, lv, depth + 1);
+                        }
                     }
                 }
 
@@ -207,7 +210,7 @@ impl ProxiedV8Value {
             return Err("Maximum proxy depth exceeded when converting V8 to ProxiedV8Value".into());
         } // Prevent excessively deep recursion
 
-        if let Some(prim) = ProxiedV8Primitive::from_v8(scope, value)? {
+        if let Some(prim) = ProxiedV8Primitive::from_v8(scope, value, &common_state.ed)? {
             return Ok(Self::Primitive(prim));
         }
 

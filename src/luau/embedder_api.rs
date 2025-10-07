@@ -3,59 +3,117 @@ use std::cell::RefCell;
 #[cfg(feature = "embedder_json")]
 use std::rc::Rc;
 
+use serde::{Deserialize, Serialize};
 #[cfg(feature = "embedder_json")]
 use serde_json::Value as JsonValue;
 #[cfg(feature = "embedder_json")]
 use serde_json::value::RawValue as JsonRawValue;
 
-#[cfg(feature = "embedder_json")]
-pub enum EmbeddableJsonInner {
-    Raw(Box<JsonRawValue>),
-    Owned(JsonValue),
+use crate::base::Error;
+use crate::denobridge::bridge::MIN_HEAP_LIMIT;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+/// Embedder specific configuration data
+pub struct EmbedderData {
+    /// Heap limit
+    pub heap_limit: usize,
+    /// Maximum number of bytes allowed for a single value within the payload
+    pub max_value_size: Option<usize>,
+    /// Maximum number of bytes allowed for a whole (constructed) value
+    pub max_constructed_value_size: Option<usize>,
+    /// Maximum number of function arguments that can be passed to a function call
+    pub max_function_args: Option<usize>,
 }
 
-/// An EmbeddableJson is a opaque userdata object that can be used to quickly transfer raw JSON data
-/// from the Luau side to JS side without needing to parse it into a LuaValue first and then send the LuaValue
-/// to JS and convert it there. This is useful for large JSON blobs, as it avoids the overhead of
+impl Default for EmbedderData {
+    fn default() -> Self {
+        Self {
+            heap_limit: MIN_HEAP_LIMIT,
+            max_value_size: None,
+            max_constructed_value_size: None,
+            max_function_args: Some(32),
+        }
+    }
+}
+
+impl EmbedderData {
+    pub(crate) fn check_value_len(&self, len: usize, typ: &'static str) -> Result<(), Error> {
+        if let Some(max) = self.max_value_size {
+            if len > max {
+                return Err(format!("Bytes exceeds maximum allowed size of {} bytes (sizeof {}) [at {}]", max, len, typ).into());
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn check_constructed_value_len(&self, len: usize, typ: &'static str) -> Result<(), Error> {
+        if let Some(max) = self.max_constructed_value_size {
+            if len > max {
+                return Err(format!("Constructed value exceeds maximum allowed size of {} bytes (sizeof {}) [at {}]", max, len, typ).into());
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn check_function_args_len(&self, len: usize) -> Result<(), Error> {
+        if let Some(max) = self.max_function_args {
+            if len > max {
+                return Err(format!("Too many function arguments passed (max {})", max).into());
+            }
+        }
+        Ok(())
+    }
+}
+
+pub enum LangTransferValueInner {
+    Transfer(mluau::Value),
+    #[cfg(feature = "embedder_json")]
+    RawJson(Box<JsonRawValue>),
+    #[cfg(feature = "embedder_json")]
+    Json(JsonValue),
+}
+
+/// An LangTransferValue is a opaque userdata object that can be used to quickly transfer data
+/// from the Luau side to JS side (often without needing to parse it into a LuaValue first before sending
+/// to JS) and convert it there. This is useful for large JSON blobs, as it avoids the overhead of
 /// parsing and serializing the JSON multiple times and the memory overhead of holding multiple copies
 /// of the data in memory (both in Luau and in JS).
-#[cfg(feature = "embedder_json")]
-pub struct EmbeddableJson {
-    pub(crate) inner: Rc<RefCell<Option<EmbeddableJsonInner>>>,
-    pub(crate) check_chars_limit: bool,
+/// 
+/// The other use case of LangTransferValue is to enable embedders to transfer data from Luau to JS while 
+/// avoiding having its size counted within the proxy's effective size code (TODO: this does not currently work)
+pub struct LangTransferValue {
+    pub(crate) inner: Rc<RefCell<Option<LangTransferValueInner>>>,
 }
 
-#[cfg(feature = "embedder_json")]
-impl EmbeddableJson {
-    /// Creates a new EmbeddableJson from a RawValue
-    /// 
-    /// If `check_chars_limit` is true, will check that the total number of string characters
-    /// does not exceed MAX_OWNED_V8_STRING_SIZE (this is useful if the JSON is coming from
-    /// an untrusted source, such as over the network).
-    pub fn new_raw(value: Box<JsonRawValue>, check_chars_limit: bool) -> Self {
+impl LangTransferValue {
+    /// Creates a new LangTransferValue from a RawValue
+    #[cfg(feature = "embedder_json")]
+    pub fn new_raw(value: Box<JsonRawValue>) -> Self {
         Self {
-            inner: Rc::new(RefCell::new(Some(EmbeddableJsonInner::Raw(value)))),
-            check_chars_limit,
+            inner: Rc::new(RefCell::new(Some(LangTransferValueInner::RawJson(value)))),
         }
     }
 
-    /// Creates a new EmbeddableJson from a owned JsonValue
-    /// 
-    /// If `check_chars_limit` is true, will check that the total number of string characters
-    /// does not exceed MAX_OWNED_V8_STRING_SIZE (this is useful if the JSON is coming from
-    /// an untrusted source, such as over the network).
-    pub fn new_owned(value: JsonValue, check_chars_limit: bool) -> Self {
+    /// Creates a new LangTransferValue from a owned JsonValue
+    #[cfg(feature = "embedder_json")]
+    pub fn new_owned(value: JsonValue) -> Self {
         Self {
-            inner: Rc::new(RefCell::new(Some(EmbeddableJsonInner::Owned(value)))),
-            check_chars_limit,
+            inner: Rc::new(RefCell::new(Some(LangTransferValueInner::Json(value)))),
         }
     }
 
-    pub fn take(&self) -> Option<EmbeddableJsonInner> {
+    /// Creates a new LangTransferValue from a Luau value
+    pub fn new_luau(value: mluau::Value) -> Self {
+        Self {
+            inner: Rc::new(RefCell::new(Some(LangTransferValueInner::Transfer(value)))),
+        }
+    }
+
+    pub fn take(&self) -> Option<LangTransferValueInner> {
         self.inner.borrow_mut().take()
     }
 }
 
 // Empty userdata impl
 #[cfg(feature = "embedder_json")]
-impl mluau::UserData for EmbeddableJson {}
+impl mluau::UserData for LangTransferValue {}

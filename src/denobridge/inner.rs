@@ -14,6 +14,7 @@ use super::{
     value::ProxiedV8Value
 };
 use crate::luau::bridge::LuaBridgeServiceClient;
+use crate::luau::embedder_api::EmbedderData;
 
 use super::bridge::{ProxyV8Client, MIN_HEAP_LIMIT};
 use super::denoexts;
@@ -37,6 +38,7 @@ pub(crate) struct CommonState {
     pub(super) obj_template: Rc<v8::Global<v8::ObjectTemplate>>,
     pub(super) proxy_client: ProxyV8Client,
     pub(super) bridge_vals: Rc<BridgeVals>,
+    pub(super) ed: EmbedderData,
 }
 
 /// Internal manager for a single V8 isolate with a minimal Deno runtime.
@@ -50,8 +52,8 @@ pub(super) struct V8IsolateManagerInner {
 }
 
 impl V8IsolateManagerInner {    
-    pub fn new(bridge: LuaBridgeServiceClient<V8IsolateManagerServer>, heap_limit: usize, loader: FusionModuleLoader) -> Self {
-        let heap_limit = heap_limit.max(MIN_HEAP_LIMIT);
+    pub fn new(bridge: LuaBridgeServiceClient<V8IsolateManagerServer>, ed: EmbedderData, loader: FusionModuleLoader) -> Self {
+        let heap_limit = ed.heap_limit.max(MIN_HEAP_LIMIT);
 
         // TODO: Support snapshots maybe
         let extensions = denoexts::extension::all_extensions(false);
@@ -112,7 +114,8 @@ impl V8IsolateManagerInner {
             proxy_client: ProxyV8Client {
                 obj_registry: bridge_vals.obj_registry.clone(),
             },
-            bridge_vals: Rc::new(bridge_vals)
+            bridge_vals: Rc::new(bridge_vals),
+            ed: ed.clone()
         };
 
         deno.op_state().borrow_mut().put(common_state.clone());
