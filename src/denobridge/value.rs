@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
-use crate::MAX_PROXY_DEPTH;
 use crate::denobridge::bridge::V8ObjectRegistryType;
 #[cfg(feature = "embedder_json")]
 use crate::denobridge::embedder_api::{json_raw_to_proxied_v8, json_to_proxied_v8};
+use crate::luau::embedder_api::EmbedderDataContext;
 #[cfg(feature = "embedder_json")]
 use crate::luau::embedder_api::{LangTransferValue, LangTransferValueInner};
 use crate::denobridge::psuedoprimitive::ProxiedV8PsuedoPrimitive;
@@ -26,6 +26,9 @@ pub enum ProxiedV8Value {
     /// Psuedoprimitive values
     Psuedoprimitive(ProxiedV8PsuedoPrimitive),
 
+    /// Embedder-transferred value (does not follow proxy payload limits)
+    Transfer(Box<ProxiedV8Value>),
+
     /// v8-owned stuff
     V8OwnedObject((V8ObjectRegistryType, V8ObjectRegistryID)), // (Type, ID) of the v8-owned object
 
@@ -34,36 +37,22 @@ pub enum ProxiedV8Value {
 }
 
 impl ProxiedV8Value {
-    /// Returns the number of bytes used by this proxied value
-    /// 
-    /// Note that only large objects (primitive string and psuedoprimitive stringbyte)
-    /// are counted here, as other types are always small
-    pub fn effective_size(&self, depth: usize) -> usize {
-        if depth >= MAX_PROXY_DEPTH {
-            return MAX_PROXY_DEPTH; // Prevent excessively deep recursion
-        }
-        match self {
-            Self::Primitive(p) => p.effective_size(),
-            Self::Psuedoprimitive(p) => p.effective_size(depth),
-            Self::V8OwnedObject(_) => 1, // Just a reference
-            Self::SourceOwnedObject(_) => 1, // Just a reference
-        }
-    }
-
     /// Proxies a Luau value to a ProxiedV8Value
-    pub(crate) fn from_luau(plc: &ProxyLuaClient, value: mluau::Value, depth: usize) -> Result<Self, Error> {
-        if depth >= MAX_PROXY_DEPTH {
-            return Err("Maximum proxy depth exceeded when converting Luau to ProxiedV8Value".into());
-        } // Prevent excessively deep recursion
-
-        if let Some(prim) = ProxiedV8Primitive::from_luau(&value, plc)? {
+    pub(crate) fn from_luau(plc: &ProxyLuaClient, value: mluau::Value, ed: &mut EmbedderDataContext) -> Result<Self, Error> {
+        let mut inner_ed_a = ed.nest_in_depth();
+        if let Some(prim) = ProxiedV8Primitive::from_luau(&value, &mut inner_ed_a)? {
+            ed.merge(inner_ed_a)?;
             return Ok(ProxiedV8Value::Primitive(prim));
         }
 
-        if let Some(psuedo) = ProxiedV8PsuedoPrimitive::from_luau(plc, &value, depth)? {
+        let mut inner_ed_b = ed.nest_in_depth();
+        if let Some(psuedo) = ProxiedV8PsuedoPrimitive::from_luau(plc, &value, &mut inner_ed_b)? {
+            ed.merge(inner_ed_b)?;
             return Ok(ProxiedV8Value::Psuedoprimitive(psuedo));
         }
         
+        ed.add(1, "ProxiedV8Value -> <base overhead>")?;
+
         match value {
             mluau::Value::Nil => unreachable!(
                 "Nil should have been handled as a primitive"
@@ -104,13 +93,15 @@ impl ProxiedV8Value {
                     match json {
                         #[cfg(feature = "embedder_json")]
                         LangTransferValueInner::RawJson(raw) => {
-                            return json_raw_to_proxied_v8(&raw, depth + 1);
+                            return Ok(ProxiedV8Value::Transfer(Box::new(json_raw_to_proxied_v8(&raw, 0)?)));
                         },
                         LangTransferValueInner::Json(v) => {
-                            return json_to_proxied_v8(v, depth + 1);
+                            return Ok(ProxiedV8Value::Transfer(Box::new(json_to_proxied_v8(v, 0)?)));
                         },
                         LangTransferValueInner::Transfer(lv) => {
-                            return ProxiedV8Value::from_luau(plc, lv, depth + 1);
+                            let inner_ed = ed.nest()?;
+                            let mut inner_ed = inner_ed.disable_limits();
+                            return ProxiedV8Value::from_luau(plc, lv, &mut inner_ed);
                         }
                     }
                 }
@@ -135,13 +126,15 @@ impl ProxiedV8Value {
     }
 
     /// Proxy a ProxiedV8Value to a Luau value
-    pub(crate) fn to_luau(self, lua: &mluau::Lua, plc: &ProxyLuaClient, bridge: &V8IsolateManagerServer, depth: usize) -> Result<mluau::Value, mluau::Error> {
-        if depth >= MAX_PROXY_DEPTH {
-            return Err(mluau::Error::external("Maximum proxy depth exceeded when converting ProxiedV8Value to Luau"));
-        } // Prevent excessively deep recursion
+    pub(crate) fn to_luau(self, lua: &mluau::Lua, plc: &ProxyLuaClient, bridge: &V8IsolateManagerServer, ed: &mut EmbedderDataContext) -> Result<mluau::Value, mluau::Error> {
+        ed.add(1, "ProxiedV8Value -> <base overhead>")
+            .map_err(|e| mluau::Error::external(e.to_string()))?;
         match self {
-            ProxiedV8Value::Primitive(p) => Ok(p.to_luau(lua).map_err(|e| mluau::Error::external(format!("Failed to convert ProxiedV8Primitive to Luau: {}", e)))?),
-            ProxiedV8Value::Psuedoprimitive(p) => Ok(p.to_luau(lua, plc, bridge, depth).map_err(|e| mluau::Error::external(format!("Failed to convert ProxiedV8PsuedoPrimitive to Luau: {}", e)))?),
+            ProxiedV8Value::Primitive(p) => {
+                Ok(p.to_luau(lua, ed).map_err(|e| mluau::Error::external(format!("Failed to convert ProxiedV8Primitive to Luau: {}", e)))?)
+            },
+            ProxiedV8Value::Psuedoprimitive(p) => Ok(p.to_luau(lua, plc, bridge, ed).map_err(|e| mluau::Error::external(format!("Failed to convert ProxiedV8PsuedoPrimitive to Luau: {}", e)))?),
+            ProxiedV8Value::Transfer(p) => p.to_luau(lua, plc, bridge, ed),
             // Target owned value
             ProxiedV8Value::V8OwnedObject((typ, id)) => {
                 let ud = V8Value::new(id, plc.clone(), bridge.clone(), typ);
@@ -204,17 +197,15 @@ impl ProxiedV8Value {
         scope: &mut v8::PinScope<'s, '_>,
         value: v8::Local<'s, v8::Value>,
         common_state: &CommonState,
-        depth: usize
+        ed: &mut EmbedderDataContext,
     ) -> Result<Self, Error> {
-        if depth >= MAX_PROXY_DEPTH {
-            return Err("Maximum proxy depth exceeded when converting V8 to ProxiedV8Value".into());
-        } // Prevent excessively deep recursion
+        ed.add(1, "ProxiedV8Value -> <base overhead>")?;
 
-        if let Some(prim) = ProxiedV8Primitive::from_v8(scope, value, &common_state.ed)? {
+        if let Some(prim) = ProxiedV8Primitive::from_v8(scope, value, ed)? {
             return Ok(Self::Primitive(prim));
         }
 
-        if let Some(psuedo) = ProxiedV8PsuedoPrimitive::from_v8(scope, value, common_state, depth)? {
+        if let Some(psuedo) = ProxiedV8PsuedoPrimitive::from_v8(scope, value, common_state, ed)? {
             return Ok(Self::Psuedoprimitive(psuedo));
         }
 
@@ -249,14 +240,13 @@ impl ProxiedV8Value {
         self,
         scope: &mut v8::PinScope<'s, '_>,
         common_state: &CommonState,
-        depth: usize,
+        ed: &mut EmbedderDataContext,
     ) -> Result<v8::Local<'s, v8::Value>, Error> {
-        if depth >= MAX_PROXY_DEPTH {
-            return Err("Maximum proxy depth exceeded when converting ProxiedV8Value to V8".into());
-        } // Prevent excessively deep recursion
+        ed.add(1, "ProxiedV8Value -> <base overhead>")?;
         match self {
-            Self::Primitive(p) => Ok(p.to_v8(scope)?),
-            Self::Psuedoprimitive(p) => Ok(p.to_v8(scope, common_state, depth)?),
+            Self::Primitive(p) => Ok(p.to_v8(scope, ed)?),
+            Self::Psuedoprimitive(p) => Ok(p.to_v8(scope, common_state, ed)?),
+            Self::Transfer(p) => Ok(p.to_v8(scope, common_state, ed)?),
             Self::V8OwnedObject((_typ, id)) => {
                 let obj = common_state.proxy_client.obj_registry.get(scope, id, |_scope, x| Ok(x))
                     .map_err(|e| format!("Object ID not found in registry: {}", e))?;

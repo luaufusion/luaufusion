@@ -9,6 +9,7 @@ use serde_json::Value as JsonValue;
 #[cfg(feature = "embedder_json")]
 use serde_json::value::RawValue as JsonRawValue;
 
+use crate::MAX_PROXY_DEPTH;
 use crate::base::Error;
 use crate::denobridge::bridge::MIN_HEAP_LIMIT;
 
@@ -17,50 +18,91 @@ use crate::denobridge::bridge::MIN_HEAP_LIMIT;
 pub struct EmbedderData {
     /// Heap limit
     pub heap_limit: usize,
-    /// Maximum number of bytes allowed for a single value within the payload
-    pub max_value_size: Option<usize>,
-    /// Maximum number of bytes allowed for a whole (constructed) value
-    pub max_constructed_value_size: Option<usize>,
-    /// Maximum number of function arguments that can be passed to a function call
-    pub max_function_args: Option<usize>,
+    /// Maximum number of bytes allowed for the payload
+    pub max_payload_size: Option<usize>,
 }
 
 impl Default for EmbedderData {
     fn default() -> Self {
         Self {
             heap_limit: MIN_HEAP_LIMIT,
-            max_value_size: None,
-            max_constructed_value_size: None,
-            max_function_args: Some(32),
+            max_payload_size: None,
         }
     }
 }
 
-impl EmbedderData {
-    pub(crate) fn check_value_len(&self, len: usize, typ: &'static str) -> Result<(), Error> {
-        if let Some(max) = self.max_value_size {
-            if len > max {
-                return Err(format!("Bytes exceeds maximum allowed size of {} bytes (sizeof {}) [at {}]", max, len, typ).into());
+pub(crate) struct EmbedderDataContext {
+    ed: EmbedderData,
+    size: usize, // Current size of constructed values
+    limit: bool,
+    depth: usize, // Current depth of constructed values
+}
+
+impl EmbedderDataContext {
+    pub fn new(ed: &EmbedderData) -> Self {
+        Self { ed: ed.clone(), size: 0, limit: true, depth: 0 }
+    }
+
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    // Used when a LangTransferValue is sent to disable limits during processing it
+    pub fn disable_limits(&self) -> Self {
+        Self {
+            ed: self.ed.clone(),
+            size: self.size,
+            limit: false,
+            depth: self.depth,
+        }
+    }
+
+    pub fn nest_in_depth(&self) -> Self {
+        Self {
+            ed: self.ed.clone(),
+            size: self.size,
+            limit: self.limit,
+            depth: self.depth,
+        }
+    }
+
+    pub fn nest(&self) -> Result<Self, Error> {
+        if self.depth >= MAX_PROXY_DEPTH {
+            return Err("Maximum nesting depth exceeded".into());
+        }
+        Ok(Self {
+            ed: self.ed.clone(),
+            size: self.size,
+            limit: self.limit,
+            depth: self.depth + 1,
+        })
+    }
+
+    pub fn add(&mut self, len: usize, typ: &'static str) -> Result<(), Error> {
+        //println!("add called: {len} {typ} limit={}", self.limit);
+        if !self.limit {
+            return Ok(()); // Limits disabled
+        }
+        self.size += len;
+        if let Some(max) = self.ed.max_payload_size {
+            if self.size > max {
+                return Err(format!("Total payload size exceeds maximum allowed size of {} bytes (got {}) [at {}]", max, self.size, typ).into());
             }
         }
         Ok(())
     }
 
-    pub(crate) fn check_constructed_value_len(&self, len: usize, typ: &'static str) -> Result<(), Error> {
-        if let Some(max) = self.max_constructed_value_size {
-            if len > max {
-                return Err(format!("Constructed value exceeds maximum allowed size of {} bytes (sizeof {}) [at {}]", max, len, typ).into());
+    pub fn merge(&mut self, other: EmbedderDataContext) -> Result<(), Error> {
+        if !self.limit {
+            return Ok(()); // Limits disabled
+        }
+        self.size = other.size;
+        if let Some(max) = self.ed.max_payload_size {
+            if self.size > max {
+                return Err(format!("Total payload size exceeds maximum allowed size of {} bytes (got {})", max, self.size).into());
             }
         }
-        Ok(())
-    }
 
-    pub(crate) fn check_function_args_len(&self, len: usize) -> Result<(), Error> {
-        if let Some(max) = self.max_function_args {
-            if len > max {
-                return Err(format!("Too many function arguments passed (max {})", max).into());
-            }
-        }
         Ok(())
     }
 }

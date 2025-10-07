@@ -5,7 +5,6 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use concurrentlyexec::{ConcurrentExecutor, ConcurrentExecutorState, ConcurrentlyExecute, MultiSender, OneshotSender, ProcessOpts};
-use deno_core::v8::GetPropertyNamesArgs;
 //use deno_core::error::{CoreError, CoreErrorKind};
 use deno_core::{PollEventLoopOptions, v8};
 use futures_util::stream::FuturesUnordered;
@@ -22,7 +21,7 @@ use crate::luau::bridge::{
 };
 
 use crate::base::{ProxyBridge, Error};
-use crate::luau::embedder_api::EmbedderData;
+use crate::luau::embedder_api::{EmbedderData, EmbedderDataContext};
 use super::inner::V8IsolateManagerInner;
 
 /// Minimum heap size for V8 isolates
@@ -236,8 +235,9 @@ impl V8ObjectOp {
                 };
 
                 let mut v8_args = Vec::with_capacity(args.len());
+                let mut ed = EmbedderDataContext::new(&inner.common_state.ed);
                 for arg in args {
-                    let v8_arg = match arg.to_v8(&mut context_scope, &inner.common_state, 0) {
+                    let v8_arg = match arg.to_v8(&mut context_scope, &inner.common_state, &mut ed) {
                         Ok(v) => v,
                         Err(e) => return Err(format!("Failed to convert argument to V8: {}", e).into()),
                     };
@@ -261,7 +261,8 @@ impl V8ObjectOp {
                     ProxiedV8Value::Primitive(p) => p,
                     _ => return Err("ObjectGetProperty key must be a primitive".into()),
                 };
-                let key = match key.to_v8(&mut context_scope) {
+                let mut ed_a = EmbedderDataContext::new(&inner.common_state.ed);
+                let key = match key.to_v8(&mut context_scope, &mut ed_a) {
                     Ok(v) => v,
                     Err(e) => return Err(format!("Failed to convert key to V8: {}", e).into()),
                 };
@@ -283,7 +284,9 @@ impl V8ObjectOp {
                 let prop_names = obj.get(&mut context_scope, key)
                     .ok_or("Failed to get property names")?;
                 
-                let prop_names = ProxiedV8Value::from_v8(&mut context_scope, prop_names.into(), &inner.common_state, 0)
+                let mut ed_b = EmbedderDataContext::new(&inner.common_state.ed);
+
+                let prop_names = ProxiedV8Value::from_v8(&mut context_scope, prop_names.into(), &inner.common_state, &mut ed_b)
                     .map_err(|e| format!("Failed to proxy property names: {}", e))?;
 
                 Ok(OpCallRet::ProxiedMulti(vec![prop_names]))
@@ -358,7 +361,8 @@ impl ConcurrentlyExecute for V8IsolateManagerClient {
                                     let main_ctx = v8::Local::new(&mut scope, main_ctx);
                                     let context_scope = &mut v8::ContextScope::new(scope, main_ctx);
                                     let namespace_obj = v8::Local::new(context_scope, namespace_obj);
-                                    match ProxiedV8Value::from_v8(context_scope, namespace_obj.into(), &inner.common_state, 0) {
+                                    let mut ed = EmbedderDataContext::new(&inner.common_state.ed);
+                                    match ProxiedV8Value::from_v8(context_scope, namespace_obj.into(), &inner.common_state, &mut ed) {
                                         Ok(v) => v,
                                         Err(e) => {
                                             let _ = resp.client(&client_ctx).send(Err(format!("Failed to proxy module namespace: {}", e).into()));
@@ -447,7 +451,8 @@ impl ConcurrentlyExecute for V8IsolateManagerClient {
                             let main_ctx = v8::Local::new(&mut scope, main_ctx);
                             let mut context_scope = &mut v8::ContextScope::new(scope, main_ctx);
                             let res = v8::Local::new(&mut context_scope, res);
-                            let res = ProxiedV8Value::from_v8(context_scope, res, &inner.common_state, 0);
+                            let mut ed = EmbedderDataContext::new(&inner.common_state.ed);
+                            let res = ProxiedV8Value::from_v8(context_scope, res, &inner.common_state, &mut ed);
                             match res {
                                 Ok(v) => {
                                     let _ = resp.client(&client_ctx).send(Ok(vec![v]));
@@ -484,11 +489,8 @@ impl ConcurrentlyExecute for V8IsolateManagerClient {
                         let main_ctx = v8::Local::new(&mut scope, main_ctx);
                         let context_scope = &mut v8::ContextScope::new(scope, main_ctx);
                         let namespace_obj = v8::Local::new(context_scope, namespace_obj);
-                        {
-                            let props = namespace_obj.get_own_property_names(context_scope, GetPropertyNamesArgs::default()).unwrap();
-                            println!("Got namespace object: {:?}", props.to_rust_string_lossy(context_scope));
-                        }
-                        match ProxiedV8Value::from_v8(context_scope, namespace_obj.into(), &inner.common_state, 0) {
+                        let mut ed = EmbedderDataContext::new(&inner.common_state.ed);
+                        match ProxiedV8Value::from_v8(context_scope, namespace_obj.into(), &inner.common_state, &mut ed) {
                             Ok(v) => v,
                             Err(e) => {
                                 let _ = resp.client(&client_ctx).send(Err(format!("Failed to proxy module namespace: {}", e).into()));
@@ -597,11 +599,13 @@ impl ProxyBridge for V8IsolateManagerServer {
     }
 
     fn to_source_lua_value(&self, lua: &mluau::Lua, value: Self::ValueType, plc: &ProxyLuaClient) -> Result<mluau::Value, Error> {
-        Ok(value.to_luau(lua, plc, self, 0).map_err(|e| e.to_string())?)
+        let mut ed = EmbedderDataContext::new(&plc.ed);
+        Ok(value.to_luau(lua, plc, self, &mut ed).map_err(|e| e.to_string())?)
     }
 
     fn from_source_lua_value(&self, _lua: &mluau::Lua, plc: &ProxyLuaClient, value: mluau::Value) -> Result<Self::ValueType, crate::base::Error> {
-        Ok(ProxiedV8Value::from_luau(plc, value, 0).map_err(|e| e.to_string())?)
+        let mut ed = EmbedderDataContext::new(&plc.ed);
+        Ok(ProxiedV8Value::from_luau(plc, value, &mut ed).map_err(|e| e.to_string())?)
     }
 
     async fn eval_from_source(&self, modname: String) -> Result<Self::ValueType, crate::base::Error> {

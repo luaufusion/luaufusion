@@ -4,6 +4,7 @@ use std::rc::Rc;
 use deno_core::{op2, v8, OpState};
 
 use crate::luau::bridge::LuauObjectOp;
+use crate::luau::embedder_api::EmbedderDataContext;
 use crate::luau::objreg::LuauObjectRegistryID;
 use super::value::ProxiedV8Value;
 use super::inner::{CommonState, FunctionRunState};
@@ -15,17 +16,13 @@ pub(super) fn __luabind(
     scope: &mut v8::PinScope,
     args: v8::Local<v8::Array>,
 ) -> Result<i32, deno_error::JsErrorBox> {
-    state.ed.check_function_args_len(args.length() as usize)
-    .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
+    let mut ed = EmbedderDataContext::new(&state.ed);
 
     let mut args_proxied = Vec::with_capacity(args.length() as usize);
     for i in 0..args.length() {
         let arg = args.get_index(scope, i).ok_or_else(|| deno_error::JsErrorBox::generic(format!("Failed to get argument {}", i)))?;
-        match ProxiedV8Value::from_v8(scope, arg, &state, 0) {
+        match ProxiedV8Value::from_v8(scope, arg, &state, &mut ed) {
             Ok(v) => {
-                let sz = v.effective_size(0);
-                state.ed.check_constructed_value_len(sz, "ProxiedV8Value from_v8")
-                .map_err(|e| deno_error::JsErrorBox::generic(format!("Argument {}: {}", i, e)))?;
                 args_proxied.push(v);
             },
             Err(e) => {
@@ -111,8 +108,9 @@ pub(super) fn __luaret<'s>(
         FunctionRunState::Executed { resp } => {
             // Proxy every return value to V8
             let mut results = vec![];
+            let mut ed = EmbedderDataContext::new(&state.ed);
             for ret in resp {
-                match ret.to_v8(scope, state, 0) {
+                match ret.to_v8(scope, state, &mut ed) {
                     Ok(v8_ret) => results.push(v8_ret),
                     Err(e) => {
                         return Err(deno_error::JsErrorBox::generic(format!("Failed to convert return value: {}", e)));

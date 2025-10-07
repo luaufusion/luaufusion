@@ -8,6 +8,7 @@ use crate::denobridge::bridge::V8ObjectOp;
 use crate::denobridge::objreg::V8ObjectRegistryID;
 use crate::denobridge::value::ProxiedV8Value;
 use crate::luau::bridge::ProxyLuaClient;
+use crate::luau::embedder_api::EmbedderDataContext;
 
 /// The core struct encapsulating a V8 object being proxied *to* luau
 pub struct V8Value {
@@ -39,7 +40,8 @@ impl V8Value {
 
     /// Do a op call with a single primitive argument (optimized)
     async fn op_call_primitive(&self, lua: &mluau::Lua, obj_id: V8ObjectRegistryID, op: V8ObjectOp, args: mluau::Value) -> Result<mluau::MultiValue, Error> {
-        let arg = ProxiedV8Primitive::from_luau(&args, &self.plc)
+        let mut ed = EmbedderDataContext::new(&self.plc.ed);
+        let arg = ProxiedV8Primitive::from_luau(&args, &mut ed)
         .map_err(|e| format!("Failed to proxy argument to ProxiedV8Value: {}", e))?
         .ok_or(format!("Argument is not a primitive value"))?;
         
@@ -51,8 +53,9 @@ impl V8Value {
         .await? {
             Ok(v) => {
                 let mut proxied = mluau::MultiValue::with_capacity(v.len());
+                let mut ed = EmbedderDataContext::new(&self.plc.ed);
                 for ret in v {
-                    let ret = ret.to_luau(&lua, &self.plc, &self.bridge, 0)
+                    let ret = ret.to_luau(&lua, &self.plc, &self.bridge, &mut ed)
                     .map_err(|e| format!("Failed to convert return value to Lua: {}", e))?;
                     proxied.push_back(ret);
                 }
@@ -65,17 +68,13 @@ impl V8Value {
 
     /// Do a op call with multiple arguments
     async fn op_call(&self, obj_id: V8ObjectRegistryID, op: V8ObjectOp, args: mluau::MultiValue) -> Result<mluau::MultiValue, Error> {
-        self.plc.ed.check_function_args_len(args.len())?;
+        let mut ed = EmbedderDataContext::new(&self.plc.ed);
         
         let mut args_proxied = Vec::with_capacity(args.len());
         for arg in args {
-            let proxied = ProxiedV8Value::from_luau(&self.plc, arg, 0)
+            let proxied = ProxiedV8Value::from_luau(&self.plc, arg, &mut ed)
             .map_err(|e| format!("Failed to proxy argument to ProxiedV8Value: {}", e))?;
-            let sz = proxied.effective_size(0);
-            if sz > 0 {
-                self.plc.ed.check_constructed_value_len(sz, "ProxiedV8Value from_luau")
-                .map_err(|e| format!("Argument: {}", e))?;
-            }
+            println!("edSize: {}", ed.size());
             args_proxied.push(proxied);
         }
         match self.bridge.send(super::bridge::OpCallMessage {
@@ -89,8 +88,9 @@ impl V8Value {
                 let Some(lua) = self.plc.weak_lua.try_upgrade() else {
                     return Err("Lua instance has been dropped".into());
                 };
+                let mut ed = EmbedderDataContext::new(&self.plc.ed);
                 for ret in v {
-                    let ret = ret.to_luau(&lua, &self.plc, &self.bridge, 0)
+                    let ret = ret.to_luau(&lua, &self.plc, &self.bridge, &mut ed)
                     .map_err(|e| format!("Failed to convert return value to Lua: {}", e))?;
                     proxied.push_back(ret);
                 }

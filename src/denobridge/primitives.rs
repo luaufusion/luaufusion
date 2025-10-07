@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use crate::{base::Error, luau::{bridge::ProxyLuaClient, embedder_api::EmbedderData}};
+use crate::{base::Error, luau::embedder_api::EmbedderDataContext};
 use deno_core::v8;
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, Hash, Clone, Debug)]
@@ -20,22 +20,12 @@ pub enum ProxiedV8Primitive {
 }
 
 impl ProxiedV8Primitive {
-/// Returns the number of bytes used by this psuedoprimitive
-    ///
-    /// Note that only string is counted here, as other types are always small
-    pub fn effective_size(&self) -> usize {
-        match self {
-            Self::String(b) => b.len(),
-            _ => 1, // Other types are always small, so ignore
-        }
-    }
-
     /// Luau -> ProxiedV8Primitive
-    pub(crate) fn from_luau(value: &mluau::Value, plc: &ProxyLuaClient) -> Result<Option<Self>, Error> {
+    pub(crate) fn from_luau(value: &mluau::Value, ed: &mut EmbedderDataContext) -> Result<Option<Self>, Error> {
+        ed.add(1, "ProxiedV8Primitive -> <base overhead>")?;
         if value.is_null() {
             return Ok(Some(ProxiedV8Primitive::Null));
         }
-
         match value {
             mluau::Value::Nil => Ok(Some(ProxiedV8Primitive::Undefined)),
             mluau::Value::Boolean(b) => Ok(Some(ProxiedV8Primitive::Boolean(*b))),
@@ -48,7 +38,7 @@ impl ProxiedV8Primitive {
                 }
             },
             mluau::Value::String(s) => {
-                plc.ed.check_value_len(s.as_bytes().len(), "ProxiedV8Primitive -> LuaString")?;
+                ed.add(s.as_bytes().len(), "ProxiedV8Primitive -> LuaString")?;
 
                 if let Ok(s) = s.to_str() {
                     return Ok(Some(ProxiedV8Primitive::String(s.to_string())));
@@ -58,6 +48,7 @@ impl ProxiedV8Primitive {
             },
             mluau::Value::Other(r) => {
                 let s = format!("unknown({r:?})");
+                ed.add(s.len(), "ProxiedV8Primitive -> LuaOther")?;
                 Ok(Some(ProxiedV8Primitive::String(s)))
             },
             _ => Ok(None),
@@ -65,7 +56,8 @@ impl ProxiedV8Primitive {
     }
 
     /// ProxiedV8Primitive -> Luau
-    pub(crate) fn to_luau(self, lua: &mluau::Lua) -> Result<mluau::Value, Error> {
+    pub(crate) fn to_luau(self, lua: &mluau::Lua, ed: &mut EmbedderDataContext) -> Result<mluau::Value, Error> {
+        ed.add(1, "ProxiedV8Primitive -> <base overhead>")?;
         match self {
             ProxiedV8Primitive::Undefined => Ok(mluau::Value::Nil),
             ProxiedV8Primitive::Null => Ok(mluau::Value::NULL),
@@ -73,6 +65,7 @@ impl ProxiedV8Primitive {
             ProxiedV8Primitive::Integer(i) => Ok(mluau::Value::Integer(i as i64)),
             ProxiedV8Primitive::BigInt(i) => Ok(mluau::Value::Integer(i)),
             ProxiedV8Primitive::String(s) => {
+                ed.add(s.len(), "ProxiedV8Primitive -> LuaString")?;
                 let s = lua.create_string(s)
                 .map_err(|e| format!("Failed to create Lua string: {}", e))?;
                 Ok(mluau::Value::String(s))
@@ -81,7 +74,8 @@ impl ProxiedV8Primitive {
     }
 
     /// ProxiedV8Primitive -> V8
-    pub(crate) fn to_v8<'s>(self, scope: &mut v8::PinScope<'s, '_>) -> Result<v8::Local<'s, v8::Value>, Error> {
+    pub(crate) fn to_v8<'s>(self, scope: &mut v8::PinScope<'s, '_>, ed: &mut EmbedderDataContext) -> Result<v8::Local<'s, v8::Value>, Error> {
+        ed.add(1, "ProxiedV8Primitive -> <base overhead>")?;
         match self {
             ProxiedV8Primitive::Null => Ok(v8::null(scope).into()),
             ProxiedV8Primitive::Undefined => Ok(v8::undefined(scope).into()),
@@ -89,6 +83,7 @@ impl ProxiedV8Primitive {
             ProxiedV8Primitive::Integer(i) => Ok(v8::Integer::new(scope, i).into()),
             ProxiedV8Primitive::BigInt(i) => Ok(v8::BigInt::new_from_i64(scope, i).into()),
             ProxiedV8Primitive::String(s) => {
+                ed.add(s.len(), "ProxiedV8Primitive -> V8String")?;
                 let try_catch = std::pin::pin!(v8::TryCatch::new(scope));
                 let try_catch = &mut try_catch.init();
                 let s = v8::String::new(try_catch, &s);
@@ -111,8 +106,10 @@ impl ProxiedV8Primitive {
     pub(crate) fn from_v8<'s>(
         scope: &mut v8::PinScope<'s, '_>,
         value: v8::Local<'s, v8::Value>,
-        ed: &EmbedderData,
+        ed: &mut EmbedderDataContext,
     ) -> Result<Option<Self>, Error> {
+        ed.add(1, "ProxiedV8Primitive -> <base overhead>")?;
+
         if value.is_null() {
             return Ok(Some(ProxiedV8Primitive::Null));
         }
@@ -144,7 +141,7 @@ impl ProxiedV8Primitive {
         if value.is_string() {
             let s = value.to_string(scope).ok_or("Failed to convert to string")?;
             let s_len = s.length();
-            ed.check_value_len(s_len, "ProxiedV8Primitive -> V8String")?;
+            ed.add(s_len, "ProxiedV8Primitive -> V8String")?;
             let string = s.to_rust_string_lossy(scope);
             return Ok(Some(Self::String(string)));
         }

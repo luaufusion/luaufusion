@@ -148,6 +148,7 @@ export function testEmbedderJson(evj) {
             &lua, 
             EmbedderData {
                 heap_limit: HEAP_LIMIT,
+                max_payload_size: Some(24),
                 ..Default::default()
             },
             ProcessOpts {
