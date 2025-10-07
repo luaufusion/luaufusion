@@ -148,7 +148,6 @@ export function testEmbedderJson(evj) {
             &lua, 
             EmbedderData {
                 heap_limit: HEAP_LIMIT,
-                max_payload_size: Some(24),
                 ..Default::default()
             },
             ProcessOpts {
@@ -161,7 +160,7 @@ export function testEmbedderJson(evj) {
             vfs,
         ).await.expect("Failed to create Lua-V8 bridge");
 
-        let test_embedder_json = r#"{"embeddedJson":"embedded22","mynestedMap":{"a":{"b":123,"c":null}}}"#;
+        let test_embedder_json = r#"{"embeddedJson":"embedded22","mynestedMap":{"a":{"b":123,"c":null,"d":{}}}}"#;
         let ev = mluau_quickjs_proxy::luau::embedder_api::LangTransferValue::new_raw(
             serde_json::value::RawValue::from_string(test_embedder_json.to_string()).expect("Failed to convert"), 
         );

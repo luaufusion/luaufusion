@@ -74,7 +74,6 @@ impl V8Value {
         for arg in args {
             let proxied = ProxiedV8Value::from_luau(&self.plc, arg, &mut ed)
             .map_err(|e| format!("Failed to proxy argument to ProxiedV8Value: {}", e))?;
-            println!("edSize: {}", ed.size());
             args_proxied.push(proxied);
         }
         match self.bridge.send(super::bridge::OpCallMessage {

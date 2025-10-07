@@ -43,10 +43,6 @@ impl EmbedderDataContext {
         Self { ed: ed.clone(), size: 0, limit: true, depth: 0 }
     }
 
-    pub fn size(&self) -> usize {
-        self.size
-    }
-
     // Used when a LangTransferValue is sent to disable limits during processing it
     pub fn disable_limits(&self) -> Self {
         Self {
