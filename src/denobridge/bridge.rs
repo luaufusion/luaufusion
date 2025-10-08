@@ -571,7 +571,14 @@ impl V8IsolateManagerServer {
         let (resp_tx, resp_rx) = self.executor.create_oneshot();
         self.messenger.server(self.executor.server_context()).send(msg.to_message(resp_tx))
             .map_err(|e| format!("Failed to send message to V8 isolate: {}", e))?;
-        resp_rx.recv().await.map_err(|e| format!("Failed to receive response from V8 isolate: {}", e).into())
+        
+        let resp = resp_rx.recv().await;
+
+        if self.is_shutdown() {
+            return Err("V8 isolate manager is shut down (likely due to timeout)".into());
+        }
+        
+        resp.map_err(|e| format!("Failed to receive response from V8 isolate: {}", e).into())
     }
 }
 

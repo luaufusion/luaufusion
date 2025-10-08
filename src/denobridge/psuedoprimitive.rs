@@ -116,7 +116,6 @@ impl ProxiedV8PsuedoPrimitive {
 
                 ed.merge(inner_ed)?;
 
-                table.set_metatable(Some(plc.map_mt.clone())).map_err(|e| format!("Failed to set metatable on Lua map: {}", e))?;
                 Ok(mluau::Value::Table(table))
             }
         }

@@ -44,6 +44,14 @@ const __opcall = async (luaid, op, args) => {
 /**
  * Request the disposal of this object from Luau. Useful to ensure quicker cleanup of objects
  * if you know you are done with them.
+ * 
+ * Note 1: values on the registry and *not* reference counted. As such, calling this method will
+ * most likely free all references to this object. Any further use of this object will result
+ * in errors.
+ * Note 2: It is guaranteed that the object's ID will never be reused for another object within the 
+ * proxy bridge.
+ * 
+ * @param {any} obj The object to request disposal of. Must be a Lua object [e.g. has the luaid/luatype symbols]
  */
 const requestDisposal = async (obj) => {
     let luaid = obj[luaidSymbol]

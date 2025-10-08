@@ -98,7 +98,7 @@ impl ProxiedV8Value {
                         LangTransferValueInner::Json(v) => {
                             return Ok(ProxiedV8Value::Transfer(Box::new(json_to_proxied_v8(v, 0)?)));
                         },
-                        LangTransferValueInner::Transfer(lv) => {
+                        LangTransferValueInner::Luau(lv) => {
                             let inner_ed = ed.nest()?;
                             let mut inner_ed = inner_ed.disable_limits();
                             return ProxiedV8Value::from_luau(plc, lv, &mut inner_ed);
@@ -264,6 +264,7 @@ impl ProxiedV8Value {
                 obj.set(scope, oid_key.into(), id_val.into());
                 let type_val = v8::Integer::new(scope, obj_registry_type_to_i32(typ));
                 obj.set(scope, otype_key.into(), type_val.into());
+                obj.set_integrity_level(scope, v8::IntegrityLevel::Frozen);
                 Ok(obj.into())
             },
         }

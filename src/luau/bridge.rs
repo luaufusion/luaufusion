@@ -44,22 +44,18 @@ pub fn i32_to_obj_registry_type(val: i32) -> Option<ObjectRegistryType> {
 /// 
 /// This struct is not thread safe and must be kept on the Lua side
 pub struct ProxyLuaClient {
-    pub(crate) weak_lua: WeakLua,
-    pub(crate) array_mt: mluau::Table,
-    pub(crate) map_mt: mluau::Table,
-    pub(crate) obj_registry: ObjRegistryLuau,
-    pub(crate) ed: EmbedderData,
+    pub weak_lua: WeakLua,
+    pub array_mt: mluau::Table,
+    pub obj_registry: ObjRegistryLuau,
+    pub ed: EmbedderData,
 }
 
 impl ProxyLuaClient {
     /// Creates a new proxy Lua client
     pub fn new(lua: &mluau::Lua, ed: EmbedderData) -> Result<Self, mluau::Error> {
-        let map_mt = lua.create_table()?;
-        map_mt.set("__metatable", false)?;
         Ok(Self {
             weak_lua: lua.weak(),
             array_mt: lua.array_metatable(),
-            map_mt,
             obj_registry: ObjRegistryLuau::new(lua)?,
             ed
         })

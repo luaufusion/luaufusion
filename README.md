@@ -61,7 +61,7 @@ Note: unless explicitly stated, all type conversions are lossless and bidirectio
 | vector                               | array of 3 numbers     | Psuedoprimitive |
 | byte sequence                        | Uint8Array             | Psuedoprimitive |
 | table w/ array_metatable             | Array                  | Psuedoprimitive |
-| table w/ map_metatable               | Map                    | Psuedoprimitive |
+| table without a metatable            | Map                    | Psuedoprimitive |
 | userdata (``V8Value``)               | underlying js value    | Reference  |
 | object with luaid/luatype symbols    | underlying lua value   | Reference  |
 | embedded json* (``EmbeddableJson``)  | json value             | Psuedoprimitive/Primitive (depending on JSON) [1] |

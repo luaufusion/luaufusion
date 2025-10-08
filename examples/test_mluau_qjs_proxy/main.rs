@@ -165,6 +165,13 @@ export function testEmbedderJson(evj) {
             serde_json::value::RawValue::from_string(test_embedder_json.to_string()).expect("Failed to convert"), 
         );
 
+        let bridge_r = bridge.bridge().clone();
+        tokio::task::spawn_local(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            println!("Shutting down bridge due to timeout");
+            bridge_r.shutdown().await.expect("Failed to shutdown bridge");
+        });
+
         // Call the v8 function now as a async script
         let lua_code = r#"
 local function myfooer()
@@ -193,10 +200,11 @@ local keysGetter = result4:getproperty("keysGetter")
 print("keys getter", keysGetter:call(result4))
 
 local staticmaptest = result4:getproperty("staticmaptest")
+local function abcfunc() end
 local smap = {
     abc = 123,
     luau = "is great",
-    meow = { nested = "object" },
+    meow = { nested = "object", ["\xf0\x28\x8c\x28"] = "with null string", [abcfunc] = 44 },
     myarr = {'a','b','c'},
     null = v8:null(),
 }

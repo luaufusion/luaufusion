@@ -104,7 +104,7 @@ impl EmbedderDataContext {
 }
 
 pub enum LangTransferValueInner {
-    Transfer(mluau::Value),
+    Luau(mluau::Value),
     #[cfg(feature = "embedder_json")]
     RawJson(Box<JsonRawValue>),
     #[cfg(feature = "embedder_json")]
@@ -143,7 +143,7 @@ impl LangTransferValue {
     /// Creates a new LangTransferValue from a Luau value
     pub fn new_luau(value: mluau::Value) -> Self {
         Self {
-            inner: Rc::new(RefCell::new(Some(LangTransferValueInner::Transfer(value)))),
+            inner: Rc::new(RefCell::new(Some(LangTransferValueInner::Luau(value)))),
         }
     }
 

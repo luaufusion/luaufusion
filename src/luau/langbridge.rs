@@ -53,9 +53,6 @@ impl<T: ProxyBridge> mluau::UserData for LangBridge<T> {
         methods.add_method("array_metatable", |_, this, ()| {
             Ok(this.plc.array_mt.clone())
         });
-        methods.add_method("map_metatable", |_, this, ()| {
-            Ok(this.plc.map_mt.clone())
-        });
         // For convenience, expose null
         methods.add_method("null", |_, _, ()| {
             Ok(mluau::Value::NULL)
@@ -63,7 +60,7 @@ impl<T: ProxyBridge> mluau::UserData for LangBridge<T> {
 
         methods.add_scheduler_async_method("run", async move |lua, this, modname: String| {
             let result = this.bridge.eval_from_source(modname).await
-                .map_err(|e| mluau::Error::external(format!("Failed to evaluate code in foreign language: {}", e)))?;
+                .map_err(|e| mluau::Error::external(e.to_string()))?;
             this.bridge.to_source_lua_value(&lua, result, &this.plc)
                 .map_err(|e| mluau::Error::external(format!("Failed to convert return value to Lua value: {}", e)))
         });
