@@ -67,7 +67,7 @@ impl V8Value {
     }
 
     /// Do a op call with multiple arguments
-    async fn op_call(&self, obj_id: V8ObjectRegistryID, op: V8ObjectOp, args: mluau::MultiValue) -> Result<mluau::MultiValue, Error> {
+    async fn op_call(&self, lua: &mluau::Lua, obj_id: V8ObjectRegistryID, op: V8ObjectOp, args: mluau::MultiValue) -> Result<mluau::MultiValue, Error> {
         let mut ed = EmbedderDataContext::new(&self.plc.ed);
         
         let mut args_proxied = Vec::with_capacity(args.len());
@@ -84,12 +84,9 @@ impl V8Value {
         .await? {
             Ok(v) => {
                 let mut proxied = mluau::MultiValue::with_capacity(v.len());
-                let Some(lua) = self.plc.weak_lua.try_upgrade() else {
-                    return Err("Lua instance has been dropped".into());
-                };
                 let mut ed = EmbedderDataContext::new(&self.plc.ed);
                 for ret in v {
-                    let ret = ret.to_luau(&lua, &self.plc, &self.bridge, &mut ed)
+                    let ret = ret.to_luau(lua, &self.plc, &self.bridge, &mut ed)
                     .map_err(|e| format!("Failed to convert return value to Lua: {}", e))?;
                     proxied.push_back(ret);
                 }
@@ -102,9 +99,9 @@ impl V8Value {
 
 impl mluau::UserData for V8Value {
     fn add_methods<M: mluau::UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_scheduler_async_method("requestdispose", async move |_, this, ()| {
+        methods.add_scheduler_async_method("requestdispose", async move |lua, this, ()| {
             let id = this.id;
-            this.op_call(id, V8ObjectOp::RequestDispose, mluau::MultiValue::with_capacity(0)).await
+            this.op_call(&lua, id, V8ObjectOp::RequestDispose, mluau::MultiValue::with_capacity(0)).await
             .map_err(|e| mluau::Error::external(format!("Failed to request dispose: {}", e)))?;
             Ok(())
         }); 
@@ -122,8 +119,8 @@ impl mluau::UserData for V8Value {
             Ok(this.type_name())
         });
 
-        methods.add_scheduler_async_method("call", async move |_lua, this, args: mluau::MultiValue| {
-            let resp = this.op_call(this.id, V8ObjectOp::FunctionCall, args)
+        methods.add_scheduler_async_method("call", async move |lua, this, args: mluau::MultiValue| {
+            let resp = this.op_call(&lua, this.id, V8ObjectOp::FunctionCall, args)
             .await
             .map_err(|e| mluau::Error::external(format!("Failed to perform function call: {}", e)))?;
 

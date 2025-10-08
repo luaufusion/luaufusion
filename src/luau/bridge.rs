@@ -44,7 +44,7 @@ pub fn i32_to_obj_registry_type(val: i32) -> Option<ObjectRegistryType> {
 /// 
 /// This struct is not thread safe and must be kept on the Lua side
 pub struct ProxyLuaClient {
-    pub weak_lua: WeakLua,
+    weak_lua: WeakLua,
     pub array_mt: mluau::Table,
     pub obj_registry: ObjRegistryLuau,
     pub ed: EmbedderData,
@@ -99,21 +99,15 @@ enum ValueOrMultiValue {
 }
 
 impl LuauObjectOp {
-    fn create_value_from_args<T: ProxyBridge>(arg: T::ValueType, bridge: &T, plc: &ProxyLuaClient) -> Result<mluau::Value, String> {
-        let Some(lua) = plc.weak_lua.try_upgrade() else {
-            return Err("Lua state has been dropped".into());
-        };
-        bridge.to_source_lua_value(&lua, arg, &plc)
+    fn create_value_from_args<T: ProxyBridge>(lua: &mluau::Lua, arg: T::ValueType, bridge: &T, plc: &ProxyLuaClient) -> Result<mluau::Value, String> {
+        bridge.to_source_lua_value(lua, arg, &plc)
             .map_err(|e| format!("Failed to convert argument to Lua value: {}", e))
     }
-    fn create_multivalue_from_args<T: ProxyBridge>(args: Vec<T::ValueType>, bridge: &T, plc: &ProxyLuaClient) -> Result<mluau::MultiValue, String> {
-        let Some(lua) = plc.weak_lua.try_upgrade() else {
-            return Err("Lua state has been dropped".into());
-        };
+    fn create_multivalue_from_args<T: ProxyBridge>(lua: &mluau::Lua, args: Vec<T::ValueType>, bridge: &T, plc: &ProxyLuaClient) -> Result<mluau::MultiValue, String> {
         let mut mv = mluau::MultiValue::with_capacity(args.len());
         let mut err = None;
         for arg in args {
-            match bridge.to_source_lua_value(&lua, arg, &plc) {
+            match bridge.to_source_lua_value(lua, arg, &plc) {
                 Ok(v) => {
                     mv.push_back(v);
                 },
@@ -131,12 +125,12 @@ impl LuauObjectOp {
         Ok(mv)
     }
 
-    async fn run<T: ProxyBridge>(self, obj_id: LuauObjectRegistryID, args: Vec<T::ValueType>, bridge: T, plc: &ProxyLuaClient) -> Result<ValueOrMultiValue, Error> {
+    async fn run<T: ProxyBridge>(self, lua: &mluau::Lua, obj_id: LuauObjectRegistryID, args: Vec<T::ValueType>, bridge: T, plc: &ProxyLuaClient) -> Result<ValueOrMultiValue, Error> {
         match self {
             Self::FunctionCallSync => {
                 let obj = plc.obj_registry.get(obj_id)
                     .map_err(|e| format!("Failed to get object from registry: {}", e))?;
-                let args = Self::create_multivalue_from_args(args, &bridge, &plc)?;
+                let args = Self::create_multivalue_from_args(lua, args, &bridge, &plc)?;
                 let func = match obj {
                     mluau::Value::Function(f) => f,
                     _ => return Err("Object is not a function".into()),
@@ -146,12 +140,9 @@ impl LuauObjectOp {
                 .map(ValueOrMultiValue::MultiValue)
             }
             Self::FunctionCallAsync => {
-                let Some(lua) = plc.weak_lua.try_upgrade() else {
-                    return Err("Lua state has been dropped".into());
-                };
                 let obj = plc.obj_registry.get(obj_id)
                     .map_err(|e| format!("Failed to get object from registry: {}", e))?;
-                let args = Self::create_multivalue_from_args(args, &bridge, &plc)?;
+                let args = Self::create_multivalue_from_args(lua, args, &bridge, &plc)?;
                 let func = match obj {
                     mluau::Value::Function(f) => f,
                     _ => return Err("Object is not a function".into()),
@@ -177,7 +168,7 @@ impl LuauObjectOp {
                     return Err("Index operation requires exactly one argument".into());
                 }
                 let arg = args.into_iter().next().ok_or("Failed to get argument for index operation".to_string())?;
-                let key = Self::create_value_from_args(arg, &bridge, &plc)?;
+                let key = Self::create_value_from_args(lua, arg, &bridge, &plc)?;
 
                 let obj = plc.obj_registry.get(obj_id)
                     .map_err(|e| format!("Failed to get object from registry: {}", e))?;
@@ -241,25 +232,14 @@ impl<T: ProxyBridge> LuaBridgeService<T> {
                         LuaBridgeMessage::OpCall { obj_id, op, args, resp } => {
                             let bridge = self.bridge.clone();
                             let plc = plc.clone();
-
-                            op_call_queue.push(async move {
-                                (op.run(obj_id, args, bridge, &plc).await, resp)
-                            });
-
-                            /*let th = match lua.create_thread(func.value()) {
-                                Ok(t) => t,
-                                Err(e) => {
-                                    let _ = resp.server(server_ctx).send(Err(format!("Failed to create Lua thread: {}", e).into()));
-                                    continue;
-                                }
+                            let Some(lua) = plc.weak_lua.try_upgrade() else {
+                                let _ = resp.server(server_ctx).send(Err("Lua state has been dropped".into()));
+                                continue;
                             };
 
-                            let taskmgr = mlua_scheduler::taskmgr::get(&lua);
-                            
-                            func_call_queue.push(async move {
-                                let result = taskmgr.spawn_thread_and_wait(th, mv).await;
-                                (result, resp)
-                            });*/
+                            op_call_queue.push(async move {
+                                (op.run(&lua, obj_id, args, bridge, &plc).await, resp)
+                            });
                         }
                         LuaBridgeMessage::Shutdown => {
                             break;

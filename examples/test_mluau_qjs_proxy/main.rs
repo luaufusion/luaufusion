@@ -165,12 +165,12 @@ export function testEmbedderJson(evj) {
             serde_json::value::RawValue::from_string(test_embedder_json.to_string()).expect("Failed to convert"), 
         );
 
-        let bridge_r = bridge.bridge().clone();
+        /*let bridge_r = bridge.bridge().clone();
         tokio::task::spawn_local(async move {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             println!("Shutting down bridge due to timeout");
             bridge_r.shutdown().await.expect("Failed to shutdown bridge");
-        });
+        });*/
 
         // Call the v8 function now as a async script
         let lua_code = r#"
