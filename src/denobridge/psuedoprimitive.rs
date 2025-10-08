@@ -1,8 +1,6 @@
-use std::collections::HashMap;
-
 use deno_core::v8;
 use serde::{Deserialize, Serialize};
-use crate::{base::Error, denobridge::{V8IsolateManagerServer, inner::CommonState, primitives::ProxiedV8Primitive, value::ProxiedV8Value}, luau::{bridge::ProxyLuaClient, embedder_api::EmbedderDataContext}};
+use crate::{base::Error, denobridge::{V8IsolateManagerServer, inner::CommonState, value::ProxiedV8Value}, luau::{bridge::ProxyLuaClient, embedder_api::EmbedderDataContext}};
 
 #[derive(Serialize, Deserialize)]
 /// A psuedoprimitive is a type that is not fully primitive (not immutable/hashable in both v8 and luau) but is copied between v8 and luau
@@ -11,7 +9,7 @@ pub enum ProxiedV8PsuedoPrimitive {
     Vector((f32, f32, f32)),
     StringBytes(serde_bytes::ByteBuf), // For byte sequences that are not valid UTF-8
     StaticList(Vec<ProxiedV8Value>),
-    StaticMap(HashMap<ProxiedV8Primitive, ProxiedV8Value>)
+    StaticMap(Vec<(ProxiedV8Value, ProxiedV8Value)>)
 }
 
 impl ProxiedV8PsuedoPrimitive {
@@ -45,20 +43,18 @@ impl ProxiedV8PsuedoPrimitive {
                     ed.merge(inner_ed)?;
 
                     return Ok(Some(Self::StaticList(list)));
-                } else if mt == Some(plc.map_mt.clone()) {
-                    let mut smap = HashMap::new();
+                } else if mt.is_none() {
+                    let mut smap = Vec::new();
                     let mut n = 0;
                     let mut inner_ed = ed.nest()?;
                     t.for_each(|k, v| {
-                        let k = ProxiedV8Primitive::from_luau(&k, &mut inner_ed)
+                        let k = ProxiedV8Value::from_luau(plc, k, &mut inner_ed)
                             .map_err(|e| mluau::Error::external(e.to_string()))?;
-                        let Some(k) = k else {
-                            return Err(mluau::Error::external("Table key is not a ProxiedV8Primitive"));
-                        };
+
                         let v = ProxiedV8Value::from_luau(plc, v, &mut inner_ed)
                             .map_err(|e| mluau::Error::external(e.to_string()))?;
                         
-                        smap.insert(k, v);
+                        smap.push((k, v));
                         n += 1;
                         Ok(())
                     })
@@ -113,7 +109,7 @@ impl ProxiedV8PsuedoPrimitive {
 
                 let table = lua.create_table().map_err(|e| format!("Failed to create Lua table: {}", e))?;
                 for (k, v) in smap {
-                    let k = k.to_luau(lua, &mut inner_ed)?;
+                    let k = k.to_luau(lua, plc, bridge, &mut inner_ed).map_err(|e| e.to_string())?;
                     let v = v.to_luau(lua, plc, bridge, &mut inner_ed).map_err(|e| format!("Failed to convert value to Lua: {}", e))?;
                     table.set(k, v).map_err(|e| format!("Failed to set key/value in Lua table: {}", e))?;
                 }
@@ -169,7 +165,7 @@ impl ProxiedV8PsuedoPrimitive {
                 let map = v8::Map::new(scope);
                 let mut inner_ed = ed.nest()?;
                 for (k, v) in smap {
-                    let k = k.to_v8(scope, &mut inner_ed)?;
+                    let k = k.to_v8(scope, common_state, &mut inner_ed)?;
                     let v = v.to_v8(scope, common_state, &mut inner_ed)?;
                     map.set(scope, k, v)
                     .ok_or("Failed to set key/value in V8 Map")?;
@@ -236,7 +232,7 @@ impl ProxiedV8PsuedoPrimitive {
         if value.is_map() {
             let map = v8::Local::<v8::Map>::try_from(value)
                 .map_err(|_| "Failed to convert V8 value to Map")?;
-            let mut smap = HashMap::new();
+            let mut smap = Vec::new();
             let entries = map.as_array(scope);
             let length = entries.length();
             ed.add(length as usize, "ProxiedV8Primitive -> V8Map")?;
@@ -245,10 +241,10 @@ impl ProxiedV8PsuedoPrimitive {
             for i in (0..length).step_by(2) {
                 let key = entries.get_index(scope, i).ok_or("Failed to get index of map entries")?;
                 let value = entries.get_index(scope, i + 1).ok_or("Failed to get value of map entries")?;
-                let k = ProxiedV8Primitive::from_v8(scope, key, &mut inner_ed)?.ok_or("Map key is not a ProxiedV8Primitive")?;
+                let k = ProxiedV8Value::from_v8(scope, key, common_state, &mut inner_ed)?;
                 let v = ProxiedV8Value::from_v8(scope, value, common_state, &mut inner_ed)?;
 
-                smap.insert(k, v);
+                smap.push((k, v));
             }
             ed.merge(inner_ed)?;
             return Ok(Some(Self::StaticMap(smap)));

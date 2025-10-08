@@ -193,13 +193,13 @@ local keysGetter = result4:getproperty("keysGetter")
 print("keys getter", keysGetter:call(result4))
 
 local staticmaptest = result4:getproperty("staticmaptest")
-local smap = setmetatable({
+local smap = {
     abc = 123,
     luau = "is great",
-    meow = setmetatable({ nested = "object" }, v8:map_metatable()),
-    myarr = setmetatable({'a','b','c'}, v8:array_metatable()),
+    meow = { nested = "object" },
+    myarr = {'a','b','c'},
     null = v8:null(),
-}, v8:map_metatable())
+}
 
 local smap = staticmaptest:call(smap)
 for k, v in smap do

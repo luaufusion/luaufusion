@@ -53,11 +53,11 @@ pub fn json_to_proxied_v8(value: JsonValue, depth: usize) -> Result<ProxiedV8Val
             Ok(ProxiedV8Value::Primitive(ProxiedV8Primitive::String(s)))
         }
         JsonValue::Object(o) => {
-            let mut smap = std::collections::HashMap::new();
+            let mut smap = Vec::new();
             for (k, v) in o {
-                let pk = ProxiedV8Primitive::String(k);
+                let pk = ProxiedV8Value::Primitive(ProxiedV8Primitive::String(k));
                 let pv = json_to_proxied_v8(v, depth + 1)?;
-                smap.insert(pk, pv);
+                smap.push((pk, pv));
             }
             Ok(ProxiedV8Value::Psuedoprimitive(crate::denobridge::psuedoprimitive::ProxiedV8PsuedoPrimitive::StaticMap(smap)))
         },
