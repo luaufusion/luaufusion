@@ -12,10 +12,13 @@ use super::inner::{CommonState, FunctionRunState};
 // OP to bind arguments to a object by ID, returning a run ID
 #[op2(fast)]
 pub(super) fn __luabind(
-    #[state] state: &CommonState,
+    op_state: &OpState,
     scope: &mut v8::PinScope,
     args: v8::Local<v8::Array>,
 ) -> Result<i32, deno_error::JsErrorBox> {
+    let state = op_state.try_borrow::<CommonState>()
+        .ok_or_else(|| deno_error::JsErrorBox::generic("CommonState not found".to_string()))?;
+
     let mut ed = EmbedderDataContext::new(&state.ed);
 
     let mut args_proxied = Vec::with_capacity(args.length() as usize);
@@ -92,10 +95,13 @@ pub(super) async fn __luarun(
 // OP to get the results of a opcall by run ID
 #[op2]
 pub(super) fn __luaret<'s>(
-    #[state] state: &CommonState,
+    op_state: &OpState,
     scope: &'s mut v8::PinScope,
     run_id: i32,
 ) -> Result<v8::Local<'s, v8::Array>, deno_error::JsErrorBox> {
+    let state = op_state.try_borrow::<CommonState>()
+        .ok_or_else(|| deno_error::JsErrorBox::generic("CommonState not found".to_string()))?;
+
     let func_state = {
         let mut funcs = state.list.borrow_mut();
         let func_state = funcs.remove(&run_id)
@@ -127,6 +133,6 @@ pub(super) fn __luaret<'s>(
         }
         FunctionRunState::Created { .. } => {
             Err(deno_error::JsErrorBox::generic("Function has not been executed yet".to_string()))
-        }
+            }
     }
 }
