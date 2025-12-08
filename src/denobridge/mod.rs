@@ -10,6 +10,5 @@ pub mod luauobjs; // luau objects that proxy to v8
 pub(super) mod inner; // internal state management
 pub(super) mod bridgeops; // deno ops for bridge
 pub(super) mod denoexts;
-pub mod embedder_api; // embedder api specific code
 
 pub use bridge::V8IsolateManagerServer;

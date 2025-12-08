@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::{base::ProxyBridge, luau::{bridge::ProxyLuaClient, embedder_api::EmbedderData}};
+use crate::{base::ProxyBridge, luau::{bridge::ProxyLuaClient, embedder_api::{EmbedderData, EmbedderDataContext}}};
 use concurrentlyexec::{ConcurrentExecutorState, ProcessOpts};
 use mlua_scheduler::LuaSchedulerAsyncUserData;
 
@@ -18,6 +18,23 @@ impl<T: ProxyBridge> LangBridge<T> {
 
     pub fn bridge(&self) -> &T {
         &self.bridge
+    }
+
+    /// Converts a Luau value to the foreign language value type
+    pub fn from_luau_value(
+        &self,
+        lv: mluau::Value,
+        disable_limits: bool,
+    ) -> Result<T::ValueType, crate::base::Error> {
+        let Some(lua) = self.plc.weak_lua.try_upgrade() else {
+            return Err("Lua state has been dropped".into());
+        };
+
+        let mut ed = EmbedderDataContext::new(&self.plc.ed);
+        if disable_limits {
+            ed.disable_limits();
+        }
+        return self.bridge.from_source_lua_value(&lua, &self.plc, lv, &mut ed);
     }
 
     pub async fn new_from_bridge(

@@ -1,10 +1,6 @@
 use serde::{Deserialize, Serialize};
 use crate::denobridge::bridge::V8ObjectRegistryType;
-#[cfg(feature = "embedder_json")]
-use crate::denobridge::embedder_api::{json_raw_to_proxied_v8, json_to_proxied_v8};
-use crate::luau::embedder_api::EmbedderDataContext;
-#[cfg(feature = "embedder_json")]
-use crate::luau::embedder_api::{LangTransferValue, LangTransferValueInner};
+use crate::luau::embedder_api::{EmbedderDataContext, SourceTransferValue};
 use crate::denobridge::psuedoprimitive::ProxiedV8PsuedoPrimitive;
 use crate::{base::Error, denobridge::luauobjs::V8Value};
 use crate::denobridge::objreg::V8ObjectRegistryID;
@@ -27,6 +23,8 @@ pub enum ProxiedV8Value {
     Psuedoprimitive(ProxiedV8PsuedoPrimitive),
 
     /// Embedder-transferred value (does not follow proxy payload limits)
+    /// 
+    /// Created using SourceTransferValue<T>
     Transfer(Box<ProxiedV8Value>),
 
     /// v8-owned stuff
@@ -85,25 +83,12 @@ impl ProxiedV8Value {
                 }
 
                 // Handle LangTransferValue
-                if let Ok(ev) = ud.borrow::<LangTransferValue>() {
-                    let Some(json) = ev.take() else {
+                if let Ok(ev) = ud.borrow::<SourceTransferValue<V8IsolateManagerServer>>() {
+                    let Some(pv8value) = ev.take() else {
                         return Err("LangTransferValue has already been taken".into());
                     };
 
-                    match json {
-                        #[cfg(feature = "embedder_json")]
-                        LangTransferValueInner::RawJson(raw) => {
-                            return Ok(ProxiedV8Value::Transfer(Box::new(json_raw_to_proxied_v8(&raw, 0)?)));
-                        },
-                        LangTransferValueInner::Json(v) => {
-                            return Ok(ProxiedV8Value::Transfer(Box::new(json_to_proxied_v8(v, 0)?)));
-                        },
-                        LangTransferValueInner::Luau(lv) => {
-                            let inner_ed = ed.nest()?;
-                            let mut inner_ed = inner_ed.disable_limits();
-                            return ProxiedV8Value::from_luau(plc, lv, &mut inner_ed);
-                        }
-                    }
+                    return Ok(ProxiedV8Value::Transfer(Box::new(pv8value)));
                 }
 
                 let userdata_id = plc.obj_registry.add(mluau::Value::UserData(ud))

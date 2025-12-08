@@ -1,17 +1,10 @@
-#[cfg(feature = "embedder_json")]
 use std::cell::RefCell;
-#[cfg(feature = "embedder_json")]
 use std::rc::Rc;
 
 use serde::{Deserialize, Serialize};
-#[cfg(feature = "embedder_json")]
-use serde_json::Value as JsonValue;
-#[cfg(feature = "embedder_json")]
-use serde_json::value::RawValue as JsonRawValue;
 
 use crate::MAX_PROXY_DEPTH;
-use crate::base::Error;
-use crate::denobridge::bridge::MIN_HEAP_LIMIT;
+use crate::base::{Error, ProxyBridge, ProxyBridgeWithStringExt};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 /// Embedder specific configuration data
@@ -22,16 +15,17 @@ pub struct EmbedderData {
     pub max_payload_size: Option<usize>,
 }
 
-impl Default for EmbedderData {
-    fn default() -> Self {
+impl EmbedderData {
+    /// Creates a new EmbedderData with default values
+    pub fn new(heap_limit: usize, max_payload_size: Option<usize>) -> Self {
         Self {
-            heap_limit: MIN_HEAP_LIMIT,
-            max_payload_size: None,
+            heap_limit,
+            max_payload_size,
         }
     }
 }
 
-pub(crate) struct EmbedderDataContext {
+pub struct EmbedderDataContext {
     ed: EmbedderData,
     size: usize, // Current size of constructed values
     limit: bool,
@@ -103,55 +97,32 @@ impl EmbedderDataContext {
     }
 }
 
-pub enum LangTransferValueInner {
-    Luau(mluau::Value),
-    #[cfg(feature = "embedder_json")]
-    RawJson(Box<JsonRawValue>),
-    #[cfg(feature = "embedder_json")]
-    Json(JsonValue),
+/// An TransferValue is a opaque userdata object that can be used to transfer data
+/// from the Luau side to the foreign language side while avoiding having its size counted within the proxy's effective size code
+pub struct SourceTransferValue<T: ProxyBridge> {
+    pub(crate) inner: Rc<RefCell<Option<T::ValueType>>>,
 }
 
-/// An LangTransferValue is a opaque userdata object that can be used to quickly transfer data
-/// from the Luau side to JS side (often without needing to parse it into a LuaValue first before sending
-/// to JS) and convert it there. This is useful for large JSON blobs, as it avoids the overhead of
-/// parsing and serializing the JSON multiple times and the memory overhead of holding multiple copies
-/// of the data in memory (both in Luau and in JS).
-/// 
-/// The other use case of LangTransferValue is to enable embedders to transfer data from Luau to JS while 
-/// avoiding having its size counted within the proxy's effective size code (TODO: this does not currently work)
-pub struct LangTransferValue {
-    pub(crate) inner: Rc<RefCell<Option<LangTransferValueInner>>>,
-}
-
-impl LangTransferValue {
-    /// Creates a new LangTransferValue from a RawValue
-    #[cfg(feature = "embedder_json")]
-    pub fn new_raw(value: Box<JsonRawValue>) -> Self {
+impl<T: ProxyBridge> SourceTransferValue<T> {
+    /// Creates a new SourceTransferValue from a T::ValueType
+    pub fn new(value: T::ValueType) -> Self {
         Self {
-            inner: Rc::new(RefCell::new(Some(LangTransferValueInner::RawJson(value)))),
+            inner: Rc::new(RefCell::new(Some(value))),
         }
     }
 
-    /// Creates a new LangTransferValue from a owned JsonValue
-    #[cfg(feature = "embedder_json")]
-    pub fn new_owned(value: JsonValue) -> Self {
-        Self {
-            inner: Rc::new(RefCell::new(Some(LangTransferValueInner::Json(value)))),
-        }
+    /// Creates a new SourceTransferValue from a raw string
+    pub fn from_str(s: String) -> Self 
+    where T: ProxyBridgeWithStringExt,
+    {
+        Self::new(
+            T::from_string(s)
+        )
     }
 
-    /// Creates a new LangTransferValue from a Luau value
-    pub fn new_luau(value: mluau::Value) -> Self {
-        Self {
-            inner: Rc::new(RefCell::new(Some(LangTransferValueInner::Luau(value)))),
-        }
-    }
-
-    pub fn take(&self) -> Option<LangTransferValueInner> {
+    pub fn take(&self) -> Option<T::ValueType> {
         self.inner.borrow_mut().take()
     }
 }
 
-// Empty userdata impl
-#[cfg(feature = "embedder_json")]
-impl mluau::UserData for LangTransferValue {}
+impl<T: ProxyBridge> mluau::UserData for SourceTransferValue<T> {}

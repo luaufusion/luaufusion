@@ -21,9 +21,7 @@ deno_permissions = { version = "0.77", optional = true }
 thiserror = { version = "2", optional = true }
 base64-simd = { version = "0.8", optional = true }
 serde_bytes = "0.11.19"
-serde_json = { version = "1", optional = true, features = ["raw_value"] }
 
 [features]
-default = ["deno", "embedder_json"]
+default = ["deno"]
 deno = ["dep:deno_core", "dep:deno_url", "dep:deno_webidl", "dep:deno_error", "dep:deno_console", "dep:thiserror", "dep:base64-simd", "dep:deno_permissions"]
-embedder_json = ["dep:serde_json"]

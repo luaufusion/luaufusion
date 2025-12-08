@@ -16,11 +16,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::denobridge::modloader::FusionModuleLoader;
 use crate::denobridge::objreg::{V8ObjectRegistry, V8ObjectRegistryID};
+use crate::denobridge::primitives::ProxiedV8Primitive;
 use crate::luau::bridge::{
     LuaBridgeMessage, LuaBridgeService, LuaBridgeServiceClient, ProxyLuaClient,
 };
 
-use crate::base::{ProxyBridge, Error};
+use crate::base::{Error, ProxyBridge, ProxyBridgeWithStringExt};
 use crate::luau::embedder_api::{EmbedderData, EmbedderDataContext};
 use super::inner::V8IsolateManagerInner;
 
@@ -610,9 +611,8 @@ impl ProxyBridge for V8IsolateManagerServer {
         Ok(value.to_luau(lua, plc, self, &mut ed).map_err(|e| e.to_string())?)
     }
 
-    fn from_source_lua_value(&self, _lua: &mluau::Lua, plc: &ProxyLuaClient, value: mluau::Value) -> Result<Self::ValueType, crate::base::Error> {
-        let mut ed = EmbedderDataContext::new(&plc.ed);
-        Ok(ProxiedV8Value::from_luau(plc, value, &mut ed).map_err(|e| e.to_string())?)
+    fn from_source_lua_value(&self, _lua: &mluau::Lua, plc: &ProxyLuaClient, value: mluau::Value, ed: &mut EmbedderDataContext) -> Result<Self::ValueType, crate::base::Error> {
+        Ok(ProxiedV8Value::from_luau(plc, value, ed).map_err(|e| e.to_string())?)
     }
 
     async fn eval_from_source(&self, modname: String) -> Result<Self::ValueType, crate::base::Error> {
@@ -631,3 +631,9 @@ impl ProxyBridge for V8IsolateManagerServer {
     }
 }
 
+impl ProxyBridgeWithStringExt for V8IsolateManagerServer {
+    /// Creates the foreign language value type from a string
+    fn from_string(s: String) -> Self::ValueType {
+        ProxiedV8Value::Primitive(ProxiedV8Primitive::String(s))
+    }
+}

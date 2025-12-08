@@ -1,4 +1,4 @@
-use crate::{base::ProxyBridge, luau::{embedder_api::EmbedderData, objreg::{LuauObjectRegistryID, ObjRegistryLuau}}};
+use crate::{base::ProxyBridge, luau::{embedder_api::{EmbedderData, EmbedderDataContext}, objreg::{LuauObjectRegistryID, ObjRegistryLuau}}};
 use concurrentlyexec::{ClientContext, MultiReceiver, MultiSender, OneshotSender};
 use mluau::{LuaSerdeExt, ObjectLike};
 use serde::{Deserialize, Serialize};
@@ -44,7 +44,7 @@ pub fn i32_to_obj_registry_type(val: i32) -> Option<ObjectRegistryType> {
 /// 
 /// This struct is not thread safe and must be kept on the Lua side
 pub struct ProxyLuaClient {
-    weak_lua: WeakLua,
+    pub(super) weak_lua: WeakLua,
     pub array_mt: mluau::Table,
     pub obj_registry: ObjRegistryLuau,
     pub ed: EmbedderData,
@@ -259,7 +259,8 @@ impl<T: ProxyBridge> LuaBridgeService<T> {
 
                             match ret {
                                 ValueOrMultiValue::Value(v) => {
-                                    match self.bridge.from_source_lua_value(&lua, &plc, v) {
+                                    let mut ed = EmbedderDataContext::new(&plc.ed);
+                                    match self.bridge.from_source_lua_value(&lua, &plc, v, &mut ed) {
                                         Ok(pv) => {
                                             let _ = resp.server(server_ctx).send(Ok(vec![pv]));
                                         }
@@ -271,8 +272,9 @@ impl<T: ProxyBridge> LuaBridgeService<T> {
                                 ValueOrMultiValue::MultiValue(v) => {
                                     let mut args = Vec::with_capacity(v.len());
                                     let mut err = None;
+                                    let mut ed = EmbedderDataContext::new(&plc.ed);
                                     for v in v {
-                                        match self.bridge.from_source_lua_value(&lua, &plc, v) {
+                                        match self.bridge.from_source_lua_value(&lua, &plc, v, &mut ed) {
                                             Ok(pv) => {
                                                 args.push(pv);
                                             }
