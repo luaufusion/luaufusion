@@ -1,7 +1,7 @@
 use mlua_scheduler::LuaSchedulerAsyncUserData;
 use super::primitives::ProxiedV8Primitive;
 use super::bridge::{
-    V8ObjectRegistryType, V8IsolateManagerServer, v8_obj_registry_type_to_i32,
+    V8ObjectRegistryType, V8IsolateManagerServer,
 };
 use crate::base::Error;
 use crate::denobridge::bridge::V8ObjectOp;
@@ -26,15 +26,6 @@ impl V8Value {
             typ,
             plc,
             bridge,
-        }
-    }
-
-    fn type_name(&self) -> &'static str {
-        match self.typ {
-            V8ObjectRegistryType::Function => "V8Function",
-            V8ObjectRegistryType::Object => "V8Object",
-            V8ObjectRegistryType::ArrayBuffer => "V8ArrayBuffer",
-            V8ObjectRegistryType::Promise => "V8Promise",
         }
     }
 
@@ -110,13 +101,9 @@ impl mluau::UserData for V8Value {
             Ok(this.id.objid())
         });
 
-        methods.add_method("type", |_, this, ()| {
-            Ok(v8_obj_registry_type_to_i32(this.typ))
-        });
-
         // Underlying JS type name
         methods.add_method("typename", |_, this, ()| {
-            Ok(this.type_name())
+            Ok(this.typ.type_name())
         });
 
         methods.add_scheduler_async_method("call", async move |lua, this, args: mluau::MultiValue| {

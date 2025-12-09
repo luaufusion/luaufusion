@@ -7,38 +7,6 @@ use mluau::WeakLua;
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
-pub fn luau_value_to_obj_registry_type(val: &mluau::Value) -> Option<ObjectRegistryType> {
-    match val {
-        mluau::Value::Table(_) => Some(ObjectRegistryType::Table),
-        mluau::Value::Function(_) => Some(ObjectRegistryType::Function),
-        mluau::Value::UserData(_) => Some(ObjectRegistryType::UserData),
-        mluau::Value::Buffer(_) => Some(ObjectRegistryType::Buffer),
-        mluau::Value::Thread(_) => Some(ObjectRegistryType::Thread),
-        _ => None,
-    }
-}
-
-pub fn obj_registry_type_to_i32(typ: ObjectRegistryType) -> i32 {
-    match typ {
-        ObjectRegistryType::Table => 0,
-        ObjectRegistryType::Function => 1,
-        ObjectRegistryType::UserData => 2,
-        ObjectRegistryType::Buffer => 3,
-        ObjectRegistryType::Thread => 4,
-    }
-}
-
-pub fn i32_to_obj_registry_type(val: i32) -> Option<ObjectRegistryType> {
-    match val {
-        0 => Some(ObjectRegistryType::Table),
-        1 => Some(ObjectRegistryType::Function),
-        2 => Some(ObjectRegistryType::UserData),
-        3 => Some(ObjectRegistryType::Buffer),
-        4 => Some(ObjectRegistryType::Thread),
-        _ => None,
-    }
-}
-
 #[derive(Clone)]
 /// The client side state for proxying Lua values
 /// 
@@ -69,6 +37,50 @@ pub enum ObjectRegistryType {
     UserData,
     Buffer,
     Thread,
+}
+
+impl ObjectRegistryType {
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            ObjectRegistryType::Table => "table",
+            ObjectRegistryType::Function => "function",
+            ObjectRegistryType::UserData => "userdata",
+            ObjectRegistryType::Buffer => "buffer",
+            ObjectRegistryType::Thread => "thread",
+        }
+    }  
+
+    pub fn from_i32(val: i32) -> Option<Self> {
+        match val {
+            0 => Some(ObjectRegistryType::Table),
+            1 => Some(ObjectRegistryType::Function),
+            2 => Some(ObjectRegistryType::UserData),
+            3 => Some(ObjectRegistryType::Buffer),
+            4 => Some(ObjectRegistryType::Thread),
+            _ => None,
+        }
+    }
+
+    pub fn from_value(val: &mluau::Value) -> Option<Self> {
+        match val {
+            mluau::Value::Table(_) => Some(ObjectRegistryType::Table),
+            mluau::Value::Function(_) => Some(ObjectRegistryType::Function),
+            mluau::Value::UserData(_) => Some(ObjectRegistryType::UserData),
+            mluau::Value::Buffer(_) => Some(ObjectRegistryType::Buffer),
+            mluau::Value::Thread(_) => Some(ObjectRegistryType::Thread),
+            _ => None,
+        }
+    }
+
+    pub fn to_i32(self) -> i32 {
+        match self {
+            ObjectRegistryType::Table => 0,
+            ObjectRegistryType::Function => 1,
+            ObjectRegistryType::UserData => 2,
+            ObjectRegistryType::Buffer => 3,
+            ObjectRegistryType::Thread => 4,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]

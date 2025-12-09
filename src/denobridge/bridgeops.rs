@@ -5,7 +5,7 @@ use deno_core::{op2, v8, OpState};
 
 use crate::luau::bridge::LuauObjectOp;
 use crate::luau::embedder_api::EmbedderDataContext;
-use crate::luau::objreg::LuauObjectRegistryID;
+use crate::luau::LuauObjectRegistryID;
 use super::value::ProxiedV8Value;
 use super::inner::{CommonState, FunctionRunState};
 

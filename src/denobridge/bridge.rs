@@ -109,24 +109,15 @@ pub enum V8ObjectRegistryType {
     Promise,
 }
 
-pub fn v8_obj_registry_type_to_i32(typ: V8ObjectRegistryType) -> i32 {
-    match typ {
-        V8ObjectRegistryType::ArrayBuffer => 0,
-        V8ObjectRegistryType::Object => 1,
-        V8ObjectRegistryType::Function => 2,
-        V8ObjectRegistryType::Promise => 3,
-    }
-}
-
-#[allow(dead_code)]
-pub fn i32_to_v8_obj_registry_type(i: i32) -> Option<V8ObjectRegistryType> {
-    match i {
-        0 => Some(V8ObjectRegistryType::ArrayBuffer),
-        2 => Some(V8ObjectRegistryType::Object),
-        4 => Some(V8ObjectRegistryType::Function),
-        5 => Some(V8ObjectRegistryType::Promise),
-        _ => None,
-    }
+impl V8ObjectRegistryType {
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            V8ObjectRegistryType::Function => "Function",
+            V8ObjectRegistryType::Object => "Object",
+            V8ObjectRegistryType::ArrayBuffer => "ArrayBuffer",
+            V8ObjectRegistryType::Promise => "Promise",
+        }
+    }  
 }
 
 #[derive(Clone)]

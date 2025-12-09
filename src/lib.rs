@@ -1,6 +1,6 @@
 pub mod base;
 pub mod luau;
-//pub mod parallelluau;
+pub mod parallelluau;
 #[cfg(feature = "deno")]
 pub mod denobridge;
 

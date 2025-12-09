@@ -4,11 +4,11 @@ use crate::luau::embedder_api::{EmbedderDataContext, SourceTransferValue};
 use crate::denobridge::psuedoprimitive::ProxiedV8PsuedoPrimitive;
 use crate::{base::Error, denobridge::luauobjs::V8Value};
 use crate::denobridge::objreg::V8ObjectRegistryID;
-use crate::luau::objreg::LuauObjectRegistryID;
+use crate::luau::LuauObjectRegistryID;
 use super::primitives::ProxiedV8Primitive;
 use super::V8IsolateManagerServer;
 use crate::luau::bridge::{
-    ObjectRegistryType, ProxyLuaClient, i32_to_obj_registry_type, luau_value_to_obj_registry_type, obj_registry_type_to_i32
+    ObjectRegistryType, ProxyLuaClient
 };
 use super::inner::CommonState;
 use deno_core::v8;
@@ -97,7 +97,7 @@ impl ProxiedV8Value {
             }
             mluau::Value::Error(e) => return Err(format!("Cannot proxy Lua error value: {}", e).into()),
             value => {
-                let obj_type = match luau_value_to_obj_registry_type(&value) {
+                let obj_type = match ObjectRegistryType::from_value(&value) {
                     Some(t) => t,
                     None => return Err(format!("Cannot proxy Luau value of type {:?}", value).into()),
                 };
@@ -147,8 +147,7 @@ impl ProxiedV8Value {
         if let Some(typ_val) = typ_val {
             if typ_val.is_int32() {
                 let typ_i32 = typ_val.to_int32(scope).ok_or("Failed to convert lua type to int32")?.value();
-                if let Some(typ) = i32_to_obj_registry_type(typ_i32) {
-                    
+                if let Some(typ) = ObjectRegistryType::from_i32(typ_i32) {
                     // Look for luaid
                     let lua_id = {
                         let p_obj_key = v8::Local::new(scope, &common_state.bridge_vals.lua_id_symbol);
@@ -247,7 +246,7 @@ impl ProxiedV8Value {
 
                 let id_val = v8::BigInt::new_from_i64(scope, id.objid());
                 obj.set(scope, oid_key.into(), id_val.into());
-                let type_val = v8::Integer::new(scope, obj_registry_type_to_i32(typ));
+                let type_val = v8::Integer::new(scope, typ.to_i32());
                 obj.set(scope, otype_key.into(), type_val.into());
                 obj.set_integrity_level(scope, v8::IntegrityLevel::Frozen);
                 Ok(obj.into())
