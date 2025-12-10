@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use deno_core::{ModuleCodeString, ModuleLoadResponse, ModuleLoader, ModuleSource, ModuleSourceCode, ModuleSpecifier, ModuleType, RequestedModuleType, ResolutionKind, error::ModuleLoaderError, resolve_import};
+use deno_core::{ModuleCodeString, ModuleLoadOptions, ModuleLoadReferrer, ModuleLoadResponse, ModuleLoader, ModuleSource, ModuleSourceCode, ModuleSpecifier, ModuleType, RequestedModuleType, ResolutionKind, error::ModuleLoaderError, resolve_import};
 use deno_error::JsErrorBox;
 
 /// A module loader that you can pre-load a number of modules into and resolve from. Useful for testing and
@@ -44,15 +44,14 @@ impl ModuleLoader for FusionModuleLoader {
   fn load(
     &self,
     module_specifier: &ModuleSpecifier,
-    _maybe_referrer: Option<&ModuleSpecifier>,
-    _is_dyn_import: bool,
-    requested_module_type: RequestedModuleType,
+    _maybe_referrer: Option<&ModuleLoadReferrer>,
+    options: ModuleLoadOptions,
   ) -> ModuleLoadResponse {
     // TODO: Handle this better?
 
     let path = module_specifier.path_segments().unwrap().collect::<Vec<_>>().join("/");
 
-    let module_type = if requested_module_type == RequestedModuleType::Json {
+    let module_type = if options.requested_module_type == RequestedModuleType::Json {
       ModuleType::Json
     } else {
       let ext = path

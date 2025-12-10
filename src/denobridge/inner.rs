@@ -120,10 +120,6 @@ impl V8IsolateManagerInner {
 
         deno.op_state().borrow_mut().put(common_state.clone());
 
-        let permissions = deno_permissions::Permissions::allow_all();
-
-        deno.op_state().borrow_mut().put(permissions);
-
         Self {
             deno,
             cancellation_token: heap_exhausted_token,

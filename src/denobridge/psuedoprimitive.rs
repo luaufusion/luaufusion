@@ -143,7 +143,7 @@ impl ProxiedV8PsuedoPrimitive {
                 // Proxy as a Uint8Array to v8
                 ed.add(b.len(), "ProxiedV8Primitive -> StringBytes")?;
 
-                let bs = v8::ArrayBuffer::new_backing_store_from_bytes(b.into_vec());
+                let bs = deno_core::serde_v8::v8_create_backing_store(scope, &b, b.len());
                 let array_buffer = v8::ArrayBuffer::with_backing_store(scope, &bs.make_shared());
                 let uint8_array = v8::Uint8Array::new(scope, array_buffer, 0, array_buffer.byte_length()).ok_or("Failed to create Uint8Array from ArrayBuffer")?;
                 return Ok(uint8_array.into());

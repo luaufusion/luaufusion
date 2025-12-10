@@ -35,15 +35,15 @@ impl ExtensionTrait<()> for init_console {
         init_console::init()
     }
 }
-impl ExtensionTrait<()> for deno_console::deno_console {
+impl ExtensionTrait<()> for super::base_deno::console::deno_console {
     fn init((): ()) -> Extension {
-        deno_console::deno_console::init()
+        super::base_deno::console::deno_console::init()
     }
 }
 
 pub(crate) fn console_extensions(is_snapshot: bool) -> Vec<Extension> {
     vec![
-        deno_console::deno_console::build((), is_snapshot),
+        super::base_deno::console::deno_console::build((), is_snapshot),
         init_console::build((), is_snapshot),
     ]
 }
@@ -59,15 +59,15 @@ impl ExtensionTrait<()> for init_url {
         init_url::init()
     }
 }
-impl ExtensionTrait<()> for deno_url::deno_url {
+impl ExtensionTrait<()> for super::base_deno::url::deno_url {
     fn init((): ()) -> Extension {
-        deno_url::deno_url::init()
+        super::base_deno::url::deno_url::init()
     }
 }
 
 pub(crate) fn url_extensions(is_snapshot: bool) -> Vec<Extension> {
     vec![
-        deno_url::deno_url::build((), is_snapshot),
+        super::base_deno::url::deno_url::build((), is_snapshot),
         init_url::build((), is_snapshot),
     ]
 }
@@ -83,15 +83,15 @@ impl ExtensionTrait<()> for init_webidl {
         init_webidl::init()
     }
 }
-impl ExtensionTrait<()> for deno_webidl::deno_webidl {
+impl ExtensionTrait<()> for super::base_deno::webidl::deno_webidl {
     fn init((): ()) -> Extension {
-        deno_webidl::deno_webidl::init()
+        super::base_deno::webidl::deno_webidl::init()
     }
 }
 
 pub(crate) fn webidl_extensions(is_snapshot: bool) -> Vec<Extension> {
     vec![
-        deno_webidl::deno_webidl::build((), is_snapshot),
+        super::base_deno::webidl::deno_webidl::build((), is_snapshot),
         init_webidl::build((), is_snapshot),
     ]
 }
