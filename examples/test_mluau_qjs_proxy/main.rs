@@ -7,22 +7,33 @@ use mluau_quickjs_proxy::base::ProxyBridge;
 use mluau_quickjs_proxy::denobridge::{V8IsolateManagerServer, run_v8_process_client};
 use mluau_quickjs_proxy::luau::embedder_api::{EmbedderData, SourceTransferValue};
 use mluau_quickjs_proxy::luau::langbridge::LangBridge;
+use mluau_quickjs_proxy::parallelluau::{ParallelLuaProxyBridge, run_luau_process_client};
+use tokio::runtime::LocalOptions;
 
 const HEAP_LIMIT: usize = 10 * 1024 * 1024; // 10 MB
 
 fn main() {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
-        .build()
+        .build_local(LocalOptions::default())
         .unwrap();
 
-    let local = tokio::task::LocalSet::new();
-    local.block_on(&rt, async move {
+    rt.block_on(async move {
         let args = std::env::args().collect::<Vec<_>>();
         if args.len() > 1 {
             assert!(args[1] == "child", "Invalid argument");
-            println!("[child] Starting child process mode");
-            run_v8_process_client().await;
+            assert!(args.len() > 2, "Missing child type");
+            match args[2].as_str() {
+                "v8" => {
+                    println!("[child] Starting child process mode [v8]");
+                    run_v8_process_client().await;
+                },
+                "luau" => {
+                    println!("[child] Starting child process mode [luau]");
+                    run_luau_process_client().await;
+                }
+                _ => panic!("Invalid child type"),
+            }
             println!("[child] Exiting child process mode");
             return;
         }
@@ -144,7 +155,7 @@ export function testEmbedderJson(evj) {
 "#.to_string()),
         ]);
 
-        let bridge = LangBridge::<V8IsolateManagerServer>::new_from_bridge(
+        let bridge_v8 = LangBridge::<V8IsolateManagerServer>::new_from_bridge(
             &lua, 
             EmbedderData {
                 heap_limit: HEAP_LIMIT,
@@ -153,11 +164,39 @@ export function testEmbedderJson(evj) {
             ProcessOpts {
                 debug_print: false,
                 start_timeout: std::time::Duration::from_secs(10),
-                cmd_argv: vec!["-".to_string(), "child".to_string()],
+                cmd_argv: vec!["-".to_string(), "child".to_string(), "v8".to_string()],
                 cmd_envs: vec![],
             },
             ConcurrentExecutorState::new(1),
             vfs,
+        ).await.expect("Failed to create Lua-V8 bridge");
+
+        let vfs_luau = HashMap::from([
+            ("init.luau".to_string(), r#"
+print("In init.luau")
+return {
+    greeting = "Hello from Luau!",
+    greetFromParallelLuau = function(name)
+        return "Hello, " .. name .. ", from Parallel Luau!"
+    end
+}
+"#.to_string()),
+        ]);
+
+        let bridge_luau: LangBridge<ParallelLuaProxyBridge> = LangBridge::<ParallelLuaProxyBridge>::new_from_bridge(
+            &lua, 
+            EmbedderData {
+                heap_limit: HEAP_LIMIT,
+                max_payload_size: None,
+            },
+            ProcessOpts {
+                debug_print: false,
+                start_timeout: std::time::Duration::from_secs(10),
+                cmd_argv: vec!["-".to_string(), "child".to_string(), "luau".to_string()],
+                cmd_envs: vec![],
+            },
+            ConcurrentExecutorState::new(1),
+            vfs_luau,
         ).await.expect("Failed to create Lua-V8 bridge");
 
         let test_embedder_json = r#"{"embeddedJson":"embedded22","mynestedMap":{"a":{"b":123,"c":null,"d":{}}}}"#;
@@ -179,7 +218,7 @@ local function myfooer()
     return 42
 end
 
-local v8, ed = ...
+local v8, luau, ed = ...
 local result = v8:run("foo.js")
 -- args to pass to foo: function() print('am here'); return task.wait(1) end, v8, buffer.create(10)
 print("Result from V8:", result)
@@ -222,6 +261,21 @@ assert(smap.v8 == "is pog", "Invalid static map value for v8 key")
 
 local testEmbedderJson = result4:getproperty("testEmbedderJson")
 testEmbedderJson:call(ed)
+
+v8:shutdown()
+
+print("Running Luau code now")
+local luau_result = luau:run("init.luau")
+print("Luau result:", luau_result, luau_result.greeting)
+assert(luau_result.greeting == "Hello from Luau!", "Invalid greeting from Luau")
+local greetFromParallelLuau = luau_result.greetFromParallelLuau
+print("greetFromParallelLuau:", greetFromParallelLuau)
+assert(typeof(greetFromParallelLuau) == "ForeignLuauValue", "Invalid type for greetFromParallelLuau")
+local greet_msg = greetFromParallelLuau:callasync("my love")
+print("greet_msg:", greet_msg)
+assert(greet_msg == "Hello, my love, from Parallel Luau!", "Invalid greet_msg from Parallel Luau")
+
+luau:shutdown()
 "#;
 
         let func = lua.load(lua_code)
@@ -230,8 +284,10 @@ testEmbedderJson:call(ed)
         let th = lua.create_thread(func).expect("Failed to create Lua thread");
         
         let mut args = mluau::MultiValue::new();
-        let bridgy = bridge.bridge().clone();
-        args.push_back(bridge.into_lua(&lua).expect("Failed to push QuickJS runtime to Lua"));
+        let bridgy = bridge_v8.bridge().clone();
+        let bridgy_luau = bridge_luau.bridge().clone();
+        args.push_back(bridge_v8.into_lua(&lua).expect("Failed to push v8 runtime to Lua"));
+        args.push_back(bridge_luau.into_lua(&lua).expect("Failed to push luau runtime to Lua"));
         args.push_back(ev.into_lua(&lua).expect("Failed to push embeddable json"));
 
         let output = task_mgr
@@ -243,7 +299,11 @@ testEmbedderJson:call(ed)
         
         println!("Output: {:?}", output);
 
+        println!("Shutting down v8 bridge");
         bridgy.shutdown().await.expect("Failed to shutdown bridge");
+        println!("Shutting down luau bridge");
+        bridgy_luau.shutdown().await.expect("Failed to shutdown luau bridge");
+        println!("Shutdown complete");
         tokio::time::sleep(std::time::Duration::from_secs(1)).await; // Wait a bit for the child process to exit
     });
 }

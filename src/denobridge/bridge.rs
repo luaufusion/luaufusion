@@ -3,16 +3,13 @@ use super::value::ProxiedV8Value;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use concurrentlyexec::{ConcurrentExecutor, ConcurrentExecutorState, ConcurrentlyExecute, MultiSender, OneshotSender, ProcessOpts};
-//use deno_core::error::{CoreError, CoreErrorKind};
 use deno_core::{PollEventLoopOptions, v8};
 use futures_util::stream::FuturesUnordered;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-//use deno_core::{op2, OpState};
-//use deno_error::JsErrorBox;
-//use mluau::serde::de;
 
 use crate::denobridge::modloader::FusionModuleLoader;
 use crate::denobridge::objreg::{V8ObjectRegistry, V8ObjectRegistryID};
@@ -21,7 +18,7 @@ use crate::luau::bridge::{
     LuaBridgeMessage, LuaBridgeService, LuaBridgeServiceClient, ProxyLuaClient,
 };
 
-use crate::base::{Error, ProxyBridge, ProxyBridgeWithStringExt};
+use crate::base::{Error, ProxyBridge, ProxyBridgeWithMultiprocessExt, ProxyBridgeWithStringExt};
 use crate::luau::embedder_api::{EmbedderData, EmbedderDataContext};
 use super::inner::V8IsolateManagerInner;
 
@@ -133,7 +130,7 @@ pub struct ProxyV8Client {
 pub(super) enum V8IsolateManagerMessage {
     CodeExec {
         modname: String,
-        resp: OneshotSender<Result<ProxiedV8Value, String>>,
+        resp: OneshotSender<Result<Vec<ProxiedV8Value>, String>>,
     },
     OpCall {
         obj_id: V8ObjectRegistryID,
@@ -155,7 +152,7 @@ pub(super) struct CodeExecMessage {
 }
 
 impl V8IsolateSendableMessage for CodeExecMessage {
-    type Response = Result<ProxiedV8Value, String>;
+    type Response = Result<Vec<ProxiedV8Value>, String>;
     fn to_message(self, resp: OneshotSender<Self::Response>) -> V8IsolateManagerMessage {
         V8IsolateManagerMessage::CodeExec {
             modname: self.modname,
@@ -332,9 +329,9 @@ impl ConcurrentlyExecute for V8IsolateManagerClient {
 
         loop {
             tokio::select! {
-                Ok(msg) = rx.recv() => {
+                msg = rx.recv() => {
                     match msg {
-                        V8IsolateManagerMessage::CodeExec { modname, resp } => {
+                        Ok(V8IsolateManagerMessage::CodeExec { modname, resp }) => {
                             if let Some(module_id) = evaluated_modules.get(&modname) {
                                 // Module already evaluated, just return the namespace object
                                 let namespace_obj = match inner.deno.get_module_namespace(*module_id) {
@@ -363,7 +360,7 @@ impl ConcurrentlyExecute for V8IsolateManagerClient {
                                     }
                                 };
 
-                                let _ = resp.client(&client_ctx).send(Ok(proxied));
+                                let _ = resp.client(&client_ctx).send(Ok(vec![proxied]));
                                 continue;
                             }
 
@@ -396,7 +393,7 @@ impl ConcurrentlyExecute for V8IsolateManagerClient {
                                 (modname, module_id, resp)
                             });
                         },
-                        V8IsolateManagerMessage::OpCall { obj_id, op, args, resp } => {
+                        Ok(V8IsolateManagerMessage::OpCall { obj_id, op, args, resp }) => {
                             let fut = match op.run(&mut inner, obj_id, args) {
                                 Ok(v) => v,
                                 Err(e) => {
@@ -417,9 +414,13 @@ impl ConcurrentlyExecute for V8IsolateManagerClient {
                                 }
                             }
                         },
-                        V8IsolateManagerMessage::Shutdown => {
+                        Ok(V8IsolateManagerMessage::Shutdown) => {
                             println!("V8 isolate manager received shutdown message");
                             break;
+                        }
+                        Err(e) => {
+                            println!("Error receiving message in V8 isolate manager: {}", e);
+                            //break;
                         }
                     }
                 }
@@ -491,7 +492,7 @@ impl ConcurrentlyExecute for V8IsolateManagerClient {
                         }
                     };
 
-                    let _ = resp.client(&client_ctx).send(Ok(proxied));
+                    let _ = resp.client(&client_ctx).send(Ok(vec![proxied]));
                 }
             }
         }
@@ -572,6 +573,15 @@ impl V8IsolateManagerServer {
         
         resp.map_err(|e| format!("Failed to receive response from V8 isolate: {}", e).into())
     }
+
+    /// Send a message to the V8 isolate process without waiting for a response
+    pub(super) fn fire<T: V8IsolateSendableMessage>(&self, msg: T) -> Result<(), crate::base::Error> {
+        let (resp_tx, _resp_rx) = self.executor.create_oneshot();
+        self.messenger.server(self.executor.server_context()).send(msg.to_message(resp_tx))
+            .map_err(|e| format!("Failed to send message to V8 isolate: {}", e))?;
+
+        Ok(())        
+    }
 }
 
 
@@ -593,10 +603,6 @@ impl ProxyBridge for V8IsolateManagerServer {
         Self::new(cs_state, ed, process_opts, plc, vfs).await        
     }
 
-    fn get_executor(&self) -> Arc<ConcurrentExecutor<Self::ConcurrentlyExecuteClient>> {
-        self.executor.clone()
-    }
-
     fn to_source_lua_value(&self, lua: &mluau::Lua, value: Self::ValueType, plc: &ProxyLuaClient) -> Result<mluau::Value, Error> {
         let mut ed = EmbedderDataContext::new(&plc.ed);
         Ok(value.to_luau(lua, plc, self, &mut ed).map_err(|e| e.to_string())?)
@@ -606,19 +612,31 @@ impl ProxyBridge for V8IsolateManagerServer {
         Ok(ProxiedV8Value::from_luau(plc, value, ed).map_err(|e| e.to_string())?)
     }
 
-    async fn eval_from_source(&self, modname: String) -> Result<Self::ValueType, crate::base::Error> {
+    async fn eval_from_source(&self, modname: String) -> Result<Vec<Self::ValueType>, crate::base::Error> {
         Ok(self.send(CodeExecMessage { modname }).await??)
     }
 
     async fn shutdown(&self) -> Result<(), crate::base::Error> {
-        let _ = self.send(ShutdownMessage).await;
-        self.executor.shutdown().await?;
-        self.executor.wait().await?;
+        let _ = self.fire(ShutdownMessage);
+        tokio::time::sleep(Duration::from_millis(100)).await; // Give some time for the message to be processed
+        tokio::time::timeout(Duration::from_secs(5), self.executor.shutdown())
+            .await
+            .map_err(|e| format!("Timeout shutting down V8 isolate manager executor: {}", e))??;
+        tokio::time::timeout(Duration::from_secs(5), self.executor.wait())
+            .await
+            .map_err(|e| format!("Timeout waiting for V8 isolate manager to shut down: {}", e))??;
         Ok(())
     }
 
     fn is_shutdown(&self) -> bool {
         self.executor.get_state().cancel_token.is_cancelled()
+    }
+}
+
+impl ProxyBridgeWithMultiprocessExt for V8IsolateManagerServer {
+    /// Returns the executor for concurrently executing tasks on a separate process
+    fn get_executor(&self) -> Arc<ConcurrentExecutor<Self::ConcurrentlyExecuteClient>> {
+        self.executor.clone()
     }
 }
 

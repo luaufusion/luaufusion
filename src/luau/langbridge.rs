@@ -78,8 +78,14 @@ impl<T: ProxyBridge> mluau::UserData for LangBridge<T> {
         methods.add_scheduler_async_method("run", async move |lua, this, modname: String| {
             let result = this.bridge.eval_from_source(modname).await
                 .map_err(|e| mluau::Error::external(e.to_string()))?;
-            this.bridge.to_source_lua_value(&lua, result, &this.plc)
-                .map_err(|e| mluau::Error::external(format!("Failed to convert return value to Lua value: {}", e)))
+            
+            let mut mv = mluau::MultiValue::with_capacity(result.len());
+            for val in result {
+                mv.push_back(this.bridge.to_source_lua_value(&lua, val, &this.plc)
+                    .map_err(|e| mluau::Error::external(format!("Failed to convert return value to Lua value: {}", e)))?);
+            }
+
+            Ok(mv)
         });
 
         methods.add_scheduler_async_method("shutdown", async move |_, this, ()| {

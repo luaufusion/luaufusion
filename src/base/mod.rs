@@ -22,9 +22,6 @@ pub trait ProxyBridge: Clone + 'static {
         vfs: HashMap<String, String>,
     ) -> Result<Self, Error>;
 
-    /// Returns the executor for concurrently executing tasks on a separate process
-    fn get_executor(&self) -> Arc<ConcurrentExecutor<Self::ConcurrentlyExecuteClient>>;
-
     /// Convert a value from the foreign language to a lua owned value
     fn to_source_lua_value(&self, lua: &mluau::Lua, value: Self::ValueType, plc: &ProxyLuaClient) -> Result<mluau::Value, Error>;
 
@@ -32,13 +29,23 @@ pub trait ProxyBridge: Clone + 'static {
     fn from_source_lua_value(&self, lua: &mluau::Lua, plc: &ProxyLuaClient, value: mluau::Value, ed: &mut EmbedderDataContext) -> Result<Self::ValueType, Error>;
 
     /// Evaluates code (string) from the source Luau to the foreign language
-    async fn eval_from_source(&self, modname: String) -> Result<Self::ValueType, Error>;
+    /// 
+    /// The specified modname is either a module name or the file name to load (depending on the underlying implementation)
+    /// 
+    /// May return one or one+ values depending on the foreign language semantics for modules (parallel luau may return multiple values while deno/v8 returns a single value)
+    async fn eval_from_source(&self, modname: String) -> Result<Vec<Self::ValueType>, Error>;
 
     /// Shuts down the bridge and its resources
     async fn shutdown(&self) -> Result<(), Error>;
 
     /// Returns true if the bridge has been shutdown
     fn is_shutdown(&self) -> bool;
+}
+
+/// Extension trait for ProxyBridge's that support multiprocess execution via concurrentlyexec
+pub trait ProxyBridgeWithMultiprocessExt: ProxyBridge {
+    /// Returns the executor for concurrently executing tasks on a separate process
+    fn get_executor(&self) -> Arc<ConcurrentExecutor<Self::ConcurrentlyExecuteClient>>;
 }
 
 /// Extension trait for ProxyBridge's that have a direct string variant

@@ -1,4 +1,4 @@
-use crate::{base::ProxyBridge, luau::{embedder_api::{EmbedderData, EmbedderDataContext}, objreg::{LuauObjectRegistryID, ObjRegistryLuau}}};
+use crate::{base::{ProxyBridge, ProxyBridgeWithMultiprocessExt}, luau::{embedder_api::{EmbedderData, EmbedderDataContext}, objreg::{LuauObjectRegistryID, ObjRegistryLuau}}};
 use concurrentlyexec::{ClientContext, MultiReceiver, MultiSender, OneshotSender};
 use mluau::{LuaSerdeExt, ObjectLike};
 use serde::{Deserialize, Serialize};
@@ -226,7 +226,7 @@ pub struct LuaBridgeService<T: ProxyBridge> {
     rx: MultiReceiver<LuaBridgeMessage<T>>,
 }
 
-impl<T: ProxyBridge> LuaBridgeService<T> {
+impl<T: ProxyBridge + ProxyBridgeWithMultiprocessExt> LuaBridgeService<T> {
     pub fn new(bridge: T, rx: MultiReceiver<LuaBridgeMessage<T>>) -> Self {
         Self { bridge, rx }
     }
@@ -254,6 +254,7 @@ impl<T: ProxyBridge> LuaBridgeService<T> {
                             });
                         }
                         LuaBridgeMessage::Shutdown => {
+                            println!("Parallel Luau client received shutdown message");
                             break;
                         }
                     }
