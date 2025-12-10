@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 
-use concurrentlyexec::{ConcurrentExecutor, ConcurrentExecutorState, ProcessOpts};
+use concurrentlyexec::{ConcurrentExecutorState, ProcessOpts};
 use mlua_scheduler::{taskmgr::NoopHooks, LuaSchedulerAsync, XRc};
 use mluau::IntoLua;
 use mluau_quickjs_proxy::base::ProxyBridge;
-use mluau_quickjs_proxy::denobridge::V8IsolateManagerServer;
+use mluau_quickjs_proxy::denobridge::{V8IsolateManagerServer, run_v8_process_client};
 use mluau_quickjs_proxy::luau::embedder_api::{EmbedderData, SourceTransferValue};
 use mluau_quickjs_proxy::luau::langbridge::LangBridge;
 
@@ -22,7 +22,7 @@ fn main() {
         if args.len() > 1 {
             assert!(args[1] == "child", "Invalid argument");
             println!("[child] Starting child process mode");
-            ConcurrentExecutor::<<V8IsolateManagerServer as ProxyBridge>::ConcurrentlyExecuteClient>::run_process_client().await;
+            run_v8_process_client().await;
             println!("[child] Exiting child process mode");
             return;
         }

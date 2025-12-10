@@ -628,3 +628,8 @@ impl ProxyBridgeWithStringExt for V8IsolateManagerServer {
         ProxiedV8Value::Primitive(ProxiedV8Primitive::String(s))
     }
 }
+
+/// Helper method to run the process client
+pub async fn run_v8_process_client() {
+    ConcurrentExecutor::<<V8IsolateManagerServer as ProxyBridge>::ConcurrentlyExecuteClient>::run_process_client().await;
+}

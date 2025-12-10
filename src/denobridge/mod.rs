@@ -11,4 +11,4 @@ pub(super) mod inner; // internal state management
 pub(super) mod bridgeops; // deno ops for bridge
 pub(super) mod denoexts;
 
-pub use bridge::V8IsolateManagerServer;
+pub use bridge::{V8IsolateManagerServer, run_v8_process_client};

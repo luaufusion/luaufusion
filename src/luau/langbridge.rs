@@ -48,7 +48,7 @@ impl<T: ProxyBridge> LangBridge<T> {
             .map_err(|e| format!("Failed to create ProxyLuaClient: {}", e))?;
         let bridge_vals = T::new(
             cs_state,
-            ed.clone(), // No heap limit
+            ed,
             process_opts,
             plc.clone(),
             vfs
