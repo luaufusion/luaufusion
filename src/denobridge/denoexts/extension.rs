@@ -6,6 +6,7 @@ pub(crate) trait ExtensionTrait<A> {
 
     // Clears the js and esm files for warmup to avoid reloading them
     fn for_warmup(mut ext: Extension) -> Extension {
+        ext.op_state_fn = None;
         ext.js_files = ::std::borrow::Cow::Borrowed(&[]);
         ext.esm_files = ::std::borrow::Cow::Borrowed(&[]);
         ext.esm_entry_point = ::std::option::Option::None;
@@ -133,6 +134,7 @@ extension!(
     luau_bridge,
     ops = [
         crate::denobridge::bridgeops::__luabind,
+        crate::denobridge::bridgeops::__luadrop,
         crate::denobridge::bridgeops::__luarun,
         crate::denobridge::bridgeops::__luaret,
     ],

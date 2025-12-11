@@ -25,7 +25,7 @@ use super::inner::V8IsolateManagerInner;
 /// Minimum heap size for V8 isolates
 pub const MIN_HEAP_LIMIT: usize = 10 * 1024 * 1024; // 10MB
 
-pub(crate) struct BridgeVals {
+pub struct BridgeVals {
     // obj registry fields (addV8Object, getV8Object and removeV8Object)
     pub obj_registry: V8ObjectRegistry,
 

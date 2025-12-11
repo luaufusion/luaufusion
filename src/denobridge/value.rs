@@ -240,10 +240,8 @@ impl ProxiedV8Value {
                 let oid_key = v8::Local::new(scope, &common_state.bridge_vals.lua_id_symbol);
                 let otype_key = v8::Local::new(scope, &common_state.bridge_vals.lua_type_symbol);
                 
-                let local_template = v8::Local::new(scope, (*common_state.obj_template).clone());
+                let obj = v8::Object::new(scope);
                 
-                let obj = local_template.new_instance(scope).ok_or("Failed to create V8 proxy object")?;
-
                 let id_val = v8::BigInt::new_from_i64(scope, id.objid());
                 obj.set(scope, oid_key.into(), id_val.into());
                 let type_val = v8::Integer::new(scope, typ.to_i32());

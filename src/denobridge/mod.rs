@@ -7,7 +7,8 @@ pub mod psuedoprimitive; // psuedoprimitive types that are not fully primitive (
 pub mod value; // proxied values
 pub mod modloader; // module loader for luaufusion based on deno staticmoduleloader for vfs support
 pub mod luauobjs; // luau objects that proxy to v8
-pub(super) mod inner; // internal state management
+pub mod snapshot; // snapshot generation for luaufusion+deno_core v8 isolates (mostly useful for generating prebuilt luaufusion snapshot)
+pub mod inner; // internal state management
 pub(super) mod bridgeops; // deno ops for bridge
 pub(super) mod denoexts;
 

@@ -19,6 +19,9 @@ use crate::luau::embedder_api::EmbedderData;
 use super::bridge::{ProxyV8Client, MIN_HEAP_LIMIT};
 use super::denoexts;
 
+#[cfg(feature = "deno_include_snapshot")]
+const V8_SNAPSHOT: &[u8] = include_bytes!("snapshot.bin");
+
 /// Stores a lua function state
 /// 
 /// This is used internally to track async function call states
@@ -32,10 +35,9 @@ pub(super) enum FunctionRunState {
 }
 
 #[derive(Clone)]
-pub(crate) struct CommonState {
+pub struct CommonState {
     pub(super) list: Rc<RefCell<HashMap<i32, FunctionRunState>>>,
     pub(super) bridge: LuaBridgeServiceClient<V8IsolateManagerServer>,
-    pub(super) obj_template: Rc<v8::Global<v8::ObjectTemplate>>,
     pub(super) proxy_client: ProxyV8Client,
     pub(super) bridge_vals: Rc<BridgeVals>,
     pub(super) ed: EmbedderData,
@@ -45,26 +47,31 @@ pub(crate) struct CommonState {
 /// 
 /// This should not be used directly, use V8IsolateManager instead
 /// which uses a tokio task w/ channel to communicate with the isolate manager.
-pub(super) struct V8IsolateManagerInner {
-    pub(super) deno: deno_core::JsRuntime,
-    pub(super) cancellation_token: CancellationToken,
-    pub(super) common_state: CommonState
+pub struct V8IsolateManagerInner {
+    pub deno: deno_core::JsRuntime,
+    pub cancellation_token: CancellationToken,
+    pub common_state: CommonState
 }
 
-impl V8IsolateManagerInner {    
-    pub fn new(bridge: LuaBridgeServiceClient<V8IsolateManagerServer>, ed: EmbedderData, loader: FusionModuleLoader) -> Self {
-        let heap_limit = ed.heap_limit.max(MIN_HEAP_LIMIT);
+pub struct SetupRuntime {
+    pub deno: deno_core::JsRuntime,
+    pub bridge_vals: BridgeVals,
+    pub heap_exhausted_token: CancellationToken,
+}
 
-        // TODO: Support snapshots maybe
+pub struct SetupRuntimeForSnapshot {
+    pub deno: deno_core::JsRuntimeForSnapshot,
+    pub heap_exhausted_token: CancellationToken,
+}
+
+impl V8IsolateManagerInner {  
+    /// Sets up a new Deno runtime with the specified embedder data and module loader  
+    pub fn setup_runtime_for_snapshot(loader: FusionModuleLoader) -> SetupRuntimeForSnapshot {
         let extensions = denoexts::extension::all_extensions(false);
 
         deno_core::v8::V8::set_flags_from_string("--harmony-import-assertions --harmony-import-attributes --jitless");
 
-        let mut deno = deno_core::JsRuntime::new(deno_core::RuntimeOptions {
-            create_params: Some(
-                CreateParams::default()
-                .heap_limits(0, heap_limit)
-            ),
+        let mut deno = deno_core::JsRuntimeForSnapshot::new(deno_core::RuntimeOptions {
             extensions,
             module_loader: Some(Rc::new(loader)),
             inspector: false,
@@ -89,12 +96,52 @@ impl V8IsolateManagerInner {
             5 * current_value
         });
 
-        let obj_template = Rc::new({
-            let isolate = deno.v8_isolate();
-            let scope = std::pin::pin!(v8::HandleScope::new(isolate));
-            let scope = &mut scope.init();
-            let template = Self::create_obj_template(scope);
-            v8::Global::new(scope, template)
+        SetupRuntimeForSnapshot {
+            deno,
+            heap_exhausted_token,
+        }
+    }
+
+    /// Sets up a new Deno runtime with the specified embedder data and module loader  
+    pub fn setup_runtime(ed: &EmbedderData, loader: FusionModuleLoader) -> SetupRuntime {
+        let heap_limit = ed.heap_limit.max(MIN_HEAP_LIMIT);
+
+        #[cfg(feature = "deno_include_snapshot")]
+        let extensions = denoexts::extension::all_extensions(true);
+        #[cfg(not(feature = "deno_include_snapshot"))]
+        let extensions = denoexts::extension::all_extensions(false);
+
+        deno_core::v8::V8::set_flags_from_string("--harmony-import-assertions --harmony-import-attributes --jitless");
+
+        let mut deno = deno_core::JsRuntime::new(deno_core::RuntimeOptions {
+            create_params: Some(
+                CreateParams::default()
+                .heap_limits(0, heap_limit)
+            ),
+            #[cfg(feature = "deno_include_snapshot")]
+            startup_snapshot: Some(V8_SNAPSHOT),
+            extensions,
+            module_loader: Some(Rc::new(loader)),
+            inspector: false,
+            import_assertions_support: deno_core::ImportAssertionsSupport::Yes,
+            ..Default::default()
+        });
+
+        let isolate_handle = deno.v8_isolate().thread_safe_handle();
+        let heap_exhausted_token = CancellationToken::new();
+
+        // Add a callback to terminate the runtime if the max_heap_size limit is approached
+        let heap_exhausted_token_ref = heap_exhausted_token.clone();
+        deno.add_near_heap_limit_callback(move |current_value, _| {
+            println!("V8 heap limit approached: {} bytes used", current_value);
+            isolate_handle.terminate_execution();
+
+            // Signal the outer runtime to cancel block_on future (avoid hanging) and return friendly error
+            heap_exhausted_token_ref.cancel();
+
+            // Spike the heap limit while terminating to avoid segfaulting
+            // Callback may fire multiple times if memory usage increases quicker then termination finalizes
+            5 * current_value
         });
 
         let bridge_vals = {
@@ -107,29 +154,32 @@ impl V8IsolateManagerInner {
             BridgeVals::new(scope)
         };
 
-        let common_state = CommonState {
-            list: Rc::new(RefCell::new(HashMap::new())),
-            obj_template,
-            bridge,
-            proxy_client: ProxyV8Client {
-                obj_registry: bridge_vals.obj_registry.clone(),
-            },
-            bridge_vals: Rc::new(bridge_vals),
-            ed: ed.clone()
-        };
-
-        deno.op_state().borrow_mut().put(common_state.clone());
-
-        Self {
+        SetupRuntime {
             deno,
-            cancellation_token: heap_exhausted_token,
-            common_state
+            bridge_vals,
+            heap_exhausted_token,
         }
     }
 
-    fn create_obj_template<'s>(scope: &mut v8::PinScope<'s, '_, ()>) -> v8::Local<'s, v8::ObjectTemplate> {
-        let template = v8::ObjectTemplate::new(scope);
-        
-        template
+    pub fn new(bridge: LuaBridgeServiceClient<V8IsolateManagerServer>, ed: EmbedderData, loader: FusionModuleLoader) -> Self {
+        let runtime = Self::setup_runtime(&ed, loader);
+
+        let common_state = CommonState {
+            list: Rc::new(RefCell::new(HashMap::new())),
+            bridge,
+            proxy_client: ProxyV8Client {
+                obj_registry: runtime.bridge_vals.obj_registry.clone(),
+            },
+            bridge_vals: Rc::new(runtime.bridge_vals),
+            ed
+        };
+
+        runtime.deno.op_state().borrow_mut().put(common_state.clone());
+
+        Self {
+            deno: runtime.deno,
+            cancellation_token: runtime.heap_exhausted_token,
+            common_state
+        }
     }
 }

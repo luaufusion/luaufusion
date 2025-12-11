@@ -1,12 +1,12 @@
 [package]
-name = "mluau-quickjs-proxy"
+name = "luaufusion"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
 mlua_scheduler = { git = "https://github.com/mluau/scheduler", version = "1.0.0" }
 mluau = { git = "https://github.com/mluau/mluau", version = "0.11.2", features = ["serde"] }
-concurrentlyexec = { git = "https://github.com/mluau-quickjs-proxy/concurrentlyexecute" }
+concurrentlyexec = { git = "https://github.com/luaufusion/concurrentlyexecute" }
 
 tokio = { version = "1.47.1", features = ["full", "process"] }
 tokio-util = "0.7"
@@ -21,6 +21,7 @@ urlpattern = { version = "0.3.0", optional = true }
 mluau-require = { git = "https://github.com/mluau/mluau-require", optional = true }
 
 [features]
-default = ["deno", "parallel_luau"]
+default = ["deno", "parallel_luau", "deno_include_snapshot"]
 deno = ["dep:deno_core", "dep:deno_error", "dep:thiserror", "dep:base64-simd", "dep:urlpattern"]
+deno_include_snapshot = ["deno"]
 parallel_luau = ["dep:mluau-require"]

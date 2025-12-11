@@ -93,3 +93,11 @@ map.set("b", 2);
 let obj = { map: map }; // Wrap in an object to make it a reference
 return obj // Assuming this is a js function called from Luau, return the object reference to Luau
 ```
+
+## Snapshots and Warmup (for maintainers)
+
+Run the below without ``deno_include_snapshot`` to create a deno snapshot for faster startup times:
+
+```bash
+./target/debug/examples/create_deno_snapshot ./src/denobridge/snapshot.bin
+```

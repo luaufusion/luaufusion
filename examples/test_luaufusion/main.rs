@@ -3,11 +3,11 @@ use std::collections::HashMap;
 use concurrentlyexec::{ConcurrentExecutorState, ProcessOpts};
 use mlua_scheduler::{taskmgr::NoopHooks, LuaSchedulerAsync, XRc};
 use mluau::IntoLua;
-use mluau_quickjs_proxy::base::ProxyBridge;
-use mluau_quickjs_proxy::denobridge::{V8IsolateManagerServer, run_v8_process_client};
-use mluau_quickjs_proxy::luau::embedder_api::{EmbedderData, SourceTransferValue};
-use mluau_quickjs_proxy::luau::langbridge::LangBridge;
-use mluau_quickjs_proxy::parallelluau::{ParallelLuaProxyBridge, run_luau_process_client};
+use luaufusion::base::ProxyBridge;
+use luaufusion::denobridge::{V8IsolateManagerServer, run_v8_process_client};
+use luaufusion::luau::embedder_api::{EmbedderData, SourceTransferValue};
+use luaufusion::luau::langbridge::LangBridge;
+use luaufusion::parallelluau::{ParallelLuaProxyBridge, run_luau_process_client};
 use tokio::runtime::LocalOptions;
 
 const HEAP_LIMIT: usize = 10 * 1024 * 1024; // 10 MB

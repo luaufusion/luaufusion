@@ -1,4 +1,4 @@
-import { __luabind, __luarun, __luaret } from "ext:core/ops";
+import { __luabind, __luadrop, __luarun, __luaret } from "ext:core/ops";
 import { V8ObjectRegistry } from "./objreg.js";
 
 // Constants for objects in general
@@ -37,7 +37,11 @@ Object.freeze(objRegistryTypeNames);
  */
 const __opcall = async (luaid, op, args) => {
     let runId = __luabind(args);
-    await __luarun(runId, luaid, op);
+    try {
+        await __luarun(runId, luaid, op);
+    } catch (e) {
+        __luadrop(runId);
+    }
     return __luaret(runId);
 }
 
@@ -139,6 +143,6 @@ globalThis.lua = {
     requestDisposal,
     call,
     getproperty,
-    objtype
+    objtype,
 }
 Object.freeze(globalThis.lua);

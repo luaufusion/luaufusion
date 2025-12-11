@@ -239,7 +239,7 @@ dependencies = [
 [[package]]
 name = "concurrentlyexec"
 version = "0.1.0"
-source = "git+https://github.com/mluau-quickjs-proxy/concurrentlyexecute#b345cf3d15e3b4ccf85ba04965d5392e06f1a1d7"
+source = "git+https://github.com/luaufusion/concurrentlyexecute#b345cf3d15e3b4ccf85ba04965d5392e06f1a1d7"
 dependencies = [
  "bincode 2.0.1",
  "futures-util",
@@ -1054,6 +1054,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "luaufusion"
+version = "0.1.0"
+dependencies = [
+ "base64-simd",
+ "concurrentlyexec",
+ "deno_core",
+ "deno_error",
+ "futures-util",
+ "mlua_scheduler",
+ "mluau",
+ "mluau-require",
+ "serde",
+ "serde_bytes",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "urlpattern",
+]
+
+[[package]]
 name = "memchr"
 version = "2.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1123,26 +1143,6 @@ dependencies = [
  "rustversion",
  "serde",
  "serde-value",
-]
-
-[[package]]
-name = "mluau-quickjs-proxy"
-version = "0.1.0"
-dependencies = [
- "base64-simd",
- "concurrentlyexec",
- "deno_core",
- "deno_error",
- "futures-util",
- "mlua_scheduler",
- "mluau",
- "mluau-require",
- "serde",
- "serde_bytes",
- "thiserror",
- "tokio",
- "tokio-util",
- "urlpattern",
 ]
 
 [[package]]

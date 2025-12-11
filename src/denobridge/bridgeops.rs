@@ -42,6 +42,23 @@ pub(super) fn __luabind(
     Ok(run_id)
 }
 
+// OP to drop a bound function by run ID
+//
+// No-op if run ID not found
+#[op2(fast)]
+pub(super) fn __luadrop(
+    op_state: &OpState,
+    run_id: i32,
+) -> Result<(), deno_error::JsErrorBox> {
+    let state = op_state.try_borrow::<CommonState>()
+        .ok_or_else(|| deno_error::JsErrorBox::generic("CommonState not found".to_string()))?;
+
+    let mut funcs = state.list.borrow_mut();
+    funcs.remove(&run_id);
+
+    Ok(())
+}
+
 // OP to execute a opcall by run ID
 //
 // Returns nothing
