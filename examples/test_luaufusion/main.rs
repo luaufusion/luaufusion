@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use concurrentlyexec::{ConcurrentExecutorState, ProcessOpts};
 use mlua_scheduler::{taskmgr::NoopHooks, LuaSchedulerAsync, XRc};
 use mluau::IntoLua;
-use luaufusion::base::ProxyBridge;
+use luaufusion::base::{ProxyBridge, ShutdownTimeouts};
 use luaufusion::denobridge::{V8IsolateManagerServer, run_v8_process_client};
 use luaufusion::luau::embedder_api::{EmbedderData, SourceTransferValue};
 use luaufusion::luau::langbridge::LangBridge;
@@ -11,6 +11,14 @@ use luaufusion::parallelluau::{ParallelLuaProxyBridge, run_luau_process_client};
 use tokio::runtime::LocalOptions;
 
 const HEAP_LIMIT: usize = 10 * 1024 * 1024; // 10 MB
+const SHUTDOWN_TIMEOUTS: ShutdownTimeouts = ShutdownTimeouts {
+    bridge_shutdown: std::time::Duration::from_millis(100),
+    executor_shutdown: std::time::Duration::from_secs(5),
+};
+const FROM_LUAU_SHUTDOWN_TIMEOUTS: ShutdownTimeouts = ShutdownTimeouts {
+    bridge_shutdown: std::time::Duration::from_millis(100),
+    executor_shutdown: std::time::Duration::from_secs(5),
+};
 
 fn main() {
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -169,6 +177,7 @@ export function testEmbedderJson(evj) {
             },
             ConcurrentExecutorState::new(1),
             vfs,
+            FROM_LUAU_SHUTDOWN_TIMEOUTS
         ).await.expect("Failed to create Lua-V8 bridge");
 
         let vfs_luau = HashMap::from([
@@ -197,6 +206,7 @@ return {
             },
             ConcurrentExecutorState::new(1),
             vfs_luau,
+            FROM_LUAU_SHUTDOWN_TIMEOUTS
         ).await.expect("Failed to create Lua-V8 bridge");
 
         let test_embedder_json = r#"{"embeddedJson":"embedded22","mynestedMap":{"a":{"b":123,"c":null,"d":{}}}}"#;
@@ -300,9 +310,9 @@ luau:shutdown()
         println!("Output: {:?}", output);
 
         println!("Shutting down v8 bridge");
-        bridgy.shutdown().await.expect("Failed to shutdown bridge");
+        bridgy.shutdown(SHUTDOWN_TIMEOUTS).await.expect("Failed to shutdown bridge");
         println!("Shutting down luau bridge");
-        bridgy_luau.shutdown().await.expect("Failed to shutdown luau bridge");
+        bridgy_luau.shutdown(SHUTDOWN_TIMEOUTS).await.expect("Failed to shutdown luau bridge");
         println!("Shutdown complete");
         tokio::time::sleep(std::time::Duration::from_secs(1)).await; // Wait a bit for the child process to exit
     });

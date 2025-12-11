@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use concurrentlyexec::{ConcurrentExecutor, ConcurrentExecutorState, ConcurrentlyExecute, ProcessOpts};
 use serde::{Deserialize, Serialize};
@@ -6,6 +6,12 @@ use serde::{Deserialize, Serialize};
 use crate::luau::{bridge::ProxyLuaClient, embedder_api::{EmbedderData, EmbedderDataContext}};
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
+
+#[derive(Clone, Copy, Debug)]
+pub struct ShutdownTimeouts {
+    pub bridge_shutdown: Duration,
+    pub executor_shutdown: Duration,
+}
 
 #[allow(async_fn_in_trait)]
 pub trait ProxyBridge: Clone + 'static {
@@ -36,7 +42,7 @@ pub trait ProxyBridge: Clone + 'static {
     async fn eval_from_source(&self, modname: String) -> Result<Vec<Self::ValueType>, Error>;
 
     /// Shuts down the bridge and its resources
-    async fn shutdown(&self) -> Result<(), Error>;
+    async fn shutdown(&self, timeouts: ShutdownTimeouts) -> Result<(), Error>;
 
     /// Returns true if the bridge has been shutdown
     fn is_shutdown(&self) -> bool;

@@ -18,12 +18,16 @@ use crate::luau::bridge::{
     LuaBridgeMessage, LuaBridgeService, LuaBridgeServiceClient, ProxyLuaClient,
 };
 
-use crate::base::{Error, ProxyBridge, ProxyBridgeWithMultiprocessExt, ProxyBridgeWithStringExt};
+use crate::base::{Error, ProxyBridge, ProxyBridgeWithMultiprocessExt, ProxyBridgeWithStringExt, ShutdownTimeouts};
 use crate::luau::embedder_api::{EmbedderData, EmbedderDataContext};
 use super::inner::V8IsolateManagerInner;
 
 /// Minimum heap size for V8 isolates
 pub const MIN_HEAP_LIMIT: usize = 10 * 1024 * 1024; // 10MB
+/// Magic number for V8 isolate manager messages
+/// 
+/// Helpful to avoid common user errors like running a parallel luau child with a v8 server instead of a v8 child
+pub const V8_MESSAGE_MAGIC: usize = 1;
 
 pub struct BridgeVals {
     // obj registry fields (addV8Object, getV8Object and removeV8Object)
@@ -131,12 +135,14 @@ pub(super) enum V8IsolateManagerMessage {
     CodeExec {
         modname: String,
         resp: OneshotSender<Result<Vec<ProxiedV8Value>, String>>,
+        magic: usize,
     },
     OpCall {
         obj_id: V8ObjectRegistryID,
         op: V8ObjectOp,
         args: Vec<ProxiedV8Value>,
         resp: OneshotSender<Result<Vec<ProxiedV8Value>, String>>,
+        magic: usize,
     },
     Shutdown,
 }
@@ -157,6 +163,7 @@ impl V8IsolateSendableMessage for CodeExecMessage {
         V8IsolateManagerMessage::CodeExec {
             modname: self.modname,
             resp,
+            magic: V8_MESSAGE_MAGIC,
         }
     }
 }
@@ -175,6 +182,7 @@ impl V8IsolateSendableMessage for OpCallMessage {
             op: self.op,
             args: self.args,
             resp,
+            magic: V8_MESSAGE_MAGIC,
         }
     }
 }
@@ -331,7 +339,12 @@ impl ConcurrentlyExecute for V8IsolateManagerClient {
             tokio::select! {
                 msg = rx.recv() => {
                     match msg {
-                        Ok(V8IsolateManagerMessage::CodeExec { modname, resp }) => {
+                        Ok(V8IsolateManagerMessage::CodeExec { modname, resp, magic }) => {
+                            if magic != V8_MESSAGE_MAGIC {
+                                let _ = resp.client(&client_ctx).send(Err("Invalid magic number in CodeExec message; are you sure you're running a V8 isolate manager and not a Parallel Luau child?".into()));
+                                continue;
+                            }
+
                             if let Some(module_id) = evaluated_modules.get(&modname) {
                                 // Module already evaluated, just return the namespace object
                                 let namespace_obj = match inner.deno.get_module_namespace(*module_id) {
@@ -393,7 +406,12 @@ impl ConcurrentlyExecute for V8IsolateManagerClient {
                                 (modname, module_id, resp)
                             });
                         },
-                        Ok(V8IsolateManagerMessage::OpCall { obj_id, op, args, resp }) => {
+                        Ok(V8IsolateManagerMessage::OpCall { obj_id, op, args, resp, magic }) => {
+                            if magic != V8_MESSAGE_MAGIC {
+                                let _ = resp.client(&client_ctx).send(Err("Invalid magic number in CodeExec message; are you sure you're running a V8 child process?".into()));
+                                continue;
+                            }
+
                             let fut = match op.run(&mut inner, obj_id, args) {
                                 Ok(v) => v,
                                 Err(e) => {
@@ -574,13 +592,21 @@ impl V8IsolateManagerServer {
         resp.map_err(|e| format!("Failed to receive response from V8 isolate: {}", e).into())
     }
 
-    /// Send a message to the V8 isolate process without waiting for a response
-    pub(super) fn fire<T: V8IsolateSendableMessage>(&self, msg: T) -> Result<(), crate::base::Error> {
-        let (resp_tx, _resp_rx) = self.executor.create_oneshot();
+    /// Send a message to the V8 isolate process with a timeout and wait for a response
+    pub(super) async fn send_timeout<T: V8IsolateSendableMessage>(&self, msg: T, timeout: Duration) -> Result<T::Response, crate::base::Error> {
+        let (resp_tx, resp_rx) = self.executor.create_oneshot();
         self.messenger.server(self.executor.server_context()).send(msg.to_message(resp_tx))
             .map_err(|e| format!("Failed to send message to V8 isolate: {}", e))?;
+        
+        let resp = tokio::time::timeout(timeout, resp_rx.recv()).await
+            .map_err(|e| format!("Timeout waiting for response from V8 isolate: {}", e))?
+            .map_err(|e| format!("Failed to receive response from V8 isolate: {}", e))?;
 
-        Ok(())        
+        if self.is_shutdown() {
+            return Err("V8 isolate manager is shut down (likely due to timeout)".into());
+        }
+        
+        Ok(resp)
     }
 }
 
@@ -616,15 +642,17 @@ impl ProxyBridge for V8IsolateManagerServer {
         Ok(self.send(CodeExecMessage { modname }).await??)
     }
 
-    async fn shutdown(&self) -> Result<(), crate::base::Error> {
-        let _ = self.fire(ShutdownMessage);
-        tokio::time::sleep(Duration::from_millis(100)).await; // Give some time for the message to be processed
-        tokio::time::timeout(Duration::from_secs(5), self.executor.shutdown())
+    async fn shutdown(&self, timeouts: ShutdownTimeouts) -> Result<(), crate::base::Error> {
+        let _ = self.send_timeout(ShutdownMessage, timeouts.bridge_shutdown).await;
+        tokio::time::timeout(timeouts.executor_shutdown, self.executor.shutdown())
             .await
             .map_err(|e| format!("Timeout shutting down V8 isolate manager executor: {}", e))??;
-        tokio::time::timeout(Duration::from_secs(5), self.executor.wait())
+        
+        // Not strictly needed as shutdown waits for the process to exit, but good to be explicit
+        tokio::time::timeout(timeouts.executor_shutdown, self.executor.wait())
             .await
             .map_err(|e| format!("Timeout waiting for V8 isolate manager to shut down: {}", e))??;
+
         Ok(())
     }
 

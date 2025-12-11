@@ -6,7 +6,7 @@ use mluau::LuaSerdeExt;
 use mluau_require::AssetRequirer;
 use serde::{Deserialize, Serialize};
 
-use crate::{base::{ProxyBridge, ProxyBridgeWithMultiprocessExt, ProxyBridgeWithStringExt}, luau::{bridge::{LuaBridgeMessage, LuaBridgeService, LuaBridgeServiceClient, ProxyLuaClient}, embedder_api::{EmbedderData, EmbedderDataContext}}, parallelluau::{objreg::{PLuauObjectRegistryID, PObjRegistryLuau}, primitives::ProxiedLuauPrimitive, value::ProxiedLuauValue}};
+use crate::{base::{ProxyBridge, ProxyBridgeWithMultiprocessExt, ProxyBridgeWithStringExt, ShutdownTimeouts}, luau::{bridge::{LuaBridgeMessage, LuaBridgeService, LuaBridgeServiceClient, ProxyLuaClient}, embedder_api::{EmbedderData, EmbedderDataContext}}, parallelluau::{objreg::{PLuauObjectRegistryID, PObjRegistryLuau}, primitives::ProxiedLuauPrimitive, value::ProxiedLuauValue}};
 
 // NOT WORKING YET: TO BE IMPLEMENTED LATER
 mod objreg;
@@ -16,7 +16,12 @@ mod value;
 mod foreignref;
 //use crate::{base::{ObjectRegistryID, ProxyBridge}, luau::bridge::{LuaBridgeObject, ProxyLuaClient}};
 
+/// Memory limit for Luau isolates
 const MIN_HEAP_LIMIT: usize = 5 * 1024 * 1024; // 5 MB
+/// Magic number for Parallel Luau messages
+/// 
+/// Helpful to avoid common user errors like running a V8 isolate manager with a parallel luau child instead
+pub const PLUAU_MESSAGE_MAGIC: usize = 2;
 
 #[derive(Clone)]
 pub struct ParallelLuaClient {}
@@ -106,15 +111,18 @@ pub(super) enum ParallelLuaMessage {
     CodeExec {
         filename: String,
         resp: OneshotSender<Result<Vec<ProxiedLuauValue>, String>>,
+        magic: usize,
     },
     CallFunctionChild {
         obj_id: PLuauObjectRegistryID,
         args: Vec<ProxiedLuauValue>,
         resp: OneshotSender<Result<Vec<ProxiedLuauValue>, String>>,
+        magic: usize,
     },
     RequestDispose {
         obj_id: PLuauObjectRegistryID,
         resp: OneshotSender<Result<(), String>>,
+        magic: usize,
     },
     Shutdown,
 }
@@ -135,6 +143,7 @@ impl LuauSendableMessage for CodeExecMessage {
         ParallelLuaMessage::CodeExec {
             filename: self.filename,
             resp,
+            magic: PLUAU_MESSAGE_MAGIC,
         }
     }
 }
@@ -151,6 +160,7 @@ impl LuauSendableMessage for CallFunctionChildMessage {
             obj_id: self.obj_id,
             args: self.args,
             resp,
+            magic: PLUAU_MESSAGE_MAGIC,
         }
     }
 }
@@ -165,6 +175,7 @@ impl LuauSendableMessage for RequestDisposeMessage {
         ParallelLuaMessage::RequestDispose {
             obj_id: self.obj_id,
             resp,
+            magic: PLUAU_MESSAGE_MAGIC,
         }
     }
 }
@@ -261,7 +272,12 @@ impl ConcurrentlyExecute for ParallelLuaClient {
             tokio::select! {
                 msg = rx.recv() => {
                     match msg {
-                        Ok(ParallelLuaMessage::CodeExec { filename, resp }) => {
+                        Ok(ParallelLuaMessage::CodeExec { filename, resp, magic }) => {
+                            if magic != PLUAU_MESSAGE_MAGIC {
+                                let _ = resp.client(&client_ctx).send(Err("Invalid magic number in CodeExec message; are you sure you're running a parallel luau child process?".into()));
+                                continue;
+                            }
+
                             let code = match vfs
                             .get_file(filename.clone()) {
                                 Ok(c) => c,
@@ -310,7 +326,12 @@ impl ConcurrentlyExecute for ParallelLuaClient {
                                 resp,
                             );
                         }
-                        Ok(ParallelLuaMessage::CallFunctionChild { obj_id, args, resp }) => {
+                        Ok(ParallelLuaMessage::CallFunctionChild { obj_id, args, resp, magic }) => {
+                            if magic != PLUAU_MESSAGE_MAGIC {
+                                let _ = resp.client(&client_ctx).send(Err("Invalid magic number in CallFunctionChild message; are you sure you're running a parallel luau child process?".into()));
+                                continue;
+                            }
+
                             let value = match common_state.proxy_client.obj_registry.get(obj_id) {
                                 Ok(v) => v,
                                 Err(e) => {
@@ -337,7 +358,12 @@ impl ConcurrentlyExecute for ParallelLuaClient {
                                 resp,
                             );
                         },
-                        Ok(ParallelLuaMessage::RequestDispose { obj_id, resp }) => {
+                        Ok(ParallelLuaMessage::RequestDispose { obj_id, resp, magic }) => {
+                            if magic != PLUAU_MESSAGE_MAGIC {
+                                let _ = resp.client(&client_ctx).send(Err("Invalid magic number in RequestDispose message; are you sure you're running a parallel luau child process?".into()));
+                                continue;
+                            }
+
                             match common_state.proxy_client.obj_registry.remove(obj_id).map_err(|e| e.to_string()) {
                                 Ok(_) => {
                                     let _ = resp.client(&client_ctx).send(Ok(()));
@@ -352,7 +378,7 @@ impl ConcurrentlyExecute for ParallelLuaClient {
                         },
                         Err(e) => {
                             eprintln!("Error receiving message in ParallelLuaClient: {}", e);
-                            break;
+                            //break;
                         }
                     }
                 }
@@ -429,13 +455,21 @@ impl ParallelLuaProxyBridge {
         resp.map_err(|e| format!("Failed to receive response from parallel luau: {}", e).into())
     }
 
-    /// Send a message to the parallel luau process without waiting for a response
-    pub(super) fn fire<T: LuauSendableMessage>(&self, msg: T) -> Result<(), crate::base::Error> {
-        let (resp_tx, _resp_rx) = self.executor.create_oneshot();
+    /// Send a message to the parallel luau process with a timeout and wait for a response
+    pub(super) async fn send_timeout<T: LuauSendableMessage>(&self, msg: T, timeout: Duration) -> Result<T::Response, crate::base::Error> {
+        let (resp_tx, resp_rx) = self.executor.create_oneshot();
         self.messenger.server(self.executor.server_context()).send(msg.to_message(resp_tx))
             .map_err(|e| format!("Failed to send message to parallel luau: {}", e))?;
+        
+        let resp = tokio::time::timeout(timeout, resp_rx.recv()).await
+            .map_err(|e| format!("Timeout waiting for response from parallel luau: {}", e))?
+            .map_err(|e| format!("Failed to receive response from parallel luau: {}", e))?;
 
-        Ok(())        
+        if self.is_shutdown() {
+            return Err("parallel luau is shut down (likely due to timeout)".into());
+        }
+        
+        Ok(resp)
     }
 }
 
@@ -478,15 +512,17 @@ impl ProxyBridge for ParallelLuaProxyBridge {
         Ok(self.send(CodeExecMessage { filename }).await??)
     }
 
-    async fn shutdown(&self) -> Result<(), crate::base::Error> {
-        let _ = self.fire(ShutdownMessage);
-        tokio::time::sleep(Duration::from_millis(100)).await; // Give some time for the message to be processed
-        tokio::time::timeout(Duration::from_secs(5), self.executor.shutdown())
+    async fn shutdown(&self, timeouts: ShutdownTimeouts) -> Result<(), crate::base::Error> {
+        let _ = self.send_timeout(ShutdownMessage, timeouts.bridge_shutdown).await;
+        tokio::time::timeout(timeouts.executor_shutdown, self.executor.shutdown())
             .await
-            .map_err(|e| format!("Timeout shutting down parallel luau client executor: {}", e))??;
-        tokio::time::timeout(Duration::from_secs(5), self.executor.wait())
+            .map_err(|e| format!("Timeout shutting down V8 isolate manager executor: {}", e))??;
+        
+        // Not strictly needed as shutdown waits for the process to exit, but good to be explicit
+        tokio::time::timeout(timeouts.executor_shutdown, self.executor.wait())
             .await
-            .map_err(|e| format!("Timeout waiting for parallel luau client to shut down: {}", e))??;
+            .map_err(|e| format!("Timeout waiting for V8 isolate manager to shut down: {}", e))??;
+
         Ok(())
     }
 

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::{base::ProxyBridge, luau::{bridge::ProxyLuaClient, embedder_api::{EmbedderData, EmbedderDataContext}}};
+use crate::{base::{ProxyBridge, ShutdownTimeouts}, luau::{bridge::ProxyLuaClient, embedder_api::{EmbedderData, EmbedderDataContext}}};
 use concurrentlyexec::{ConcurrentExecutorState, ProcessOpts};
 use mlua_scheduler::LuaSchedulerAsyncUserData;
 
@@ -8,12 +8,13 @@ use mlua_scheduler::LuaSchedulerAsyncUserData;
 pub struct LangBridge<T: ProxyBridge> {
     bridge: T,
     plc: ProxyLuaClient,
+    from_luau_shutdown_timeouts: ShutdownTimeouts,
 }
 
 impl<T: ProxyBridge> LangBridge<T> {
     /// Creates a new language bridge
-    pub fn new(bridge: T, plc: ProxyLuaClient) -> Self {
-        Self { bridge, plc }
+    pub fn new(bridge: T, plc: ProxyLuaClient, from_luau_shutdown_timeouts: ShutdownTimeouts) -> Self {
+        Self { bridge, plc, from_luau_shutdown_timeouts }
     }
 
     pub fn bridge(&self) -> &T {
@@ -43,6 +44,7 @@ impl<T: ProxyBridge> LangBridge<T> {
         process_opts: ProcessOpts,
         cs_state: ConcurrentExecutorState<T::ConcurrentlyExecuteClient>,
         vfs: HashMap<String, String>,
+        from_luau_shutdown_timeouts: ShutdownTimeouts
     ) -> Result<Self, crate::base::Error> {
         let plc = ProxyLuaClient::new(lua, ed.clone())
             .map_err(|e| format!("Failed to create ProxyLuaClient: {}", e))?;
@@ -57,6 +59,7 @@ impl<T: ProxyBridge> LangBridge<T> {
         Ok(Self {
             bridge: bridge_vals,
             plc,
+            from_luau_shutdown_timeouts,
         })
     }
 }
@@ -89,7 +92,7 @@ impl<T: ProxyBridge> mluau::UserData for LangBridge<T> {
         });
 
         methods.add_scheduler_async_method("shutdown", async move |_, this, ()| {
-            this.bridge.shutdown().await
+            this.bridge.shutdown(this.from_luau_shutdown_timeouts).await
                 .map_err(|e| mluau::Error::external(format!("Failed to shutdown foreign language bridge: {}", e)))
         });
 
