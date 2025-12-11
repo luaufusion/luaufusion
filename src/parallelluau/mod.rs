@@ -251,6 +251,27 @@ impl ConcurrentlyExecute for ParallelLuaClient {
             .set("require", lua.create_require_function(controller).expect("Failed to create require function"))
             .expect("Failed to set require function");
 
+        /*
+        // Custom print function that writes to a table to ensure stdout isnt spammed 
+        let print_table = lua.create_table().expect("Failed to create print table");
+        let print_table_ref = print_table.clone();
+        lua.globals().set("print", lua.create_function(move |lua, msg: mluau::MultiValue| {
+            let insert_tab = lua.create_table()?;
+            for v in msg.into_iter() {
+                insert_tab.raw_push(v)?;
+            }
+
+            print_table_ref.raw_push(insert_tab)?;
+            Ok(())
+        }).expect("Failed to create print function"))
+        .expect("Failed to set print function");
+
+        lua.globals().set("printoutput", lua.create_function(move |_, ()| {
+            Ok(print_table.clone())
+        }).expect("Failed to create printoutput function"))
+        .expect("Failed to set printoutput function");
+        */
+
         lua.sandbox(true)
         .expect("Failed to sandbox Luau state");
 

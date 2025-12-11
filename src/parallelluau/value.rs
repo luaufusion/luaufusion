@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
-use crate::luau::embedder_api::{EmbedderDataContext, SourceTransferValue};
+use crate::luau::embedder_api::EmbedderDataContext;
 use crate::base::Error;
 use crate::luau::LuauObjectRegistryID;
+use crate::luau::langbridge::ProxiedValue;
 use crate::parallelluau::{ParallelLuaProxyBridge, ProxyPLuaClient};
 use crate::parallelluau::foreignref::ForeignLuauValue;
 use crate::parallelluau::objreg::PLuauObjectRegistryID;
@@ -18,11 +19,6 @@ pub enum ProxiedLuauValue {
 
     /// Psuedoprimitive values
     Psuedoprimitive(ProxiedLuauPsuedoPrimitive),
-
-    /// Embedder-transferred value (does not follow proxy payload limits)
-    /// 
-    /// Created using SourceTransferValue<T>
-    Transfer(Box<ProxiedLuauValue>),
 
     /// target-owned stuff
     TargetOwnedObject((ObjectRegistryType, PLuauObjectRegistryID)), // (Type, ID) of the target-owned object
@@ -87,12 +83,8 @@ impl ProxiedLuauValue {
                 }
 
                 // Handle LangTransferValue
-                if let Ok(ev) = ud.borrow::<SourceTransferValue<ParallelLuaProxyBridge>>() {
-                    let Some(plvalue) = ev.take() else {
-                        return Err("LangTransferValue has already been taken".into());
-                    };
-
-                    return Ok(Self::Transfer(Box::new(plvalue)));
+                if let Ok(ev) = ud.take::<ProxiedValue<ParallelLuaProxyBridge>>() {
+                    return Ok(ev.into_inner())
                 }
 
                 let userdata_id = plc.obj_registry.add(mluau::Value::UserData(ud))
@@ -196,7 +188,6 @@ impl ProxiedLuauValue {
                 Ok(p.to_luau(lua, ed).map_err(|e| mluau::Error::external(format!("Failed to convert ProxiedLuauPrimitive to Luau: {}", e)))?)
             },
             Self::Psuedoprimitive(p) => Ok(p.to_luau_host(lua, plc, bridge, ed).map_err(|e| mluau::Error::external(format!("Failed to convert ProxiedLuauPsuedoPrimitive to Luau: {}", e)))?),
-            Self::Transfer(p) => p.to_luau_host(lua, plc, bridge, ed),
             // Target owned value
             Self::TargetOwnedObject((typ, id)) => {
                 let ud = ForeignLuauValue::new_child(id, plc.clone(), bridge.clone(), typ);
@@ -221,7 +212,6 @@ impl ProxiedLuauValue {
                 Ok(p.to_luau(lua, ed).map_err(|e| mluau::Error::external(format!("Failed to convert ProxiedLuauPrimitive to Luau: {}", e)))?)
             },
             Self::Psuedoprimitive(p) => Ok(p.to_luau_child(lua, plc, bridge, ed).map_err(|e| mluau::Error::external(format!("Failed to convert ProxiedLuauPsuedoPrimitive to Luau: {}", e)))?),
-            Self::Transfer(p) => p.to_luau_child(lua, plc, bridge, ed),
             // Target owned value
             Self::TargetOwnedObject((_typ, id)) => {
                 let value = plc.obj_registry.get(id)

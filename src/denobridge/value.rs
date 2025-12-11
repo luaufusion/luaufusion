@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 use crate::denobridge::bridge::V8ObjectRegistryType;
-use crate::luau::embedder_api::{EmbedderDataContext, SourceTransferValue};
+use crate::luau::embedder_api::EmbedderDataContext;
 use crate::denobridge::psuedoprimitive::ProxiedV8PsuedoPrimitive;
+use crate::luau::langbridge::ProxiedValue;
 use crate::{base::Error, denobridge::luauobjs::V8Value};
 use crate::denobridge::objreg::V8ObjectRegistryID;
 use crate::luau::LuauObjectRegistryID;
@@ -21,11 +22,6 @@ pub enum ProxiedV8Value {
 
     /// Psuedoprimitive values
     Psuedoprimitive(ProxiedV8PsuedoPrimitive),
-
-    /// Embedder-transferred value (does not follow proxy payload limits)
-    /// 
-    /// Created using SourceTransferValue<T>
-    Transfer(Box<ProxiedV8Value>),
 
     /// v8-owned stuff
     V8OwnedObject((V8ObjectRegistryType, V8ObjectRegistryID)), // (Type, ID) of the v8-owned object
@@ -83,12 +79,8 @@ impl ProxiedV8Value {
                 }
 
                 // Handle LangTransferValue
-                if let Ok(ev) = ud.borrow::<SourceTransferValue<V8IsolateManagerServer>>() {
-                    let Some(pv8value) = ev.take() else {
-                        return Err("LangTransferValue has already been taken".into());
-                    };
-
-                    return Ok(ProxiedV8Value::Transfer(Box::new(pv8value)));
+                if let Ok(ev) = ud.take::<ProxiedValue<V8IsolateManagerServer>>() {
+                    return Ok(ev.into_inner())
                 }
 
                 let userdata_id = plc.obj_registry.add(mluau::Value::UserData(ud))
@@ -119,7 +111,6 @@ impl ProxiedV8Value {
                 Ok(p.to_luau(lua, ed).map_err(|e| mluau::Error::external(format!("Failed to convert ProxiedV8Primitive to Luau: {}", e)))?)
             },
             ProxiedV8Value::Psuedoprimitive(p) => Ok(p.to_luau(lua, plc, bridge, ed).map_err(|e| mluau::Error::external(format!("Failed to convert ProxiedV8PsuedoPrimitive to Luau: {}", e)))?),
-            ProxiedV8Value::Transfer(p) => p.to_luau(lua, plc, bridge, ed),
             // Target owned value
             ProxiedV8Value::V8OwnedObject((typ, id)) => {
                 let ud = V8Value::new(id, plc.clone(), bridge.clone(), typ);
@@ -230,7 +221,6 @@ impl ProxiedV8Value {
         match self {
             Self::Primitive(p) => Ok(p.to_v8(scope, ed)?),
             Self::Psuedoprimitive(p) => Ok(p.to_v8(scope, common_state, ed)?),
-            Self::Transfer(p) => Ok(p.to_v8(scope, common_state, ed)?),
             Self::V8OwnedObject((_typ, id)) => {
                 let obj = common_state.proxy_client.obj_registry.get(scope, id, |_scope, x| Ok(x))
                     .map_err(|e| format!("Object ID not found in registry: {}", e))?;

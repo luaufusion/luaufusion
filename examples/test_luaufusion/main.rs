@@ -5,8 +5,8 @@ use mlua_scheduler::{taskmgr::NoopHooks, LuaSchedulerAsync, XRc};
 use mluau::IntoLua;
 use luaufusion::base::{ProxyBridge, ShutdownTimeouts};
 use luaufusion::denobridge::{V8IsolateManagerServer, run_v8_process_client};
-use luaufusion::luau::embedder_api::{EmbedderData, SourceTransferValue};
-use luaufusion::luau::langbridge::LangBridge;
+use luaufusion::luau::embedder_api::EmbedderData;
+use luaufusion::luau::langbridge::{LangBridge, ProxiedValue};
 use luaufusion::parallelluau::{ParallelLuaProxyBridge, run_luau_process_client};
 use tokio::runtime::LocalOptions;
 
@@ -210,7 +210,7 @@ return {
         ).await.expect("Failed to create Lua-V8 bridge");
 
         let test_embedder_json = r#"{"embeddedJson":"embedded22","mynestedMap":{"a":{"b":123,"c":null,"d":{}}}}"#;
-        let ev = SourceTransferValue::<V8IsolateManagerServer>::from_str(
+        let ev = ProxiedValue::<V8IsolateManagerServer>::from_str(
             test_embedder_json.to_string(), 
         );
 

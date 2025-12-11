@@ -1,10 +1,7 @@
-use std::cell::RefCell;
-use std::rc::Rc;
-
 use serde::{Deserialize, Serialize};
 
 use crate::MAX_PROXY_DEPTH;
-use crate::base::{Error, ProxyBridge, ProxyBridgeWithStringExt};
+use crate::base::Error;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 /// Embedder specific configuration data
@@ -96,33 +93,3 @@ impl EmbedderDataContext {
         Ok(())
     }
 }
-
-/// An TransferValue is a opaque userdata object that can be used to transfer data
-/// from the Luau side to the foreign language side while avoiding having its size counted within the proxy's effective size code
-pub struct SourceTransferValue<T: ProxyBridge> {
-    pub(crate) inner: Rc<RefCell<Option<T::ValueType>>>,
-}
-
-impl<T: ProxyBridge> SourceTransferValue<T> {
-    /// Creates a new SourceTransferValue from a T::ValueType
-    pub fn new(value: T::ValueType) -> Self {
-        Self {
-            inner: Rc::new(RefCell::new(Some(value))),
-        }
-    }
-
-    /// Creates a new SourceTransferValue from a raw string
-    pub fn from_str(s: String) -> Self 
-    where T: ProxyBridgeWithStringExt,
-    {
-        Self::new(
-            T::from_string(s)
-        )
-    }
-
-    pub fn take(&self) -> Option<T::ValueType> {
-        self.inner.borrow_mut().take()
-    }
-}
-
-impl<T: ProxyBridge> mluau::UserData for SourceTransferValue<T> {}
