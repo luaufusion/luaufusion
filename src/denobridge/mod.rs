@@ -6,7 +6,6 @@ pub mod primitives; // primitive types that can be proxied
 pub mod psuedoprimitive; // psuedoprimitive types that are not fully primitive (not immutable in both v8 and luau) but are copied between v8 and luau
 pub mod value; // proxied values
 pub mod modloader; // module loader for luaufusion based on deno staticmoduleloader for vfs support
-pub mod luauobjs; // luau objects that proxy to v8
 pub mod snapshot; // snapshot generation for luaufusion+deno_core v8 isolates (mostly useful for generating prebuilt luaufusion snapshot)
 pub mod inner; // internal state management
 pub(super) mod bridgeops; // deno ops for bridge

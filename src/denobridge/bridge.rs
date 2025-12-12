@@ -18,7 +18,7 @@ use crate::luau::bridge::{
     LuaBridgeMessage, LuaBridgeService, LuaBridgeServiceClient, ProxyLuaClient,
 };
 
-use crate::base::{Error, ProxyBridge, ProxyBridgeWithMultiprocessExt, ProxyBridgeWithStringExt, ShutdownTimeouts};
+use crate::base::{Error, ProxyBridge, ProxyBridgeWithMultiprocessExt, ProxyBridgeWithStringExt, ShutdownTimeouts, StandardProxyBridge};
 use crate::luau::embedder_api::{EmbedderData, EmbedderDataContext};
 use super::inner::V8IsolateManagerInner;
 
@@ -108,6 +108,12 @@ pub enum V8ObjectRegistryType {
     Object,
     Function,
     Promise,
+}
+
+impl Into<&'static str> for V8ObjectRegistryType {
+    fn into(self) -> &'static str {
+        self.type_name()
+    }  
 }
 
 impl V8ObjectRegistryType {
@@ -672,6 +678,47 @@ impl ProxyBridgeWithStringExt for V8IsolateManagerServer {
     /// Creates the foreign language value type from a string
     fn from_string(s: String) -> Self::ValueType {
         ProxiedV8Value::Primitive(ProxiedV8Primitive::String(s))
+    }
+}
+
+impl StandardProxyBridge for V8IsolateManagerServer {
+    type ObjectRegistryID = V8ObjectRegistryID;
+    type ObjectRegistryType = V8ObjectRegistryType;
+
+    async fn function_call(
+        &self,
+        id: Self::ObjectRegistryID,
+        args: Vec<Self::ValueType>,
+    ) -> Result<Vec<Self::ValueType>, Error> {
+        Ok(self.send(OpCallMessage {
+            obj_id: id,
+            op: V8ObjectOp::FunctionCall,
+            args,
+        }).await??)
+    }
+
+    async fn get_property(
+        &self,
+        id: Self::ObjectRegistryID,
+        property: Self::ValueType,
+    ) -> Result<Self::ValueType, Error> {
+        Ok(self.send(OpCallMessage {
+            obj_id: id,
+            op: V8ObjectOp::ObjectGetProperty,
+            args: vec![property],
+        }).await??.into_iter().next().ok_or("No value returned from get_property".to_string())?)
+    }
+
+    async fn request_dispose(
+        &self,
+        id: Self::ObjectRegistryID,
+    ) -> Result<(), Error> {
+        self.send(OpCallMessage {
+            obj_id: id,
+            op: V8ObjectOp::RequestDispose,
+            args: vec![],
+        }).await??;
+        Ok(())
     }
 }
 

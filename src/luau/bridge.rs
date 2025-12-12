@@ -39,6 +39,12 @@ pub enum ObjectRegistryType {
     Thread,
 }
 
+impl Into<&'static str> for ObjectRegistryType {
+    fn into(self) -> &'static str {
+        self.type_name()
+    }  
+} 
+
 impl ObjectRegistryType {
     pub fn type_name(&self) -> &'static str {
         match self {

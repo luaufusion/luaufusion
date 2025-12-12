@@ -1,9 +1,9 @@
 use serde::{Deserialize, Serialize};
-use crate::denobridge::bridge::V8ObjectRegistryType;
+use crate::base::Error;
+use crate::{denobridge::bridge::V8ObjectRegistryType, luau::foreignref::ForeignRef};
 use crate::luau::embedder_api::EmbedderDataContext;
 use crate::denobridge::psuedoprimitive::ProxiedV8PsuedoPrimitive;
 use crate::luau::langbridge::ProxiedValue;
-use crate::{base::Error, denobridge::luauobjs::V8Value};
 use crate::denobridge::objreg::V8ObjectRegistryID;
 use crate::luau::LuauObjectRegistryID;
 use super::primitives::ProxiedV8Primitive;
@@ -74,7 +74,7 @@ impl ProxiedV8Value {
             ),
             mluau::Value::UserData(ud) => {
                 // Handle v8 objects
-                if let Ok(v8value) = ud.borrow::<V8Value>() {
+                if let Ok(v8value) = ud.borrow::<ForeignRef<V8IsolateManagerServer>>() {
                     return Ok(ProxiedV8Value::V8OwnedObject((v8value.typ, v8value.id)));
                 }
 
@@ -113,7 +113,7 @@ impl ProxiedV8Value {
             ProxiedV8Value::Psuedoprimitive(p) => Ok(p.to_luau(lua, plc, bridge, ed).map_err(|e| mluau::Error::external(format!("Failed to convert ProxiedV8PsuedoPrimitive to Luau: {}", e)))?),
             // Target owned value
             ProxiedV8Value::V8OwnedObject((typ, id)) => {
-                let ud = V8Value::new(id, plc.clone(), bridge.clone(), typ);
+                let ud = ForeignRef::new(id, plc.clone(), bridge.clone(), typ);
                 let ud = lua.create_userdata(ud)?;
                 Ok(mluau::Value::UserData(ud))
             }

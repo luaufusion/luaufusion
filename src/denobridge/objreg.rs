@@ -6,6 +6,12 @@ pub struct V8ObjectRegistryID {
     objid: i64, // Unique ID representing the object
 }
 
+impl Into<i64> for V8ObjectRegistryID {
+    fn into(self) -> i64 {
+        self.objid
+    }
+}
+
 impl V8ObjectRegistryID {
     pub fn objid(&self) -> i64 {
         self.objid

@@ -280,8 +280,8 @@ print("Luau result:", luau_result, luau_result.greeting)
 assert(luau_result.greeting == "Hello from Luau!", "Invalid greeting from Luau")
 local greetFromParallelLuau = luau_result.greetFromParallelLuau
 print("greetFromParallelLuau:", greetFromParallelLuau)
-assert(typeof(greetFromParallelLuau) == "ForeignLuauValue", "Invalid type for greetFromParallelLuau")
-local greet_msg = greetFromParallelLuau:callasync("my love")
+assert(type(greetFromParallelLuau) == "userdata", "Invalid type for greetFromParallelLuau")
+local greet_msg = greetFromParallelLuau:call("my love")
 print("greet_msg:", greet_msg)
 assert(greet_msg == "Hello, my love, from Parallel Luau!", "Invalid greet_msg from Parallel Luau")
 

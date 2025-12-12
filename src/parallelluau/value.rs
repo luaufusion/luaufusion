@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use crate::luau::embedder_api::EmbedderDataContext;
 use crate::base::Error;
 use crate::luau::LuauObjectRegistryID;
+use crate::luau::foreignref::ForeignRef;
 use crate::luau::langbridge::ProxiedValue;
 use crate::parallelluau::{ParallelLuaProxyBridge, ProxyPLuaClient};
 use crate::parallelluau::foreignref::ForeignLuauValue;
@@ -70,16 +71,8 @@ impl ProxiedLuauValue {
                 "Vector({v:?}) should have been handled as a psuedoprimitive"
             ),
             mluau::Value::UserData(ud) => {
-                // Handle luau objects
-                if let Ok(flvalue) = ud.borrow::<ForeignLuauValue>() {
-                    match &*flvalue {
-                        ForeignLuauValue::Host { id, typ, .. } => {
-                            return Ok(Self::SourceOwnedObject((*typ, id.clone())));
-                        },
-                        ForeignLuauValue::Child { id, typ, .. } => {
-                            return Ok(Self::TargetOwnedObject((*typ, id.clone())));
-                        }
-                    }
+                if let Ok(fref) = ud.borrow::<ForeignRef<ParallelLuaProxyBridge>>() {
+                    return Ok(Self::TargetOwnedObject((fref.typ, fref.id)));
                 }
 
                 // Handle LangTransferValue
@@ -150,14 +143,7 @@ impl ProxiedLuauValue {
             mluau::Value::UserData(ud) => {
                 // Handle luau objects
                 if let Ok(flvalue) = ud.borrow::<ForeignLuauValue>() {
-                    match &*flvalue {
-                        ForeignLuauValue::Host { id, typ, .. } => {
-                            return Ok(Self::SourceOwnedObject((*typ, id.clone())));
-                        },
-                        ForeignLuauValue::Child { id, typ, .. } => {
-                            return Ok(Self::TargetOwnedObject((*typ, id.clone())));
-                        }
-                    }
+                    return Ok(Self::SourceOwnedObject((flvalue.typ.clone(), flvalue.id.clone())));
                 }
 
                 let userdata_id = plc.obj_registry.add(mluau::Value::UserData(ud))
@@ -190,7 +176,7 @@ impl ProxiedLuauValue {
             Self::Psuedoprimitive(p) => Ok(p.to_luau_host(lua, plc, bridge, ed).map_err(|e| mluau::Error::external(format!("Failed to convert ProxiedLuauPsuedoPrimitive to Luau: {}", e)))?),
             // Target owned value
             Self::TargetOwnedObject((typ, id)) => {
-                let ud = ForeignLuauValue::new_child(id, plc.clone(), bridge.clone(), typ);
+                let ud = ForeignRef::new(id, plc.clone(), bridge.clone(), typ);
                 let ud = lua.create_userdata(ud)?;
                 Ok(mluau::Value::UserData(ud))
             }
@@ -220,7 +206,7 @@ impl ProxiedLuauValue {
             }
             // Source-owned values (lua values being proxied between host luau and child luau)
             Self::SourceOwnedObject((typ, id)) => {
-                let ud = ForeignLuauValue::new_host(id, plc.clone(), bridge.clone(), typ);
+                let ud = ForeignLuauValue::new(id, plc.clone(), bridge.clone(), typ);
                 let ud = lua.create_userdata(ud)?;
                 Ok(mluau::Value::UserData(ud))
 

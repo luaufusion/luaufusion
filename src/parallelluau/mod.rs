@@ -6,7 +6,7 @@ use mluau::LuaSerdeExt;
 use mluau_require::AssetRequirer;
 use serde::{Deserialize, Serialize};
 
-use crate::{base::{ProxyBridge, ProxyBridgeWithMultiprocessExt, ProxyBridgeWithStringExt, ShutdownTimeouts}, luau::{bridge::{LuaBridgeMessage, LuaBridgeService, LuaBridgeServiceClient, ProxyLuaClient}, embedder_api::{EmbedderData, EmbedderDataContext}}, parallelluau::{objreg::{PLuauObjectRegistryID, PObjRegistryLuau}, primitives::ProxiedLuauPrimitive, value::ProxiedLuauValue}};
+use crate::{base::{ProxyBridge, ProxyBridgeWithMultiprocessExt, ProxyBridgeWithStringExt, ShutdownTimeouts, StandardProxyBridge}, luau::{bridge::{LuaBridgeMessage, LuaBridgeService, LuaBridgeServiceClient, ObjectRegistryType, ProxyLuaClient}, embedder_api::{EmbedderData, EmbedderDataContext}}, parallelluau::{objreg::{PLuauObjectRegistryID, PObjRegistryLuau}, primitives::ProxiedLuauPrimitive, value::ProxiedLuauValue}};
 
 // NOT WORKING YET: TO BE IMPLEMENTED LATER
 mod objreg;
@@ -113,6 +113,12 @@ pub(super) enum ParallelLuaMessage {
         resp: OneshotSender<Result<Vec<ProxiedLuauValue>, String>>,
         magic: usize,
     },
+    GetProperty {
+        obj_id: PLuauObjectRegistryID,
+        property: ProxiedLuauValue,
+        resp: OneshotSender<Result<ProxiedLuauValue, String>>,
+        magic: usize,
+    },
     CallFunctionChild {
         obj_id: PLuauObjectRegistryID,
         args: Vec<ProxiedLuauValue>,
@@ -142,6 +148,23 @@ impl LuauSendableMessage for CodeExecMessage {
     fn to_message(self, resp: OneshotSender<Self::Response>) -> ParallelLuaMessage {
         ParallelLuaMessage::CodeExec {
             filename: self.filename,
+            resp,
+            magic: PLUAU_MESSAGE_MAGIC,
+        }
+    }
+}
+
+pub struct GetPropertyMessage {
+    pub obj_id: PLuauObjectRegistryID,
+    pub property: ProxiedLuauValue,
+}
+
+impl LuauSendableMessage for GetPropertyMessage {
+    type Response = Result<ProxiedLuauValue, String>;
+    fn to_message(self, resp: OneshotSender<Self::Response>) -> ParallelLuaMessage {
+        ParallelLuaMessage::GetProperty {
+            obj_id: self.obj_id,
+            property: self.property,
             resp,
             magic: PLUAU_MESSAGE_MAGIC,
         }
@@ -347,6 +370,55 @@ impl ConcurrentlyExecute for ParallelLuaClient {
                                 resp,
                             );
                         }
+                        Ok(ParallelLuaMessage::GetProperty { obj_id, property, resp, magic }) => {
+                            if magic != PLUAU_MESSAGE_MAGIC {
+                                let _ = resp.client(&client_ctx).send(Err("Invalid magic number in GetProperty message; are you sure you're running a parallel luau child process?".into()));
+                                continue;
+                            }
+
+                            let value = match common_state.proxy_client.obj_registry.get(obj_id) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    let _ = resp.client(&client_ctx).send(Err(format!("Failed to get object for GetProperty: {}", e)));
+                                    continue;
+                                }
+                            };
+
+                            let mut ed = EmbedderDataContext::new(&common_state.ed);
+                            let prop_lua = match property.to_luau_child(&&lua, &common_state.proxy_client, &common_state.bridge, &mut ed) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    let _ = resp.client(&client_ctx).send(Err(format!("Failed to convert property to Lua value: {}", e)));
+                                    continue;
+                                }
+                            };
+
+                            let tab = match value {
+                                mluau::Value::Table(t) => t,
+                                _ => {
+                                    let _ = resp.client(&client_ctx).send(Err("Object is not a table".to_string()));
+                                    continue;
+                                }
+                            };
+
+                            let prop_value = match tab.get(prop_lua) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    let _ = resp.client(&client_ctx).send(Err(format!("Failed to get property from Lua table: {}", e)));
+                                    continue;
+                                }
+                            };
+
+                            let proxied_prop = match ProxiedLuauValue::from_luau_child(&common_state.proxy_client, prop_value, &mut ed) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    let _ = resp.client(&client_ctx).send(Err(format!("Failed to convert property value to ProxiedLuauValue: {}", e)));
+                                    continue;
+                                }
+                            };
+
+                            let _ = resp.client(&client_ctx).send(Ok(proxied_prop));
+                        },
                         Ok(ParallelLuaMessage::CallFunctionChild { obj_id, args, resp, magic }) => {
                             if magic != PLUAU_MESSAGE_MAGIC {
                                 let _ = resp.client(&client_ctx).send(Err("Invalid magic number in CallFunctionChild message; are you sure you're running a parallel luau child process?".into()));
@@ -563,6 +635,34 @@ impl ProxyBridgeWithStringExt for ParallelLuaProxyBridge {
     /// Creates the foreign language value type from a string
     fn from_string(s: String) -> Self::ValueType {
         ProxiedLuauValue::Primitive(ProxiedLuauPrimitive::String(s))
+    }
+}
+
+impl StandardProxyBridge for ParallelLuaProxyBridge {
+    type ObjectRegistryID = PLuauObjectRegistryID;
+    type ObjectRegistryType = ObjectRegistryType;
+
+    async fn get_property(
+        &self,
+        id: Self::ObjectRegistryID,
+        property: Self::ValueType,
+    ) -> Result<Self::ValueType, crate::base::Error> {
+        Ok(self.send(GetPropertyMessage { obj_id: id, property }).await??)
+    }
+
+    async fn function_call(
+        &self,
+        id: Self::ObjectRegistryID,
+        args: Vec<Self::ValueType>,
+    ) -> Result<Vec<Self::ValueType>, crate::base::Error> {
+        Ok(self.send(CallFunctionChildMessage { obj_id: id, args }).await??)
+    }
+
+    async fn request_dispose(
+        &self,
+        id: Self::ObjectRegistryID,
+    ) -> Result<(), crate::base::Error> {
+        Ok(self.send(RequestDisposeMessage { obj_id: id }).await??)
     }
 }
 

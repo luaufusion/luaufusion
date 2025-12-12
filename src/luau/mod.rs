@@ -4,5 +4,6 @@ pub mod bridge;
 mod objreg;
 pub mod langbridge;
 pub mod embedder_api;
+pub mod foreignref;
 
 pub use objreg::LuauObjectRegistryID;
