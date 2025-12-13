@@ -17,11 +17,11 @@ interface LuaObject {
      * 
      * Currently only supported on functions (tables with __call metamethods are not supported yet).
      * 
-     * The returned arguments are inserted back into the provided ProxiedValues object.
+     * The returned arguments are inserted back into the provided ArgBuffer object.
      * 
-     * @param {ProxiedValues} args The arguments to pass
+     * @param {ArgBuffer} args The arguments to pass
      */
-    callSync: (args: ProxiedValues) => Promise<void>;
+    callSync: (args: ArgBuffer) => Promise<void>;
 
     /**
      * Calls the function asynchronously/in a new Luau thread
@@ -32,11 +32,11 @@ interface LuaObject {
      * 
      * Currently only supported on functions (tables with __call metamethods are not supported yet).
      * 
-     * The returned arguments are inserted back into the provided ProxiedValues object.
+     * The returned arguments are inserted back into the provided ArgBuffer object.
      * 
-     * @param {ProxiedValues} args The arguments to pass
+     * @param {ArgBuffer} args The arguments to pass
      */
-    callAsync: (args: ProxiedValues) => Promise<void>;
+    callAsync: (args: ArgBuffer) => Promise<void>;
 
     /**
      * Index the object with the provided key
@@ -45,43 +45,28 @@ interface LuaObject {
      * 
      * Currently only supported on tables and userdata.
      * 
-     * The returned value is inserted back into the provided ProxiedValues object.
+     * The returned value is inserted back into the provided ArgBuffer object.
      * 
-     * @param {ProxiedValues} key The key to index the object with. This should be the only value in the ProxiedValues object.
+     * @param {ArgBuffer} key The key to index the object with. This should be the only value in the ArgBuffer object.
      */
-    get: (key: ProxiedValues) => Promise<void>;
-
-    /**
-     * Same as get, but specifically takes in a string key and returns a {ProxiedValues} containing the value.
-     * 
-     * @param {string} key The string key to index the object with
-     * @returns {ProxiedValues} The value at the provided key
-     */
-    getPropertyString: (key: string) => Promise<ProxiedValues>;
-
-    /**
-     * Same as getPropertyString, but with a integer key.
-     */
-    getPropertyInteger: (key: number) => Promise<ProxiedValues>;
-
-    /**
-     * Same as getPropertyString, but with a number key.
-     */
-    getPropertyNumber: (key: number) => Promise<ProxiedValues>;
+    get: (key: ArgBuffer) => Promise<void>;
 }
 
-interface ProxiedValues {
+/**
+ * Represents a buffer of arguments passed through the bridge
+ */
+interface ArgBuffer {
     /**
-     * Creates a new ProxiedValues object from the provided values
+     * Creates a new ArgBuffer object from the provided values
      * 
      * The passed values are converted to their Luau counterparts (see the README for luaufusion
      * for more information on the conversion semantics) which may involve storing v8 objects in
      * a 'object registry' in the Javascript side.
      * 
-     * @param {any[]} values The values to store in the ProxiedValues object
-     * @returns {ProxiedValues} The created ProxiedValues object
+     * @param {any[]} values The values to store in the ArgBuffer object
+     * @returns {ArgBuffer} The created ArgBuffer object
      */
-    new (values: any[]): ProxiedValues;
+    new (values: any[]): ArgBuffer;
 
     /**
      * Returns the length of the proxied values
@@ -101,10 +86,10 @@ interface ProxiedValues {
     sizeBigInt: () => bigint;
 
     /**
-     * Takes the values out of the ProxiedValues, converting them to their Javascript counterparts
+     * Takes the values out of the ArgBuffer, converting them to their Javascript counterparts
      * as per the conversion semantics (see the README for luaufusion for more information on the conversion semantics).
      * 
-     * Can be called after a function call or otherwise places the returned values into the ProxiedValues object
+     * Can be called after a function call or otherwise places the returned values into the ArgBuffer object
      * to get out the values.
      */
     take: () => any[];

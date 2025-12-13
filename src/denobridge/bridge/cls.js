@@ -1,4 +1,4 @@
-import { LuaObject, ProxiedValues } from "ext:core/ops";
+import { LuaObject, ArgBuffer } from "ext:core/ops";
 import { V8ObjectRegistry } from "./objreg.js";
 
 // v8 object registry instance
@@ -27,7 +27,7 @@ function gc() {
  * converted to a single value internally
  */
 const call = async (obj, isAsync, ...args) => {
-    let boundArgs = new ProxiedValues(...args);
+    let boundArgs = new ArgBuffer(...args);
     if (isAsync) {
         await obj.callAsync(boundArgs);
     } else {
@@ -47,22 +47,8 @@ const call = async (obj, isAsync, ...args) => {
  * @param {any} key The key to index the object with
  * @returns {any} The value at the provided key
  */
-const getproperty = async (obj, key) => {
-    // Try fast-paths for common key types
-    if (typeof key === "number") {
-        if (Number.isInteger(key)) {
-            let ret = await obj.getPropertyInteger(key);
-            return ret.extract()
-        } else {
-            let ret = await obj.getPropertyNumber(key);
-            return ret.extract();
-        }
-    } else if (typeof key === "string") {
-        let ret = await obj.getPropertyString(key);
-        return ret.extract();
-    }
-
-    let keyPV = new ProxiedValues(key);
+const get = async (obj, key) => {
+    let keyPV = new ArgBuffer(key);
     await obj.get(keyPV);
     return keyPV.extract();
 }
@@ -74,8 +60,8 @@ globalThis.lua = {
     getV8Object: v8objreg.get.bind(v8objreg),
     removeV8Object: v8objreg.remove.bind(v8objreg),
     call,
-    getproperty,
+    get,
     LuaObject,
-    ProxiedValues,
+    ArgBuffer,
 }
 Object.freeze(globalThis.lua);

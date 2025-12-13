@@ -160,6 +160,13 @@ export function staticmaptest(m) {
 export function testEmbedderJson(evj) {
     console.log("In testEmbedderJson", JSON.parse(evj));
 }
+
+export async function tablepropget(obj) {
+    console.log("In tablepropget", obj);
+    let key = await globalThis.lua.get(obj, "foo");
+    console.log("Got foo key:", key);
+    return key;
+}
 "#.to_string()),
         ]);
 
@@ -271,6 +278,20 @@ assert(smap.v8 == "is pog", "Invalid static map value for v8 key")
 
 local testEmbedderJson = result4:getproperty("testEmbedderJson")
 testEmbedderJson:call(ed)
+
+local tablepropget = result4:getproperty("tablepropget")
+local tbl = setmetatable({}, {
+    __index = function(t, k)
+        print("Indexing table for key:", k)
+        if k == "foo" then
+            return "barvalue"
+        end
+        return nil
+    end
+})
+local foo_key = tablepropget:call(tbl)
+print("foo_key from tablepropget:", foo_key)
+assert(foo_key == "barvalue", "Invalid foo_key from tablepropget")
 
 v8:shutdown()
 

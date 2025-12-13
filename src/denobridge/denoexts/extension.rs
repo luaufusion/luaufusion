@@ -134,7 +134,7 @@ extension!(
     luau_bridge,
     objects = [
         crate::denobridge::bridgeops::LuaObject,
-        crate::denobridge::bridgeops::ProxiedValues
+        crate::denobridge::bridgeops::ArgBuffer
     ],
     esm_entry_point = "ext:luau_bridge/cls.js",
     esm = [ dir "src/denobridge/bridge", "cls.js", "objreg.js" ],

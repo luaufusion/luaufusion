@@ -4,8 +4,6 @@ use std::rc::Rc;
 use deno_core::parking_lot::Mutex;
 use deno_core::{GarbageCollected, OpState, op2, v8};
 
-use crate::denobridge::primitives::ProxiedV8Primitive;
-use crate::denobridge::psuedoprimitive::ProxiedV8PsuedoPrimitive;
 use crate::luau::bridge::{LuauObjectOp, ObjectRegistryType};
 use crate::luau::embedder_api::EmbedderDataContext;
 use crate::luau::LuauObjectRegistryID;
@@ -60,14 +58,13 @@ impl LuaObject {
     }
 
     /// Internal implementation of opcall
-    /// that reuses a single ProxiedValues cppgc object
+    /// that reuses a single ArgBuffer cppgc object
     /// 
     /// Verifies that the args passed in are valid for the opcall
-    /// (unlike opcall_impl_new_value)
     async fn opcall_impl(
         &self,
         state_rc: Rc<RefCell<OpState>>,
-        bound_args: &ProxiedValues,
+        bound_args: &ArgBuffer,
         op_id: LuauObjectOp,
     ) -> Result<(), deno_error::JsErrorBox> {
         let running_funcs = {
@@ -105,37 +102,6 @@ impl LuaObject {
 
         bound_args.replace(lua_resp)?;
         Ok(())
-    }
-
-    /// Internal implementation of opcall
-    /// that creates a new ProxiedValues cppgc object for each call
-    /// 
-    /// Trusts that the args passed in are valid for the opcall
-    /// (unlike opcall_impl)
-    async fn opcall_impl_new_value(
-        &self,
-        state_rc: Rc<RefCell<OpState>>,
-        args: Vec<ProxiedV8Value>,
-        op_id: LuauObjectOp,
-    ) -> Result<ProxiedValues, deno_error::JsErrorBox> {
-        let running_funcs = {
-            let state = state_rc.try_borrow()
-                .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
-            
-            state.try_borrow::<CommonState>()
-                .ok_or_else(|| deno_error::JsErrorBox::generic("CommonState not found".to_string()))?
-                .clone()
-        };
-
-        let lua_resp = running_funcs.bridge.opcall(
-            self.lua_id.clone(),
-            op_id,
-            args,
-        )
-        .await
-        .map_err(|e| deno_error::JsErrorBox::generic(format!("Bridge call failed: {}", e)))?;
-
-        return Ok(ProxiedValues::new(lua_resp));
     }
 }
 
@@ -184,7 +150,7 @@ impl LuaObject {
     pub async fn call_sync(
         &self,
         state_rc: Rc<RefCell<OpState>>,
-        #[cppgc] bound_args: &ProxiedValues,
+        #[cppgc] bound_args: &ArgBuffer,
     ) -> Result<(), deno_error::JsErrorBox> {
         self.opcall_impl(state_rc, bound_args, LuauObjectOp::FunctionCallSync).await
     }
@@ -195,7 +161,7 @@ impl LuaObject {
     pub async fn call_async(
         &self,
         state_rc: Rc<RefCell<OpState>>,
-        #[cppgc] bound_args: &ProxiedValues,
+        #[cppgc] bound_args: &ArgBuffer,
     ) -> Result<(), deno_error::JsErrorBox> {
         self.opcall_impl(state_rc, bound_args, LuauObjectOp::FunctionCallAsync).await
     }
@@ -206,51 +172,9 @@ impl LuaObject {
     pub async fn get(
         &self,
         state_rc: Rc<RefCell<OpState>>,
-        #[cppgc] bound_args: &ProxiedValues,
+        #[cppgc] bound_args: &ArgBuffer,
     ) -> Result<(), deno_error::JsErrorBox> {
         self.opcall_impl(state_rc, bound_args, LuauObjectOp::Index).await
-    }
-
-    #[async_method]
-    #[rename("getPropertyString")]
-    #[cppgc]
-    // Get a property
-    //
-    // Similar to get, except works with a arg that is a String
-    pub async fn get_property<'a>(
-        &self,
-        state_rc: Rc<RefCell<OpState>>,
-        #[string] prop: String,
-    ) -> Result<ProxiedValues, deno_error::JsErrorBox> {
-        self.opcall_impl_new_value(state_rc, vec![ProxiedV8Value::Primitive(ProxiedV8Primitive::String(prop))], LuauObjectOp::Index).await
-    }
-
-    #[async_method]
-    #[rename("getPropertyInteger")]
-    #[cppgc]
-    // Get a property
-    //
-    // Similar to get, except works with a arg that is a i32 index
-    pub async fn get_index<'a>(
-        &self,
-        state_rc: Rc<RefCell<OpState>>,
-        prop: i32,
-    ) -> Result<ProxiedValues, deno_error::JsErrorBox> {
-        self.opcall_impl_new_value(state_rc, vec![ProxiedV8Value::Primitive(ProxiedV8Primitive::Integer(prop))], LuauObjectOp::Index).await
-    }
-
-    #[async_method]
-    #[rename("getPropertyNumber")]
-    #[cppgc]
-    // Get a property
-    //
-    // Similar to get, except works with a arg that is a i32 index
-    pub async fn get_property_number<'a>(
-        &self,
-        state_rc: Rc<RefCell<OpState>>,
-        prop: f64,
-    ) -> Result<ProxiedValues, deno_error::JsErrorBox> {
-        self.opcall_impl_new_value(state_rc, vec![ProxiedV8Value::Psuedoprimitive(ProxiedV8PsuedoPrimitive::Number(prop))], LuauObjectOp::Index).await
     }
 }
 
@@ -259,13 +183,13 @@ impl LuaObject {
 // We use a cppgc struct to ensure that in the event of errors etc, the values
 // are eventually garbage collected all the same by V8's cppgc system
 // instead of leaking memory
-pub(super) struct ProxiedValues {
+pub(super) struct ArgBuffer {
     proxied_values: Mutex<Option<Vec<ProxiedV8Value>>>,
 }
 
-impl ProxiedValues {
+impl ArgBuffer {
     fn new(values: Vec<ProxiedV8Value>) -> Self {
-        ProxiedValues {
+        ArgBuffer {
             proxied_values: Mutex::new(Some(values)),
         }
     }
@@ -274,7 +198,7 @@ impl ProxiedValues {
     fn replace(&self, values: Vec<ProxiedV8Value>) -> Result<(), deno_error::JsErrorBox> {
         let mut borrowed = self.proxied_values.lock();
         if borrowed.is_some() {
-            Err(deno_error::JsErrorBox::generic("ProxiedValues already initialized".to_string()))
+            Err(deno_error::JsErrorBox::generic("ArgBuffer already initialized".to_string()))
         } else {
             *borrowed = Some(values);
             Ok(())
@@ -284,20 +208,20 @@ impl ProxiedValues {
     /// Consume the proxied values, leaving None in its place
     fn consume(&self) -> Result<Vec<ProxiedV8Value>, deno_error::JsErrorBox> {
         let mut borrowed = self.proxied_values.lock();
-        borrowed.take().ok_or_else(|| deno_error::JsErrorBox::generic("ProxiedValues already consumed".to_string()))
+        borrowed.take().ok_or_else(|| deno_error::JsErrorBox::generic("ArgBuffer already consumed".to_string()))
     }
 }
 
-impl Drop for ProxiedValues {
+impl Drop for ArgBuffer {
     fn drop(&mut self) {
         // No fields to drop
-        println!("ProxiedValues dropped");
+        println!("ArgBuffer dropped");
     }
 }
 
-unsafe impl GarbageCollected for ProxiedValues {
+unsafe impl GarbageCollected for ArgBuffer {
     fn get_name(&self) -> &'static std::ffi::CStr {
-        c"ProxiedValues"
+        c"ArgBuffer"
     }
 
     fn trace(&self, _visitor: &mut v8::cppgc::Visitor) {
@@ -306,16 +230,16 @@ unsafe impl GarbageCollected for ProxiedValues {
 }
 
 #[op2]
-impl ProxiedValues {
+impl ArgBuffer {
     #[constructor]
     #[cppgc]
     pub fn constructor<'a>(
         op_state: &OpState, 
         scope: &mut v8::PinScope<'a, '_>,
         #[varargs] fn_args: Option<&v8::FunctionCallbackArguments<'a>>,
-    ) -> Result<ProxiedValues, deno_error::JsErrorBox> {
+    ) -> Result<ArgBuffer, deno_error::JsErrorBox> {
         let Some(args) = fn_args else {
-            return Ok(ProxiedValues::new(vec![]))
+            return Ok(ArgBuffer::new(vec![]))
         };
 
         let state = op_state.try_borrow::<CommonState>()
@@ -336,7 +260,7 @@ impl ProxiedValues {
             }
         }
 
-        let proxied_values = ProxiedValues::new(args_proxied);
+        let proxied_values = ArgBuffer::new(args_proxied);
         Ok(proxied_values)
     }
 
@@ -348,12 +272,12 @@ impl ProxiedValues {
         match &*borrowed {
             Some(vals) => {
                 if vals.len() > (u32::MAX as usize) {
-                    Err(deno_error::JsErrorBox::generic("ProxiedValues length exceeds u32 max, use sizeBigint instead".to_string()))
+                    Err(deno_error::JsErrorBox::generic("ArgBuffer length exceeds u32 max, use sizeBigint instead".to_string()))
                 } else {
                     Ok(vals.len() as u32)
                 }
             },
-            None => Err(deno_error::JsErrorBox::generic("ProxiedValues already consumed".to_string())),
+            None => Err(deno_error::JsErrorBox::generic("ArgBuffer already consumed".to_string())),
         }
     }
 
@@ -368,12 +292,12 @@ impl ProxiedValues {
             Some(vals) => {
                 Ok(vals.len())
             },
-            None => Err(deno_error::JsErrorBox::generic("ProxiedValues already consumed".to_string())),
+            None => Err(deno_error::JsErrorBox::generic("ArgBuffer already consumed".to_string())),
         }
     }
 
     #[method]
-    // After a function call or otherwise, take the values out of the ProxiedValues
+    // After a function call or otherwise, take the values out of the ArgBuffer
     pub fn take<'a>(
         &self,
         scope: &mut v8::PinScope<'a, '_>,
