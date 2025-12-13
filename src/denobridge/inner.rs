@@ -1,7 +1,5 @@
-use super::bridge::{BridgeVals, V8IsolateManagerServer};
+use super::bridge::V8IsolateManagerServer;
 
-use std::cell::RefCell;
-use std::collections::HashMap;
 use std::rc::Rc;
 
 //use deno_core::error::{CoreError, CoreErrorKind};
@@ -11,8 +9,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     modloader::FusionModuleLoader,
-    value::ProxiedV8Value
 };
+use crate::denobridge::objreg::V8ObjectRegistry;
 use crate::luau::bridge::LuaBridgeServiceClient;
 use crate::luau::embedder_api::EmbedderData;
 
@@ -22,24 +20,10 @@ use super::denoexts;
 #[cfg(feature = "deno_include_snapshot")]
 const V8_SNAPSHOT: &[u8] = include_bytes!("snapshot.bin");
 
-/// Stores a lua function state
-/// 
-/// This is used internally to track async function call states
-pub(super) enum FunctionRunState {
-    Created {
-        args: Vec<ProxiedV8Value>,
-    },
-    Executed {
-        resp: Vec<ProxiedV8Value>,
-    },
-}
-
 #[derive(Clone)]
 pub struct CommonState {
-    pub(super) list: Rc<RefCell<HashMap<i32, FunctionRunState>>>,
     pub(super) bridge: LuaBridgeServiceClient<V8IsolateManagerServer>,
     pub(super) proxy_client: ProxyV8Client,
-    pub(super) bridge_vals: Rc<BridgeVals>,
     pub(super) ed: EmbedderData,
 }
 
@@ -55,7 +39,7 @@ pub struct V8IsolateManagerInner {
 
 pub struct SetupRuntime {
     pub deno: deno_core::JsRuntime,
-    pub bridge_vals: BridgeVals,
+    pub obj_registry: V8ObjectRegistry,
     pub heap_exhausted_token: CancellationToken,
 }
 
@@ -144,19 +128,19 @@ impl V8IsolateManagerInner {
             5 * current_value
         });
 
-        let bridge_vals = {
+        let obj_registry = {
             let main_ctx = deno.main_context();
             let isolate = deno.v8_isolate();
             let scope = std::pin::pin!(v8::HandleScope::new(isolate));
             let scope = &mut scope.init();
             let main_ctx = v8::Local::new(scope, main_ctx);
             let scope = &mut v8::ContextScope::new(scope, main_ctx);
-            BridgeVals::new(scope)
+            V8ObjectRegistry::new(scope)
         };
 
         SetupRuntime {
             deno,
-            bridge_vals,
+            obj_registry,
             heap_exhausted_token,
         }
     }
@@ -165,12 +149,10 @@ impl V8IsolateManagerInner {
         let runtime = Self::setup_runtime(&ed, loader);
 
         let common_state = CommonState {
-            list: Rc::new(RefCell::new(HashMap::new())),
             bridge,
             proxy_client: ProxyV8Client {
-                obj_registry: runtime.bridge_vals.obj_registry.clone(),
+                obj_registry: runtime.obj_registry,
             },
-            bridge_vals: Rc::new(runtime.bridge_vals),
             ed
         };
 

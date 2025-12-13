@@ -132,11 +132,9 @@ pub(crate) fn structuredclone_extensions(is_snapshot: bool) -> Vec<Extension> {
 
 extension!(
     luau_bridge,
-    ops = [
-        crate::denobridge::bridgeops::__luabind,
-        crate::denobridge::bridgeops::__luadrop,
-        crate::denobridge::bridgeops::__luarun,
-        crate::denobridge::bridgeops::__luaret,
+    objects = [
+        crate::denobridge::bridgeops::LuaObject,
+        crate::denobridge::bridgeops::ProxiedValues
     ],
     esm_entry_point = "ext:luau_bridge/cls.js",
     esm = [ dir "src/denobridge/bridge", "cls.js", "objreg.js" ],

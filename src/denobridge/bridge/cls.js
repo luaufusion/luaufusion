@@ -1,9 +1,6 @@
-import { __luabind, __luadrop, __luarun, __luaret } from "ext:core/ops";
+import { LuaObject, ProxiedValues } from "ext:core/ops";
 import { V8ObjectRegistry } from "./objreg.js";
 
-// Constants for objects in general
-const luaidSymbol = Symbol("luaufusion.luaid");
-const luatypeSymbol = Symbol("luaufusion.luatype");
 // v8 object registry instance
 const v8objreg = new V8ObjectRegistry();
 
@@ -15,34 +12,23 @@ const opCalls = {
     Drop: 4,
 }
 
-// Enum for object registry types
-const objRegistryType = {
-    Table: 0,
-    Function: 1,
-    UserData: 2,
-    Buffer: 3,
-    Thread: 4
+// TODO: Remove this once we've proven the cppgc handles are in fact being collected properly
+function gc() {
+    for (let i = 0; i < 10; i++) {
+        new ArrayBuffer(1024 * 1024 * 10);
+    }
 }
-Object.freeze(objRegistryType);
-const objRegistryTypeNames = {};
-for (let key in objRegistryType) {
-    objRegistryTypeNames[objRegistryType[key]] = key;
-}
-Object.freeze(objRegistryTypeNames);
 
 /**
- * Perform an opcall on this object
+ * Perform an opcall on this object. For backward compatibility only.
  * 
  * Internal use only. 
  */
-const __opcall = async (luaid, op, args) => {
-    let runId = __luabind(args);
-    try {
-        await __luarun(runId, luaid, op);
-    } catch (e) {
-        __luadrop(runId);
-    }
-    return __luaret(runId);
+const __opcall = async (obj, op, args) => {
+    let boundArgs = new ProxiedValues(...args);
+    await obj.opcall(boundArgs, op);
+    gc()
+    return boundArgs.take();
 }
 
 /**
@@ -58,11 +44,7 @@ const __opcall = async (luaid, op, args) => {
  * @param {any} obj The object to request disposal of. Must be a Lua object [e.g. has the luaid/luatype symbols]
  */
 const requestDisposal = async (obj) => {
-    let luaid = obj[luaidSymbol]
-    if (typeof luaid !== "bigint") {
-        throw new Error("Invalid obj provided to __opcall");
-    }
-    await __opcall(luaid, opCalls.Drop, [])
+    return // no-op
 }
 
 /**
@@ -81,14 +63,7 @@ const requestDisposal = async (obj) => {
  * converted to a single value internally
  */
 const call = async (obj, isAsync, ...args) => {
-    let luaid = obj[luaidSymbol]
-    if (typeof luaid !== "bigint") {
-        throw new Error("Invalid obj provided to __opcall");
-    }
-    if (typeof isAsync !== "boolean") {
-        throw new Error("Invalid isAsync provided to callSync");
-    }
-    let ret = await __opcall(luaid, isAsync ? opCalls.FunctionCallAsync : opCalls.FunctionCallSync, args);
+    let ret = await __opcall(obj, isAsync ? opCalls.FunctionCallAsync : opCalls.FunctionCallSync, args);
     if (Array.isArray(ret) && ret.length <= 1) {
         return ret[0]; // Cast to single value due to lua multivalue things
     }
@@ -106,11 +81,7 @@ const call = async (obj, isAsync, ...args) => {
  * @returns {any} The value at the provided key
  */
 const getproperty = async (obj, key) => {
-    let luaid = obj[luaidSymbol]
-    if (typeof luaid !== "bigint") {
-        throw new Error("Invalid obj provided to __opcall");
-    }
-    let ret = await __opcall(luaid, opCalls.Index, [key]);
+    let ret = await __opcall(obj, opCalls.Index, [key]);
     if (Array.isArray(ret) && ret.length <= 1) {
         return ret[0]; // Cast to single value due to lua multivalue things
     }
@@ -123,26 +94,21 @@ const getproperty = async (obj, key) => {
  * Returns one of "String", "Table", "Function", "UserData", "Buffer", "Thread" or "unknown"
  */
 const objtype = (obj) => {
-    if (obj && typeof obj === "object" && luatypeSymbol in obj) {
-        return objRegistryTypeNames[obj[luatypeSymbol]];
-    }
-    return "unknown";
+    return obj.type
 }
 
 globalThis.lua = {
     V8ObjectRegistry,
-    objRegistryType,
-    objRegistryTypeNames,
     opCalls,
     v8objreg,
     addV8Object: v8objreg.add.bind(v8objreg),
     getV8Object: v8objreg.get.bind(v8objreg),
     removeV8Object: v8objreg.remove.bind(v8objreg),
-    luaidSymbol,
-    luatypeSymbol,
     requestDisposal,
     call,
     getproperty,
     objtype,
+    LuaObject,
+    ProxiedValues,
 }
 Object.freeze(globalThis.lua);

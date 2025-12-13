@@ -90,6 +90,7 @@ fn main() {
         let vfs = HashMap::from([
             ("foo.js".to_string(), r#"
 export async function foo(luafunc) { 
+    console.log("foo", luafunc)
     console.log("foo, type:", `${globalThis.lua.objtype(luafunc)}`);
     console.log("fooCall", `${await globalThis.lua.call(luafunc, false)}`);
     console.log("hi");

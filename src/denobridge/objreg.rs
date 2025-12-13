@@ -33,6 +33,51 @@ pub struct V8ObjectRegistry {
 }
 
 impl V8ObjectRegistry {
+    pub(crate) fn new<'s>(scope: &mut v8::PinScope<'s, '_>) -> Self {
+        // The createLuaObjectFromData function is stored in globalThis.lua.createLuaObjectFromData
+        let (add_v8_object, get_v8_object, remove_v8_object) = {
+            // Get globalThis.lua
+            let global = scope.get_current_context().global(scope);
+            let lua_str = v8::String::new(scope, "lua").unwrap();
+            let lua_obj = global.get(scope, lua_str.into()).unwrap();
+            //println!("lua_obj: {:?}", lua_obj.to_rust_string_lossy(scope));
+            assert!(lua_obj.is_object());
+            let lua_obj = lua_obj.to_object(scope).unwrap();
+            
+            // get addV8Object, getV8Object and removeV8Object from V8ObjectRegistry
+            let add_v8_object = {
+                let addv8obj_str = v8::String::new(scope, "addV8Object").unwrap();
+                let addv8obj = lua_obj.get(scope, addv8obj_str.into()).unwrap();
+                assert!(addv8obj.is_function());
+                let addv8obj = v8::Local::<v8::Function>::try_from(addv8obj).unwrap();
+                addv8obj
+            };
+            let get_v8_object = {
+                let getv8obj_str = v8::String::new(scope, "getV8Object").unwrap();
+                let getv8obj = lua_obj.get(scope, getv8obj_str.into()).unwrap();
+                assert!(getv8obj.is_function());
+                let getv8obj = v8::Local::<v8::Function>::try_from(getv8obj).unwrap();
+                getv8obj
+            };
+            let remove_v8_object = {
+                let removev8obj_str = v8::String::new(scope, "removeV8Object").unwrap();
+                let removev8obj = lua_obj.get(scope, removev8obj_str.into()).unwrap();
+                assert!(removev8obj.is_function());
+                let removev8obj = v8::Local::<v8::Function>::try_from(removev8obj).unwrap();
+                removev8obj
+            };
+
+            (add_v8_object, get_v8_object, remove_v8_object)
+        };
+
+        Self {
+            add_v8_object: v8::Global::new(scope, add_v8_object),
+            get_v8_object: v8::Global::new(scope, get_v8_object), 
+            remove_v8_object: v8::Global::new(scope, remove_v8_object),
+
+        }
+    }
+
     /// Adds a value to the V8 object registry and returns its ID
     pub fn add(&self, scope: &mut v8::PinScope, obj: v8::Local<v8::Value>) -> Result<V8ObjectRegistryID, String> {
         let try_catch = std::pin::pin!(v8::TryCatch::new(scope));

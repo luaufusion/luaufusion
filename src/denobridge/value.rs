@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use crate::base::Error;
+use crate::denobridge::bridgeops::LuaObject;
 use crate::{denobridge::bridge::V8ObjectRegistryType, luau::foreignref::ForeignRef};
 use crate::luau::embedder_api::EmbedderDataContext;
 use crate::denobridge::psuedoprimitive::ProxiedV8PsuedoPrimitive;
@@ -127,46 +128,6 @@ impl ProxiedV8Value {
         }
     }
 
-    // Helper function to extract a SourceOwnedObject from a V8 object, if it is one
-    fn proxy_source_owned_object_from_v8<'s>(
-        scope: &mut v8::PinScope<'s, '_>,
-        common_state: &CommonState,
-        obj: v8::Local<'s, v8::Object>,
-    ) -> Result<Option<Self>, Error> {
-        let typ_key = v8::Local::new(scope, &common_state.bridge_vals.lua_type_symbol);
-        let typ_val = obj.get(scope, typ_key.into());
-        if let Some(typ_val) = typ_val {
-            if typ_val.is_int32() {
-                let typ_i32 = typ_val.to_int32(scope).ok_or("Failed to convert lua type to int32")?.value();
-                if let Some(typ) = ObjectRegistryType::from_i32(typ_i32) {
-                    // Look for luaid
-                    let lua_id = {
-                        let p_obj_key = v8::Local::new(scope, &common_state.bridge_vals.lua_id_symbol);
-                        let p_obj_val = obj.get(scope, p_obj_key.into());
-                        if let Some(p_obj_val) = p_obj_val {
-                            if p_obj_val.is_big_int() {
-                                let id = p_obj_val.to_big_int(scope).ok_or("Failed to convert lua function id to int32")?.i64_value().0;
-                                Some(id)
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        }
-                    };
-
-                    let Some(lua_id) = lua_id else {
-                        return Ok(None);
-                    };
-
-                    return Ok(Some(Self::SourceOwnedObject((typ, LuauObjectRegistryID::from_i64(lua_id)))))
-                }
-            }
-        }
-
-        Ok(None)
-    }
-
     /// Given a v8 value, convert it to a ProxiedV8Value
     pub(super) fn from_v8<'s>(
         scope: &mut v8::PinScope<'s, '_>,
@@ -191,11 +152,9 @@ impl ProxiedV8Value {
         } else if value.is_promise() {
             V8ObjectRegistryType::Promise
         } else if value.is_object() {
-            let obj = value.to_object(scope).ok_or("Failed to convert to object")?;
-
             // Handled source-owned objects
-            if let Some(v) = Self::proxy_source_owned_object_from_v8(scope, &common_state, obj)? {
-                return Ok(v);
+            if let Some(v) = LuaObject::from_v8(scope, value) {
+                return Ok(Self::SourceOwnedObject((v.lua_type, v.lua_id)));
             }
 
             V8ObjectRegistryType::Object
@@ -227,17 +186,8 @@ impl ProxiedV8Value {
                 Ok(obj.into())
             }
             Self::SourceOwnedObject((typ, id)) => {
-                let oid_key = v8::Local::new(scope, &common_state.bridge_vals.lua_id_symbol);
-                let otype_key = v8::Local::new(scope, &common_state.bridge_vals.lua_type_symbol);
-                
-                let obj = v8::Object::new(scope);
-                
-                let id_val = v8::BigInt::new_from_i64(scope, id.objid());
-                obj.set(scope, oid_key.into(), id_val.into());
-                let type_val = v8::Integer::new(scope, typ.to_i32());
-                obj.set(scope, otype_key.into(), type_val.into());
-                obj.set_integrity_level(scope, v8::IntegrityLevel::Frozen);
-                Ok(obj.into())
+                let lua_obj = LuaObject::new(typ, id);
+                Ok(lua_obj.to_v8(scope))
             },
         }
     }
