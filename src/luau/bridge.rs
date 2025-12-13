@@ -56,17 +56,6 @@ impl ObjectRegistryType {
         }
     }  
 
-    pub fn from_i32(val: i32) -> Option<Self> {
-        match val {
-            0 => Some(ObjectRegistryType::Table),
-            1 => Some(ObjectRegistryType::Function),
-            2 => Some(ObjectRegistryType::UserData),
-            3 => Some(ObjectRegistryType::Buffer),
-            4 => Some(ObjectRegistryType::Thread),
-            _ => None,
-        }
-    }
-
     pub fn from_value(val: &mluau::Value) -> Option<Self> {
         match val {
             mluau::Value::Table(_) => Some(ObjectRegistryType::Table),
@@ -77,16 +66,6 @@ impl ObjectRegistryType {
             _ => None,
         }
     }
-
-    pub fn to_i32(self) -> i32 {
-        match self {
-            ObjectRegistryType::Table => 0,
-            ObjectRegistryType::Function => 1,
-            ObjectRegistryType::UserData => 2,
-            ObjectRegistryType::Buffer => 3,
-            ObjectRegistryType::Thread => 4,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -95,20 +74,6 @@ pub enum LuauObjectOp {
     FunctionCallAsync = 2,
     Index = 3,
     Drop = 4,
-}
-
-impl TryFrom<u8> for LuauObjectOp {
-    type Error = String;
-
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
-        match value {
-            1 => Ok(LuauObjectOp::FunctionCallSync),
-            2 => Ok(LuauObjectOp::FunctionCallAsync),
-            3 => Ok(LuauObjectOp::Index),
-            4 => Ok(LuauObjectOp::Drop),
-            _ => Err(format!("Invalid ObjectOp value: {}", value)),
-        }
-    }
 }
 
 enum ValueOrMultiValue {

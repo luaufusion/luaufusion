@@ -90,8 +90,8 @@ fn main() {
         let vfs = HashMap::from([
             ("foo.js".to_string(), r#"
 export async function foo(luafunc) { 
-    console.log("foo", luafunc)
-    console.log("foo, type:", `${globalThis.lua.objtype(luafunc)}`);
+    console.log("foo [func class]: ", luafunc, luafunc.constructor.name);
+    console.log("foo, type:", `${luafunc.type}`);
     console.log("fooCall", `${await globalThis.lua.call(luafunc, false)}`);
     console.log("hi");
     return 123 + (await globalThis.lua.call(luafunc, true));
@@ -107,7 +107,7 @@ export function bar(x) {
 }
 
 await Promise.resolve(); // Force async
-console.log(`In foo.js ${structuredClone}`);
+console.log(`In foo.js ${structuredClone({})}`);
 "#.to_string()),
     ("foo1.json".to_string(), "{\"foo\":1929}".to_string()),
     ("dir/foo.js".to_string(), r#"
@@ -134,7 +134,6 @@ export function baz(x) {
 }
 // Sleep for 2 seconds
 console.log("In bar.js, sleeping for 5 seconds...");
-console.log(typeof Deno.core.queueUserTimer)
 await new Promise(resolve => setTimeout(resolve, 5000));
 console.log("Awake now!");
 console.log(`In foo2.js ${structuredClone} ${structuredClone([1,2,3,4,{},JSON.stringify({a:1,b:2})])}`);

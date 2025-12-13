@@ -4,47 +4,11 @@ import { V8ObjectRegistry } from "./objreg.js";
 // v8 object registry instance
 const v8objreg = new V8ObjectRegistry();
 
-// Enum for opcalls
-const opCalls = {
-    FunctionCallSync: 1,
-    FunctionCallAsync: 2,
-    Index: 3,
-    Drop: 4,
-}
-
 // TODO: Remove this once we've proven the cppgc handles are in fact being collected properly
 function gc() {
     for (let i = 0; i < 10; i++) {
         new ArrayBuffer(1024 * 1024 * 10);
     }
-}
-
-/**
- * Perform an opcall on this object. For backward compatibility only.
- * 
- * Internal use only. 
- */
-const __opcall = async (obj, op, args) => {
-    let boundArgs = new ProxiedValues(...args);
-    await obj.opcall(boundArgs, op);
-    gc()
-    return boundArgs.take();
-}
-
-/**
- * Request the disposal of this object from Luau. Useful to ensure quicker cleanup of objects
- * if you know you are done with them.
- * 
- * Note 1: values on the registry and *not* reference counted. As such, calling this method will
- * most likely free all references to this object. Any further use of this object will result
- * in errors.
- * Note 2: It is guaranteed that the object's ID will never be reused for another object within the 
- * proxy bridge.
- * 
- * @param {any} obj The object to request disposal of. Must be a Lua object [e.g. has the luaid/luatype symbols]
- */
-const requestDisposal = async (obj) => {
-    return // no-op
 }
 
 /**
@@ -63,11 +27,14 @@ const requestDisposal = async (obj) => {
  * converted to a single value internally
  */
 const call = async (obj, isAsync, ...args) => {
-    let ret = await __opcall(obj, isAsync ? opCalls.FunctionCallAsync : opCalls.FunctionCallSync, args);
-    if (Array.isArray(ret) && ret.length <= 1) {
-        return ret[0]; // Cast to single value due to lua multivalue things
+    let boundArgs = new ProxiedValues(...args);
+    if (isAsync) {
+        await obj.callAsync(boundArgs);
+    } else {
+        await obj.callSync(boundArgs);
     }
-    return ret;
+    gc()
+    return boundArgs.extract();
 }
 
 /**
@@ -81,33 +48,33 @@ const call = async (obj, isAsync, ...args) => {
  * @returns {any} The value at the provided key
  */
 const getproperty = async (obj, key) => {
-    let ret = await __opcall(obj, opCalls.Index, [key]);
-    if (Array.isArray(ret) && ret.length <= 1) {
-        return ret[0]; // Cast to single value due to lua multivalue things
+    // Try fast-paths for common key types
+    if (typeof key === "number") {
+        if (Number.isInteger(key)) {
+            let ret = await obj.getPropertyInteger(key);
+            return ret.extract()
+        } else {
+            let ret = await obj.getPropertyNumber(key);
+            return ret.extract();
+        }
+    } else if (typeof key === "string") {
+        let ret = await obj.getPropertyString(key);
+        return ret.extract();
     }
-    return ret;
-}
 
-/**
- * Helper method to get the type of a lua object
- * 
- * Returns one of "String", "Table", "Function", "UserData", "Buffer", "Thread" or "unknown"
- */
-const objtype = (obj) => {
-    return obj.type
+    let keyPV = new ProxiedValues(key);
+    await obj.get(keyPV);
+    return keyPV.extract();
 }
 
 globalThis.lua = {
     V8ObjectRegistry,
-    opCalls,
     v8objreg,
     addV8Object: v8objreg.add.bind(v8objreg),
     getV8Object: v8objreg.get.bind(v8objreg),
     removeV8Object: v8objreg.remove.bind(v8objreg),
-    requestDisposal,
     call,
     getproperty,
-    objtype,
     LuaObject,
     ProxiedValues,
 }

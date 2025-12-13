@@ -5,6 +5,7 @@ use deno_core::parking_lot::Mutex;
 use deno_core::{GarbageCollected, OpState, op2, v8};
 
 use crate::denobridge::primitives::ProxiedV8Primitive;
+use crate::denobridge::psuedoprimitive::ProxiedV8PsuedoPrimitive;
 use crate::luau::bridge::{LuauObjectOp, ObjectRegistryType};
 use crate::luau::embedder_api::EmbedderDataContext;
 use crate::luau::LuauObjectRegistryID;
@@ -30,6 +31,7 @@ impl LuaObject {
         value: v8::Local<'a, v8::Value>,
     ) -> Option<ExtractedLuaObject> {
         if let Some(cppgc_obj) = deno_core::cppgc::try_unwrap_cppgc_object::<LuaObject>(scope, value) {
+            // Copy out what we need to ensure the UnsafePtr is only stored on the stack for minimal time
             Some(ExtractedLuaObject {
                 lua_type: cppgc_obj.lua_type,
                 lua_id: cppgc_obj.lua_id.clone(),
@@ -59,6 +61,9 @@ impl LuaObject {
 
     /// Internal implementation of opcall
     /// that reuses a single ProxiedValues cppgc object
+    /// 
+    /// Verifies that the args passed in are valid for the opcall
+    /// (unlike opcall_impl_new_value)
     async fn opcall_impl(
         &self,
         state_rc: Rc<RefCell<OpState>>,
@@ -76,8 +81,19 @@ impl LuaObject {
 
         let args = bound_args.consume()?;
 
-        let op_id = LuauObjectOp::try_from(op_id)
-            .map_err(|e| deno_error::JsErrorBox::generic(format!("Invalid op_id: {}", e)))?;
+        match op_id {
+            LuauObjectOp::Drop => {
+                if !args.is_empty() {
+                    return Err(deno_error::JsErrorBox::generic(format!("Drop op expects no arguments, got {}", args.len())));
+                }
+            }
+            LuauObjectOp::Index => {
+                if args.len() != 1 {
+                    return Err(deno_error::JsErrorBox::generic(format!("Indexing a object requires exactly/only 1 argument, got {}", args.len())));
+                }
+            },
+            _ => {}
+        }
 
         let lua_resp = running_funcs.bridge.opcall(
             self.lua_id.clone(),
@@ -93,6 +109,9 @@ impl LuaObject {
 
     /// Internal implementation of opcall
     /// that creates a new ProxiedValues cppgc object for each call
+    /// 
+    /// Trusts that the args passed in are valid for the opcall
+    /// (unlike opcall_impl)
     async fn opcall_impl_new_value(
         &self,
         state_rc: Rc<RefCell<OpState>>,
@@ -107,9 +126,6 @@ impl LuaObject {
                 .ok_or_else(|| deno_error::JsErrorBox::generic("CommonState not found".to_string()))?
                 .clone()
         };
-
-        let op_id = LuauObjectOp::try_from(op_id)
-            .map_err(|e| deno_error::JsErrorBox::generic(format!("Invalid op_id: {}", e)))?;
 
         let lua_resp = running_funcs.bridge.opcall(
             self.lua_id.clone(),
@@ -149,31 +165,17 @@ impl LuaObject {
     //}
 
     #[getter]
-    #[rename("type")]
-    #[string]
-    pub fn get_lua_type(&self) -> &'static str {
-        self.lua_type.type_name()
-    }
-
-    #[getter]
     #[rename("id")]
     #[bigint]
     pub fn get_lua_id(&self) -> i64 {
         self.lua_id.objid()
     }
 
-    #[async_method]
-    // Performs an opcall on this LuaObject
-    pub async fn opcall(
-        &self,
-        state_rc: Rc<RefCell<OpState>>,
-        #[cppgc] bound_args: &ProxiedValues,
-        op_id: u8,
-    ) -> Result<(), deno_error::JsErrorBox> {
-        let op_id = LuauObjectOp::try_from(op_id)
-            .map_err(|e| deno_error::JsErrorBox::generic(format!("Invalid op_id: {}", e)))?;
-
-        self.opcall_impl(state_rc, bound_args, op_id).await
+    #[getter]
+    #[rename("type")]
+    #[string]
+    pub fn get_lua_type(&self) -> &'static str {
+        self.lua_type.type_name()
     }
 
     #[async_method]
@@ -200,7 +202,7 @@ impl LuaObject {
 
     #[async_method]
     #[rename("get")]
-    // Index/get opcall
+    // Index/get a property from the Lua object
     pub async fn get(
         &self,
         state_rc: Rc<RefCell<OpState>>,
@@ -210,7 +212,7 @@ impl LuaObject {
     }
 
     #[async_method]
-    #[rename("getProperty")]
+    #[rename("getPropertyString")]
     #[cppgc]
     // Get a property
     //
@@ -224,7 +226,7 @@ impl LuaObject {
     }
 
     #[async_method]
-    #[rename("getIndex")]
+    #[rename("getPropertyInteger")]
     #[cppgc]
     // Get a property
     //
@@ -235,6 +237,20 @@ impl LuaObject {
         prop: i32,
     ) -> Result<ProxiedValues, deno_error::JsErrorBox> {
         self.opcall_impl_new_value(state_rc, vec![ProxiedV8Value::Primitive(ProxiedV8Primitive::Integer(prop))], LuauObjectOp::Index).await
+    }
+
+    #[async_method]
+    #[rename("getPropertyNumber")]
+    #[cppgc]
+    // Get a property
+    //
+    // Similar to get, except works with a arg that is a i32 index
+    pub async fn get_property_number<'a>(
+        &self,
+        state_rc: Rc<RefCell<OpState>>,
+        prop: f64,
+    ) -> Result<ProxiedValues, deno_error::JsErrorBox> {
+        self.opcall_impl_new_value(state_rc, vec![ProxiedV8Value::Psuedoprimitive(ProxiedV8PsuedoPrimitive::Number(prop))], LuauObjectOp::Index).await
     }
 }
 
@@ -357,7 +373,7 @@ impl ProxiedValues {
     }
 
     #[method]
-    // After a function call, take the values out of the ProxiedValues
+    // After a function call or otherwise, take the values out of the ProxiedValues
     pub fn take<'a>(
         &self,
         scope: &mut v8::PinScope<'a, '_>,
@@ -385,5 +401,49 @@ impl ProxiedValues {
         }
 
         Ok(arr)
+    }
+
+    #[method]
+    // Similar to take, but flattens single-valued results into just that value
+    // and returns undefined for zero-length results
+    pub fn extract<'a>(
+        &self,
+        scope: &mut v8::PinScope<'a, '_>,
+        op_state: &OpState,
+    ) -> Result<v8::Local<'a, v8::Value>, deno_error::JsErrorBox> {
+        let state = op_state.try_borrow::<CommonState>()
+            .ok_or_else(|| deno_error::JsErrorBox::generic("CommonState not found".to_string()))?;
+
+        // Proxy every return value to V8
+        let mut results = vec![];
+        let mut ed = EmbedderDataContext::new(&state.ed);
+        let args = self.consume()?;
+
+        match args.len() {
+            0 => return Ok(v8::undefined(scope).into()),
+            1 => {
+                let arg = args.into_iter().next().ok_or(deno_error::JsErrorBox::generic("Failed to extract single value".to_string()))?;
+                let v8_ret = arg.to_v8(scope, state, &mut ed)
+                    .map_err(|e| deno_error::JsErrorBox::generic(format!("Failed to convert return value: {}", e)))?;
+                return Ok(v8_ret);
+            },
+            _ => {
+                for arg in args {
+                    match arg.to_v8(scope, state, &mut ed) {
+                        Ok(v8_ret) => results.push(v8_ret),
+                        Err(e) => {
+                            return Err(deno_error::JsErrorBox::generic(format!("Failed to convert return value: {}", e)));
+                        }
+                    }
+                }
+
+                let arr = v8::Array::new(scope, results.len() as i32);
+                for (i, v) in results.into_iter().enumerate() {
+                    arr.set_index(scope, i as u32, v);
+                }
+
+                Ok(arr.into())
+            }
+        }
     }
 }

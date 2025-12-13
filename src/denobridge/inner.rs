@@ -19,6 +19,10 @@ use super::denoexts;
 
 #[cfg(feature = "deno_include_snapshot")]
 const V8_SNAPSHOT: &[u8] = include_bytes!("snapshot.bin");
+#[cfg(all(feature = "deno_include_snapshot", any(not(target_os = "linux"), not(target_arch = "x86_64"))))]
+const _: () = {
+    compile_error!("Including V8 snapshot in binary is only supported on Linux x86_64 targets at this time.");
+};
 
 #[derive(Clone)]
 pub struct CommonState {
@@ -96,6 +100,11 @@ impl V8IsolateManagerInner {
         let extensions = denoexts::extension::all_extensions(false);
 
         deno_core::v8::V8::set_flags_from_string("--harmony-import-assertions --harmony-import-attributes --jitless");
+
+        #[cfg(feature = "deno_include_snapshot")]
+        {
+            assert!(V8_SNAPSHOT.len() > 0, "V8 snapshot is empty but deno_include_snapshot feature is enabled");
+        }
 
         let mut deno = deno_core::JsRuntime::new(deno_core::RuntimeOptions {
             create_params: Some(
