@@ -11,6 +11,12 @@ pub struct ForeignLuauValue {
 
 }
 
+impl Drop for ForeignLuauValue {
+    fn drop(&mut self) {
+        self.bridge.fire_request_dispose(self.id.clone());
+    }
+}
+
 impl ForeignLuauValue {
     /// Create a new ForeignLuauValue (host mode)
     pub fn new(id: LuauObjectRegistryID, plc: ProxyPLuaClient, bridge: LuaBridgeServiceClient<ParallelLuaProxyBridge>, typ: ObjectRegistryType) -> Self {
@@ -31,10 +37,8 @@ impl LuaUserData for ForeignLuauValue {
         });
 
         methods.add_scheduler_async_method("requestdispose", async move |_lua, this, ()| {
-            this.bridge.opcall(
+            this.bridge.request_dispose(
                 this.id.clone(),
-                LuauObjectOp::Drop,
-                vec![]
             )
             .await
             .map_err(|e| mluau::Error::external(format!("Bridge call failed: {}", e)))?;

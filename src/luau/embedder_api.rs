@@ -3,23 +3,18 @@ use serde::{Deserialize, Serialize};
 use crate::MAX_PROXY_DEPTH;
 use crate::base::Error;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 /// Embedder specific configuration data
 pub struct EmbedderData {
     /// Heap limit
     pub heap_limit: usize,
     /// Maximum number of bytes allowed for the payload
     pub max_payload_size: Option<usize>,
-}
-
-impl EmbedderData {
-    /// Creates a new EmbedderData with default values
-    pub fn new(heap_limit: usize, max_payload_size: Option<usize>) -> Self {
-        Self {
-            heap_limit,
-            max_payload_size,
-        }
-    }
+    /// Whether or not object disposal is enabled at all
+    pub object_disposal_enabled: bool,
+    /// Whether or not automatic disposal of objects is enabled
+    /// (via fire_request_dispose messages)
+    pub automatic_object_disposal_enabled: bool,
 }
 
 pub struct EmbedderDataContext {

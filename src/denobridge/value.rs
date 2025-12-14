@@ -186,7 +186,7 @@ impl ProxiedV8Value {
                 Ok(obj.into())
             }
             Self::SourceOwnedObject((typ, id)) => {
-                let lua_obj = LuaObject::new(typ, id);
+                let lua_obj = LuaObject::new(typ, id, common_state.bridge.clone());
                 Ok(lua_obj.to_v8(scope))
             },
         }

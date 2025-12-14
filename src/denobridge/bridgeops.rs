@@ -4,7 +4,8 @@ use std::rc::Rc;
 use deno_core::parking_lot::Mutex;
 use deno_core::{GarbageCollected, OpState, op2, v8};
 
-use crate::luau::bridge::{LuauObjectOp, ObjectRegistryType};
+use crate::denobridge::V8IsolateManagerServer;
+use crate::luau::bridge::{LuaBridgeServiceClient, LuauObjectOp, ObjectRegistryType};
 use crate::luau::embedder_api::EmbedderDataContext;
 use crate::luau::LuauObjectRegistryID;
 use super::value::ProxiedV8Value;
@@ -12,7 +13,9 @@ use super::inner::CommonState;
 
 pub(super) struct LuaObject {
     pub(super) lua_type: ObjectRegistryType,
-    pub(super) lua_id: LuauObjectRegistryID
+    pub(super) lua_id: LuauObjectRegistryID,
+    pub(super) bridge: LuaBridgeServiceClient<V8IsolateManagerServer>,
+
 }
 
 pub(super) struct ExtractedLuaObject {
@@ -40,10 +43,11 @@ impl LuaObject {
     }
 
     /// Creates a new LuaObject with the specified type and ID
-    pub(super) fn new(lua_type: ObjectRegistryType, lua_id: LuauObjectRegistryID) -> Self {
+    pub(super) fn new(lua_type: ObjectRegistryType, lua_id: LuauObjectRegistryID, bridge: LuaBridgeServiceClient<V8IsolateManagerServer>) -> Self {
         LuaObject {
             lua_type,
-            lua_id
+            lua_id,
+            bridge,
         }
     }
 
@@ -79,11 +83,6 @@ impl LuaObject {
         let args = bound_args.consume()?;
 
         match op_id {
-            LuauObjectOp::Drop => {
-                if !args.is_empty() {
-                    return Err(deno_error::JsErrorBox::generic(format!("Drop op expects no arguments, got {}", args.len())));
-                }
-            }
             LuauObjectOp::Index => {
                 if args.len() != 1 {
                     return Err(deno_error::JsErrorBox::generic(format!("Indexing a object requires exactly/only 1 argument, got {}", args.len())));
@@ -118,7 +117,10 @@ unsafe impl GarbageCollected for LuaObject {
 impl Drop for LuaObject {
     fn drop(&mut self) {
         // No fields to drop
-        println!("LuaObject of type {} with ID {:?} dropped", self.lua_type.type_name(), self.lua_id);
+        if cfg!(feature = "debug_message_print_enabled") {
+            println!("LuaObject of type {} with ID {:?} dropped", self.lua_type.type_name(), self.lua_id);
+        }
+        self.bridge.fire_request_dispose(self.lua_id.clone());
     }
 }
 
@@ -176,6 +178,31 @@ impl LuaObject {
     ) -> Result<(), deno_error::JsErrorBox> {
         self.opcall_impl(state_rc, bound_args, LuauObjectOp::Index).await
     }
+
+    #[async_method]
+    #[rename("requestDispose")]
+    // Request disposal of the Lua object. Should be used with care as luaufusion usually handles this automatically
+    pub async fn request_dispose(
+        &self,
+        state_rc: Rc<RefCell<OpState>>,
+    ) -> Result<(), deno_error::JsErrorBox> {
+        let running_funcs = {
+            let state = state_rc.try_borrow()
+                .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
+            
+            state.try_borrow::<CommonState>()
+                .ok_or_else(|| deno_error::JsErrorBox::generic("CommonState not found".to_string()))?
+                .clone()
+        };
+
+        running_funcs.bridge.request_dispose(
+            self.lua_id.clone(),
+        )
+        .await
+        .map_err(|e| deno_error::JsErrorBox::generic(format!("Bridge call failed: {}", e)))?;
+
+        Ok(())
+    }
 }
 
 // A cppgc struct to hold proxied values for passing between ops
@@ -215,7 +242,9 @@ impl ArgBuffer {
 impl Drop for ArgBuffer {
     fn drop(&mut self) {
         // No fields to drop
-        println!("ArgBuffer dropped");
+        if cfg!(feature = "debug_message_print_enabled") {
+            println!("ArgBuffer dropped");
+        }
     }
 }
 

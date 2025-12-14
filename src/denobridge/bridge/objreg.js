@@ -5,13 +5,19 @@
 export class V8ObjectRegistry {
     // Reverse mapping of object to id for quick lookup
     #objToId = new Map();
-    // Objects stored as [id] = obj
+    // Objects stored as [id] = {obj: obj, refcount: n}
     #idToObj = new Map();
     #lastid = 1;
 
+    // Adds an object to the registry, returning its ID
+    //
+    // Increments refcount if already present
     add(obj) {
         let potid = this.#objToId.get(obj);
         if(this.#objToId.has(obj)) {
+            // Increment refcount
+            let entry = this.#idToObj.get(potid);
+            entry.refcount++;
             return potid;
         }
 
@@ -22,15 +28,23 @@ export class V8ObjectRegistry {
         this.#lastid++;
         let id = this.#lastid;
         this.#objToId.set(obj, id);
-        this.#idToObj.set(id, obj);
+        this.#idToObj.set(id, {obj: obj, refcount: 1});
         return id;
     }
 
+    // Retrieves an object by its ID
+    //
+    // Does not modify refcount
     get(id) {
-        return this.#idToObj.get(id);
+        let entry = this.#idToObj.get(id);
+        if (entry) {
+            return entry.obj;
+        }
+        return undefined;
     }
 
-    remove(id) {
+    // Decrements refcount of object by ID, removing it if refcount reaches 0
+    drop(id) {
         let entry = this.#idToObj.get(id);
         if(entry) {
             entry.refcount--;

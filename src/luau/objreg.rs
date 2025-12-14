@@ -29,7 +29,7 @@ pub struct ObjRegistryLuau {
     objreg: mluau::Table,
     add: mluau::Function,
     get: mluau::Function,
-    remove: mluau::Function,
+    drop: mluau::Function,
 }
 
 impl ObjRegistryLuau {
@@ -39,32 +39,38 @@ impl ObjRegistryLuau {
         let objreg: mluau::Table = objreg_tab.get("objreg")?;
         let add: mluau::Function = objreg_tab.get("add")?;
         let get: mluau::Function = objreg_tab.get("get")?;
-        let remove: mluau::Function = objreg_tab.get("remove")?;
+        let drop: mluau::Function = objreg_tab.get("drop")?;
         Ok(Self {
             objreg,
             add,
             get,
-            remove,
+            drop,
         })
     }
 
     /// Adds the obj ``obj`` to the registry and returns its ID
     /// 
     /// May reuse IDs corresponding to the same object if it was already added
+    /// 
+    /// Increments refcount of the object
     pub fn add(&self, obj: mluau::Value) -> Result<LuauObjectRegistryID, mluau::Error> {
         let id: i64 = self.add.call(obj)?;
         Ok(LuauObjectRegistryID::from_i64(id))
     }
 
     /// Calls get on the registry
+    /// 
+    /// Does not modify refcount
     pub fn get(&self, id: LuauObjectRegistryID) -> Result<mluau::Value, mluau::Error> {
         let val: mluau::Value = self.get.call(id.objid())?;
         Ok(val)
     }
 
-    /// Calls remove on the registry
-    pub fn remove(&self, id: LuauObjectRegistryID) -> Result<(), mluau::Error> {
-        self.remove.call::<()>(id.objid())?;
+    /// Calls drop on the registry
+    /// 
+    /// Decrements refcount of the object, removing it from the registry if refcount reaches 0
+    pub fn drop(&self, id: LuauObjectRegistryID) -> Result<(), mluau::Error> {
+        self.drop.call::<()>(id.objid())?;
         Ok(())
     }
 

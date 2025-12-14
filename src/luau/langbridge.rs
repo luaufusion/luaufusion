@@ -147,3 +147,12 @@ impl<T: ProxyBridge> mluau::UserData for LangBridge<T> {
         });
     }
 }
+
+impl<T: ProxyBridge> Drop for LangBridge<T> {
+    fn drop(&mut self) {
+        // Ensure the bridge is shutdown on drop
+        if !self.bridge.is_shutdown() {
+            self.bridge.fire_shutdown();
+        }
+    }
+}

@@ -73,7 +73,6 @@ pub enum LuauObjectOp {
     FunctionCallSync = 1,
     FunctionCallAsync = 2,
     Index = 3,
-    Drop = 4,
 }
 
 enum ValueOrMultiValue {
@@ -166,15 +165,6 @@ impl LuauObjectOp {
                 }?;
                 Ok(ValueOrMultiValue::Value(v))
             }
-            Self::Drop => {
-                if !args.is_empty() {
-                    return Err("Drop operation does not take arguments".into());
-                }
-                plc.obj_registry.remove(obj_id)
-                    .map_err(|e| format!("Failed to remove object from registry: {}", e))?;
-                // Dropping is handled by the registry; just return nil
-                Ok(ValueOrMultiValue::Value(mluau::Value::Nil))
-            }
         }
     }
 }
@@ -188,6 +178,10 @@ pub enum LuaBridgeMessage<T: ProxyBridge> {
         args: Vec<T::ValueType>,
         resp: OneshotSender<Result<Vec<T::ValueType>, String>>,
     },
+    RequestDispose {
+        obj_id: LuauObjectRegistryID,
+        resp: Option<OneshotSender<Result<(), String>>>,
+    },
     Shutdown,
 }
 
@@ -195,11 +189,12 @@ pub enum LuaBridgeMessage<T: ProxyBridge> {
 pub struct LuaBridgeService<T: ProxyBridge> {
     bridge: T,
     rx: MultiReceiver<LuaBridgeMessage<T>>,
+    ed: EmbedderData,
 }
 
 impl<T: ProxyBridge + ProxyBridgeWithMultiprocessExt> LuaBridgeService<T> {
-    pub fn new(bridge: T, rx: MultiReceiver<LuaBridgeMessage<T>>) -> Self {
-        Self { bridge, rx }
+    pub fn new(bridge: T, rx: MultiReceiver<LuaBridgeMessage<T>>, ed: EmbedderData) -> Self {
+        Self { bridge, rx, ed }
     }
 
     /// Creates a new Lua proxy bridge
@@ -224,13 +219,40 @@ impl<T: ProxyBridge + ProxyBridgeWithMultiprocessExt> LuaBridgeService<T> {
                                 (op.run(&lua, obj_id, args, bridge, &plc).await, resp)
                             });
                         }
+                        LuaBridgeMessage::RequestDispose { obj_id, resp } => {
+                            if !self.ed.object_disposal_enabled {
+                                continue;
+                            }
+                            
+                            if cfg!(feature = "debug_message_print_enabled") {
+                                println!("Host Luau received request to dispose object ID {:?}", obj_id);
+                            }
+
+                            match plc.obj_registry.drop(obj_id) {
+                                Ok(_) => {
+                                    if let Some(resp) = resp {
+                                        let _ = resp.server(&server_ctx).send(Ok(()));
+                                    }
+                                },
+                                Err(e) => {
+                                    if let Some(resp) = resp {
+                                        let _ = resp.server(&server_ctx).send(Err(format!("Failed to dispose object: {}", e)));
+                                    }
+                                }
+                            }
+                        }
                         LuaBridgeMessage::Shutdown => {
-                            println!("Parallel Luau client received shutdown message");
+                            if cfg!(feature = "debug_message_print_enabled") {
+                                println!("Host Luau received shutdown message");
+                            }
                             break;
                         }
                     }
                 }
                 _ = state.cancel_token.cancelled() => {
+                    if cfg!(feature = "debug_message_print_enabled") {
+                        println!("Lua bridge service received shutdown cancellation");
+                    }
                     break; // Executor is shutting down
                 }
                 Some((result, resp)) = op_call_queue.next() => {                    
@@ -297,12 +319,14 @@ impl<T: ProxyBridge + ProxyBridgeWithMultiprocessExt> LuaBridgeService<T> {
 pub struct LuaBridgeServiceClient<T: ProxyBridge> {
     client_context: ClientContext,
     tx: MultiSender<LuaBridgeMessage<T>>,
+    pub(crate) ed: EmbedderData,
+
 }
 
 impl<T: ProxyBridge> LuaBridgeServiceClient<T> {
     /// Creates a new Lua bridge service client
-    pub fn new(client_context: ClientContext, tx: MultiSender<LuaBridgeMessage<T>>) -> Self {
-        Self { client_context, tx }
+    pub fn new(client_context: ClientContext, tx: MultiSender<LuaBridgeMessage<T>>, ed: EmbedderData) -> Self {
+        Self { client_context, tx, ed }
     }
 
     /// Calls a Lua function by its ID with the given arguments, returning the results
@@ -316,5 +340,33 @@ impl<T: ProxyBridge> LuaBridgeServiceClient<T> {
         };
         self.tx.client(&self.client_context).send(msg).map_err(|e| format!("Failed to send opcall message: {}", e))?;
         resp_rx.recv().await.map_err(|e| format!("Failed to receive opcall response: {}", e))?
+    }
+
+    /// Requests disposal of a Lua object by its ID
+    pub async fn request_dispose(&self, obj_id: LuauObjectRegistryID) -> Result<(), String> {
+        if !self.ed.object_disposal_enabled {
+            return Ok(());
+        }
+
+        let (resp_tx, resp_rx) = self.client_context.oneshot();
+        let msg = LuaBridgeMessage::RequestDispose {
+            obj_id,
+            resp: Some(resp_tx),
+        };
+        self.tx.client(&self.client_context).send(msg).map_err(|e| format!("Failed to send request dispose message: {}", e))?;
+        resp_rx.recv().await.map_err(|e| format!("Failed to receive request dispose response: {}", e))?
+    }
+
+    /// Fires a dispose request without waiting for the result
+    pub fn fire_request_dispose(&self, obj_id: LuauObjectRegistryID) {
+        if !self.ed.object_disposal_enabled || !self.ed.automatic_object_disposal_enabled {
+            return;
+        }
+
+        let msg = LuaBridgeMessage::RequestDispose {
+            obj_id,
+            resp: None,
+        };
+        let _ = self.tx.client(&self.client_context).send(msg);
     }
 }

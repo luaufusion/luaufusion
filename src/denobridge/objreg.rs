@@ -29,7 +29,7 @@ pub struct V8ObjectRegistry {
     // obj registry fields (addV8Object, getV8Object and removeV8Object)
     pub add_v8_object: v8::Global<v8::Function>,
     pub get_v8_object: v8::Global<v8::Function>,
-    pub remove_v8_object: v8::Global<v8::Function>,
+    pub drop_v8_object: v8::Global<v8::Function>,
 }
 
 impl V8ObjectRegistry {
@@ -60,7 +60,7 @@ impl V8ObjectRegistry {
                 getv8obj
             };
             let remove_v8_object = {
-                let removev8obj_str = v8::String::new(scope, "removeV8Object").unwrap();
+                let removev8obj_str = v8::String::new(scope, "dropV8Object").unwrap();
                 let removev8obj = lua_obj.get(scope, removev8obj_str.into()).unwrap();
                 assert!(removev8obj.is_function());
                 let removev8obj = v8::Local::<v8::Function>::try_from(removev8obj).unwrap();
@@ -73,12 +73,14 @@ impl V8ObjectRegistry {
         Self {
             add_v8_object: v8::Global::new(scope, add_v8_object),
             get_v8_object: v8::Global::new(scope, get_v8_object), 
-            remove_v8_object: v8::Global::new(scope, remove_v8_object),
+            drop_v8_object: v8::Global::new(scope, remove_v8_object),
 
         }
     }
 
     /// Adds a value to the V8 object registry and returns its ID
+    /// 
+    /// Increments the reference count if the object is already present
     pub fn add(&self, scope: &mut v8::PinScope, obj: v8::Local<v8::Value>) -> Result<V8ObjectRegistryID, String> {
         let try_catch = std::pin::pin!(v8::TryCatch::new(scope));
         let try_catch = &mut try_catch.init();
@@ -107,7 +109,9 @@ impl V8ObjectRegistry {
         }
     }
 
-    /// Gets a value from the V8 object registry by ID
+    /// Gets a value from the V8 object registry by ID. 
+    /// 
+    /// Does not increment the reference count in the registry.
     /// 
     /// May be undefined if the ID does not exist
     pub fn get<'a, R>(
@@ -141,11 +145,13 @@ impl V8ObjectRegistry {
     }
 
     /// Removes a value from the V8 object registry by ID
-    pub fn remove(&self, scope: &mut v8::PinScope, id: V8ObjectRegistryID) -> Result<(), String> {
+    /// 
+    /// Decrements the reference count, removing the object if it reaches 0
+    pub fn drop(&self, scope: &mut v8::PinScope, id: V8ObjectRegistryID) -> Result<(), String> {
         let try_catch = std::pin::pin!(v8::TryCatch::new(scope));
         let try_catch = &mut try_catch.init();
         let undefined = v8::undefined(try_catch);
-        let remove_v8_object = v8::Local::new(try_catch, &self.remove_v8_object);
+        let remove_v8_object = v8::Local::new(try_catch, &self.drop_v8_object);
         let id_value = v8::Integer::new(try_catch, id.objid() as i32);
         // The function is bound, so recv is undefined
         let func = remove_v8_object.call(try_catch, undefined.into(), &[id_value.into()]);

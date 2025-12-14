@@ -73,7 +73,7 @@ impl V8IsolateManagerInner {
         // Add a callback to terminate the runtime if the max_heap_size limit is approached
         let heap_exhausted_token_ref = heap_exhausted_token.clone();
         deno.add_near_heap_limit_callback(move |current_value, _| {
-            println!("V8 heap limit approached: {} bytes used", current_value);
+            eprintln!("V8 heap limit approached: {} bytes used", current_value);
             isolate_handle.terminate_execution();
 
             // Signal the outer runtime to cancel block_on future (avoid hanging) and return friendly error
@@ -126,7 +126,7 @@ impl V8IsolateManagerInner {
         // Add a callback to terminate the runtime if the max_heap_size limit is approached
         let heap_exhausted_token_ref = heap_exhausted_token.clone();
         deno.add_near_heap_limit_callback(move |current_value, _| {
-            println!("V8 heap limit approached: {} bytes used", current_value);
+            eprintln!("V8 heap limit approached: {} bytes used", current_value);
             isolate_handle.terminate_execution();
 
             // Signal the outer runtime to cancel block_on future (avoid hanging) and return friendly error

@@ -50,6 +50,13 @@ interface LuaObject {
      * @param {ArgBuffer} key The key to index the object with. This should be the only value in the ArgBuffer object.
      */
     get: (key: ArgBuffer) => Promise<void>;
+
+    /**
+     * Requests disposal of the Lua object on the Luau side
+     * 
+     * Note: this method should be used with care. Usually, luaufusion will automatically
+     * handle this when the JS object is garbage collected.
+     */
 }
 
 /**

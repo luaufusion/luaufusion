@@ -77,6 +77,11 @@ pub(super) enum V8IsolateManagerMessage {
         resp: OneshotSender<Result<Vec<ProxiedV8Value>, String>>,
         magic: usize,
     },
+    DropObject {
+        object_id: V8ObjectRegistryID,
+        resp: Option<OneshotSender<Result<(), String>>>,
+        magic: usize,
+    },
     Shutdown,
 }
 
@@ -120,6 +125,21 @@ impl V8IsolateSendableMessage for OpCallMessage {
     }
 }
 
+pub(super) struct DropObjectMessage {
+    pub object_id: V8ObjectRegistryID,
+}
+
+impl V8IsolateSendableMessage for DropObjectMessage {
+    type Response = Result<(), String>;
+    fn to_message(self, resp: OneshotSender<Self::Response>) -> V8IsolateManagerMessage {
+        V8IsolateManagerMessage::DropObject {
+            object_id: self.object_id,
+            resp: Some(resp),
+            magic: V8_MESSAGE_MAGIC,
+        }
+    }
+}
+
 pub(super) struct ShutdownMessage;
 
 impl V8IsolateSendableMessage for ShutdownMessage {
@@ -133,7 +153,6 @@ impl V8IsolateSendableMessage for ShutdownMessage {
 pub enum V8ObjectOp {
     ObjectGetProperty,
     FunctionCall,
-    RequestDispose,
 }
 
 enum OpCallRet {
@@ -145,12 +164,12 @@ impl V8ObjectOp {
     fn run<'s>(self, inner: &mut V8IsolateManagerInner, obj_id: V8ObjectRegistryID, args: Vec<ProxiedV8Value>) -> Result<OpCallRet, Error> {        
         match self {
             Self::FunctionCall => {
-                    let main_ctx = inner.deno.main_context();
-                    let isolate = inner.deno.v8_isolate();
-                    let scope = std::pin::pin!(v8::HandleScope::new(isolate));
-                    let mut scope = &mut scope.init();
-                    let main_ctx = v8::Local::new(&mut scope, main_ctx);
-                    let mut context_scope = &mut v8::ContextScope::new(scope, main_ctx);
+                let main_ctx = inner.deno.main_context();
+                let isolate = inner.deno.v8_isolate();
+                let scope = std::pin::pin!(v8::HandleScope::new(isolate));
+                let mut scope = &mut scope.init();
+                let main_ctx = v8::Local::new(&mut scope, main_ctx);
+                let mut context_scope = &mut v8::ContextScope::new(scope, main_ctx);
 
                 let func = match inner.common_state.proxy_client.obj_registry.get(context_scope, obj_id, |tc, v| {
                     if !v.is_function() {
@@ -221,19 +240,6 @@ impl V8ObjectOp {
 
                 Ok(OpCallRet::ProxiedMulti(vec![prop_names]))
             }
-            V8ObjectOp::RequestDispose => {
-                let main_ctx = inner.deno.main_context();
-                let isolate = inner.deno.v8_isolate();
-                let scope = std::pin::pin!(v8::HandleScope::new(isolate));
-                let mut scope = &mut scope.init();
-                let main_ctx = v8::Local::new(&mut scope, main_ctx);
-                let mut context_scope = &mut v8::ContextScope::new(scope, main_ctx);
-
-                match inner.common_state.proxy_client.obj_registry.remove(&mut context_scope, obj_id) {
-                    Ok(_) => Ok(OpCallRet::ProxiedMulti(vec![])),
-                    Err(e) => Err(format!("Failed to remove V8 object from registry: {}", e).into()),
-                }
-            }
         }
     }
 }
@@ -259,7 +265,7 @@ impl ConcurrentlyExecute for V8IsolateManagerClient {
         data.messenger_tx.client(&client_ctx).send(tx).unwrap();
 
         let mut inner = V8IsolateManagerInner::new(
-            LuaBridgeServiceClient::new(client_ctx.clone(), data.lua_bridge_tx),
+            LuaBridgeServiceClient::new(client_ctx.clone(), data.lua_bridge_tx, data.ed.clone()),
             data.ed,
             FusionModuleLoader::new(data.vfs.into_iter().map(|(x, y)| (x, y.into())))
         );
@@ -365,18 +371,54 @@ impl ConcurrentlyExecute for V8IsolateManagerClient {
                                 }
                             }
                         },
+                        Ok(V8IsolateManagerMessage::DropObject { object_id, resp, magic }) => {
+                            if magic != V8_MESSAGE_MAGIC {
+                                if let Some(resp) = resp {
+                                    let _ = resp.client(&client_ctx).send(Err("Invalid magic number in DropObject message; are you sure you're running a V8 child process?".into()));
+                                }
+                                continue;
+                            }
+
+                            if cfg!(feature = "debug_message_print_enabled") {
+                                println!("Host V8 received request to drop object ID {:?}", object_id);
+                            }
+
+                            if !inner.common_state.ed.object_disposal_enabled {
+                                continue; // Skip disposal if disabled
+                            }
+
+                            let main_ctx = inner.deno.main_context();
+                            let isolate = inner.deno.v8_isolate();
+                            let scope = std::pin::pin!(v8::HandleScope::new(isolate));
+                            let mut scope = &mut scope.init();
+                            let main_ctx = v8::Local::new(&mut scope, main_ctx);
+                            let mut context_scope = &mut v8::ContextScope::new(scope, main_ctx);
+
+                            match inner.common_state.proxy_client.obj_registry.drop(&mut context_scope, object_id) {
+                                Ok(_) => {},
+                                Err(e) => {
+                                    if let Some(resp) = resp {
+                                        let _ = resp.client(&client_ctx).send(Err(format!("Failed to drop V8 object: {}", e).into()));
+                                    }
+                                }
+                            }
+                        }
                         Ok(V8IsolateManagerMessage::Shutdown) => {
-                            println!("V8 isolate manager received shutdown message");
+                            if cfg!(feature = "debug_message_print_enabled") {
+                                println!("V8 isolate manager received shutdown message");
+                            }
                             break;
                         }
                         Err(e) => {
-                            println!("Error receiving message in V8 isolate manager: {}", e);
+                            eprintln!("Error receiving message in V8 isolate manager: {}", e);
                             //break;
                         }
                     }
                 }
                 _ = inner.cancellation_token.cancelled() => {
-                    println!("V8 isolate manager received shutdown message");
+                    if cfg!(feature = "debug_message_print_enabled") {
+                        println!("V8 isolate manager received shutdown message");
+                    }
                     break;
                 }
                 _ = inner.deno.run_event_loop(PollEventLoopOptions {
@@ -458,6 +500,7 @@ pub struct V8IsolateManagerServerInner {
 #[derive(Clone)]
 pub struct V8IsolateManagerServer {
     inner: Rc<V8IsolateManagerServerInner>,
+    ed: EmbedderData,
 }
 
 impl std::ops::Deref for V8IsolateManagerServer {
@@ -495,14 +538,16 @@ impl V8IsolateManagerServer {
         let self_ret = Self { 
             inner: Rc::new(V8IsolateManagerServerInner {
                 executor: Arc::new(executor), 
-                messenger: Arc::new(messenger)
-            })
+                messenger: Arc::new(messenger),
+            }),
+            ed
          };
         let self_ref = self_ret.clone();
         tokio::task::spawn_local(async move {
             let lua_bridge_service = LuaBridgeService::new(
                 self_ref,
                 lua_bridge_rx,
+                ed,
             );
             lua_bridge_service.run(plc).await;
         });
@@ -589,6 +634,13 @@ impl ProxyBridge for V8IsolateManagerServer {
         Ok(())
     }
 
+    fn fire_shutdown(&self) {
+        let _ = self.messenger.server(self.executor.server_context()).send(
+            V8IsolateManagerMessage::Shutdown
+        );
+        let _ = self.executor.shutdown_in_task();
+    }
+
     fn is_shutdown(&self) -> bool {
         self.executor.get_state().cancel_token.is_cancelled()
     }
@@ -640,12 +692,31 @@ impl StandardProxyBridge for V8IsolateManagerServer {
         &self,
         id: Self::ObjectRegistryID,
     ) -> Result<(), Error> {
-        self.send(OpCallMessage {
-            obj_id: id,
-            op: V8ObjectOp::RequestDispose,
-            args: vec![],
+        if !self.ed.object_disposal_enabled {
+            return Ok(());
+        }
+
+        self.send(DropObjectMessage {
+            object_id: id,
         }).await??;
         Ok(())
+    }
+
+    fn fire_request_dispose(
+        &self,
+        id: Self::ObjectRegistryID,
+    ) {
+        if !self.ed.object_disposal_enabled || !self.ed.automatic_object_disposal_enabled {
+            return;
+        }
+
+        let _ = self.messenger.server(self.executor.server_context()).send(
+            V8IsolateManagerMessage::DropObject {
+                object_id: id,
+                resp: None,
+                magic: V8_MESSAGE_MAGIC,
+            }
+        );        
     }
 }
 

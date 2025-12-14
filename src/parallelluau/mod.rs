@@ -127,7 +127,7 @@ pub(super) enum ParallelLuaMessage {
     },
     RequestDispose {
         obj_id: PLuauObjectRegistryID,
-        resp: OneshotSender<Result<(), String>>,
+        resp: Option<OneshotSender<Result<(), String>>>,
         magic: usize,
     },
     Shutdown,
@@ -197,7 +197,7 @@ impl LuauSendableMessage for RequestDisposeMessage {
     fn to_message(self, resp: OneshotSender<Self::Response>) -> ParallelLuaMessage {
         ParallelLuaMessage::RequestDispose {
             obj_id: self.obj_id,
-            resp,
+            resp: Some(resp),
             magic: PLUAU_MESSAGE_MAGIC,
         }
     }
@@ -298,7 +298,7 @@ impl ConcurrentlyExecute for ParallelLuaClient {
         lua.sandbox(true)
         .expect("Failed to sandbox Luau state");
 
-        let lbsc = LuaBridgeServiceClient::new(client_ctx.clone(), data.lua_bridge_tx);
+        let lbsc = LuaBridgeServiceClient::new(client_ctx.clone(), data.lua_bridge_tx, data.ed.clone());
 
         let common_state = CommonState {
             bridge: lbsc,
@@ -452,17 +452,27 @@ impl ConcurrentlyExecute for ParallelLuaClient {
                             );
                         },
                         Ok(ParallelLuaMessage::RequestDispose { obj_id, resp, magic }) => {
-                            if magic != PLUAU_MESSAGE_MAGIC {
-                                let _ = resp.client(&client_ctx).send(Err("Invalid magic number in RequestDispose message; are you sure you're running a parallel luau child process?".into()));
+                            if !common_state.ed.object_disposal_enabled {
                                 continue;
                             }
 
-                            match common_state.proxy_client.obj_registry.remove(obj_id).map_err(|e| e.to_string()) {
+                            if magic != PLUAU_MESSAGE_MAGIC {
+                                if let Some(resp) = resp {
+                                    let _ = resp.client(&client_ctx).send(Err("Invalid magic number in RequestDispose message; are you sure you're running a parallel luau child process?".into()));
+                                }
+                                continue;
+                            }
+
+                            match common_state.proxy_client.obj_registry.drop(obj_id).map_err(|e| e.to_string()) {
                                 Ok(_) => {
-                                    let _ = resp.client(&client_ctx).send(Ok(()));
+                                    if let Some(resp) = resp {
+                                        let _ = resp.client(&client_ctx).send(Ok(()));
+                                    }
                                 },
                                 Err(e) => {
-                                    let _ = resp.client(&client_ctx).send(Err(format!("Failed to dispose object: {}", e)));
+                                    if let Some(resp) = resp {
+                                        let _ = resp.client(&client_ctx).send(Err(format!("Failed to dispose object: {}", e)));
+                                    }
                                 }
                             };
                         },
@@ -488,6 +498,7 @@ pub struct ParallelLuaProxyBridgeInner {
 #[derive(Clone)]
 pub struct ParallelLuaProxyBridge {
     inner: Rc<ParallelLuaProxyBridgeInner>,
+    ed: EmbedderData,
 }
 
 impl ParallelLuaProxyBridge {
@@ -519,13 +530,15 @@ impl ParallelLuaProxyBridge {
             inner: Rc::new(ParallelLuaProxyBridgeInner {
                 executor: Arc::new(executor), 
                 messenger: Arc::new(messenger)
-            })
+            }),
+            ed
          };
         let self_ref = self_ret.clone();
         tokio::task::spawn_local(async move {
             let lua_bridge_service = LuaBridgeService::new(
                 self_ref,
                 lua_bridge_rx,
+                ed
             );
             lua_bridge_service.run(plc).await;
         });
@@ -619,6 +632,13 @@ impl ProxyBridge for ParallelLuaProxyBridge {
         Ok(())
     }
 
+    fn fire_shutdown(&self) {
+        let _ = self.messenger.server(self.executor.server_context()).send(
+            ParallelLuaMessage::Shutdown
+        );
+        let _ = self.executor.shutdown_in_task();
+    }
+
     fn is_shutdown(&self) -> bool {
         self.executor.get_state().cancel_token.is_cancelled()
     }
@@ -662,7 +682,28 @@ impl StandardProxyBridge for ParallelLuaProxyBridge {
         &self,
         id: Self::ObjectRegistryID,
     ) -> Result<(), crate::base::Error> {
+        if !self.ed.object_disposal_enabled {
+            return Ok(());
+        }
+
         Ok(self.send(RequestDisposeMessage { obj_id: id }).await??)
+    }
+
+    fn fire_request_dispose(
+        &self,
+        id: Self::ObjectRegistryID,
+    ) {
+        if !self.ed.object_disposal_enabled || !self.ed.automatic_object_disposal_enabled {
+            return;
+        }
+
+        let _ = self.messenger.server(self.executor.server_context()).send(
+            ParallelLuaMessage::RequestDispose {
+                obj_id: id,
+                resp: None,
+                magic: PLUAU_MESSAGE_MAGIC,
+            }
+        );        
     }
 }
 

@@ -11,6 +11,12 @@ pub struct ForeignRef<T: StandardProxyBridge> {
     pub bridge: T,
 }
 
+impl<T: StandardProxyBridge> Drop for ForeignRef<T> {
+    fn drop(&mut self) {
+        self.bridge.fire_request_dispose(self.id);
+    }
+}
+
 impl<T: StandardProxyBridge> ForeignRef<T> {
     /// Create a new V8Value
     pub fn new(id: T::ObjectRegistryID, plc: ProxyLuaClient, bridge: T, typ: T::ObjectRegistryType) -> Self {

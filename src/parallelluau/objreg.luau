@@ -5,7 +5,7 @@
 local objreg = {
     --- Reverse mapping of object to id for quick lookup
     objToId = {},
-    --- Objects stored as [id] = obj
+    --- Objects stored as [id] = {obj = obj, refcount = refcount}
     idToObj = {},
     --- Current highest ID
     lastid = 0,
@@ -16,6 +16,8 @@ local function add(obj)
     -- Check if object already exists
     local potid = objreg.objToId[obj]
     if potid then
+        local entry = objreg.idToObj[potid]
+        entry.refcount += 1
         return potid
     end
 
@@ -27,19 +29,28 @@ local function add(obj)
     objreg.lastid += 1
     local id = objreg.lastid
     objreg.objToId[obj] = id
-    objreg.idToObj[id] = obj
+    objreg.idToObj[id] = {obj = obj, refcount = 1}
     return id
 end
 
 local function get(id)
-    return objreg.idToObj[id] -- Returns either the obj or nil if not found
-end
-
-local function remove(id)
     local entry = objreg.idToObj[id]
     if entry then
-        objreg.idToObj[id] = nil
-        objreg.objToId[entry] = nil
+        return entry.obj
+    else
+        return nil
+    end
+end
+
+local function drop(id)
+    local entry = objreg.idToObj[id]
+    if entry then
+        entry.refcount -= 1
+        if entry.refcount <= 0 then
+            -- Remove completely
+            objreg.idToObj[id] = nil
+            objreg.objToId[entry.obj] = nil
+        end
     end
 end
 
@@ -47,5 +58,5 @@ return {
     objreg = objreg,
     add = add,
     get = get,
-    remove = remove,
+    drop = drop,
 }

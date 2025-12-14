@@ -21,7 +21,8 @@ urlpattern = { version = "0.3.0", optional = true }
 mluau-require = { git = "https://github.com/mluau/mluau-require", optional = true }
 
 [features]
-default = ["deno", "parallel_luau", "deno_include_snapshot"]
+default = ["deno", "parallel_luau", "deno_include_snapshot", "debug_message_print_enabled"]
 deno = ["dep:deno_core", "dep:deno_error", "dep:thiserror", "dep:base64-simd", "dep:urlpattern"]
 deno_include_snapshot = ["deno"]
 parallel_luau = ["dep:mluau-require"]
+debug_message_print_enabled = []

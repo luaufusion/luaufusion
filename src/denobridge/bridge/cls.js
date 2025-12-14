@@ -11,42 +11,18 @@ function gc() {
     }
 }
 
-/**
- * Calls the function synchronously/not in a new Luau thread
- * 
- * Note: this method is non-blocking in the JS side. The main difference of async over non async is that
- * non-async calls are executed in the main Luau thread, while async calls is executed in a new Luau thread (making
- * non-async potentially faster than async at the expense of blocking yielding).
- * 
- * Currently only supported on functions (tables with __call metamethods are not supported yet).
- * 
- * @param {any} obj The object of the function. Must be a Lua function object [e.g. has the luaid/luatype symbols]
- * @param {boolean} isAsync Whether to call the function asynchronously (in a new Luau thread) or not
- * @param {any} args The arguments to pass
- * @returns {any} The returned data from the function. A single value returned by Luau is automatically
- * converted to a single value internally
- */
-const call = async (obj, isAsync, ...args) => {
+const callAsync = async (obj, ...args) => {
     let boundArgs = new ArgBuffer(...args);
-    if (isAsync) {
-        await obj.callAsync(boundArgs);
-    } else {
-        await obj.callSync(boundArgs);
-    }
-    gc()
+    await obj.callAsync(boundArgs);
     return boundArgs.extract();
 }
 
-/**
- * Index the object with the provided key
- * 
- * This method calls the __index metamethod of the object, if it exists.
- * 
- * Currently only supported on tables and userdata.
- * 
- * @param {any} key The key to index the object with
- * @returns {any} The value at the provided key
- */
+const callSync = async (obj, ...args) => {
+    let boundArgs = new ArgBuffer(...args);
+    await obj.callSync(boundArgs);
+    return boundArgs.extract();
+}
+
 const get = async (obj, key) => {
     let keyPV = new ArgBuffer(key);
     await obj.get(keyPV);
@@ -58,8 +34,9 @@ globalThis.lua = {
     v8objreg,
     addV8Object: v8objreg.add.bind(v8objreg),
     getV8Object: v8objreg.get.bind(v8objreg),
-    removeV8Object: v8objreg.remove.bind(v8objreg),
-    call,
+    dropV8Object: v8objreg.drop.bind(v8objreg),
+    callAsync,
+    callSync,
     get,
     LuaObject,
     ArgBuffer,

@@ -92,9 +92,9 @@ fn main() {
 export async function foo(luafunc) { 
     console.log("foo [func class]: ", luafunc, luafunc.constructor.name);
     console.log("foo, type:", `${luafunc.type}`);
-    console.log("fooCall", `${await globalThis.lua.call(luafunc, false)}`);
+    console.log("fooCall", `${await globalThis.lua.callSync(luafunc)}`);
     console.log("hi");
-    return 123 + (await globalThis.lua.call(luafunc, true));
+    return 123 + (await globalThis.lua.callAsync(luafunc));
 }
 
 export function s(s) {
@@ -175,6 +175,8 @@ export async function tablepropget(obj) {
             EmbedderData {
                 heap_limit: HEAP_LIMIT,
                 max_payload_size: None,
+                object_disposal_enabled: true,
+                automatic_object_disposal_enabled: true,
             },
             ProcessOpts {
                 debug_print: false,
@@ -204,6 +206,8 @@ return {
             EmbedderData {
                 heap_limit: HEAP_LIMIT,
                 max_payload_size: None,
+                object_disposal_enabled: true,
+                automatic_object_disposal_enabled: true,
             },
             ProcessOpts {
                 debug_print: false,

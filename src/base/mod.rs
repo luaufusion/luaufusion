@@ -44,6 +44,9 @@ pub trait ProxyBridge: Clone + 'static {
     /// Shuts down the bridge and its resources
     async fn shutdown(&self, timeouts: ShutdownTimeouts) -> Result<(), Error>;
 
+    /// Fires a shutdown request without waiting for the result
+    fn fire_shutdown(&self);
+
     /// Returns true if the bridge has been shutdown
     fn is_shutdown(&self) -> bool;
 }
@@ -89,6 +92,12 @@ pub trait StandardProxyBridge: ProxyBridge {
         id: Self::ObjectRegistryID,
         args: Vec<Self::ValueType>,
     ) -> Result<Vec<Self::ValueType>, Error>;
+
+    /// Fire a request dispose synchronously without waiting for the result
+    fn fire_request_dispose(
+        &self,
+        id: Self::ObjectRegistryID,
+    );
 
     /// RequestDispose requests disposal of a foreign object by its registry ID
     async fn request_dispose(
