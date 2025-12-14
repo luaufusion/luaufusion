@@ -73,7 +73,25 @@ interface ArgBuffer {
      * @param {any[]} values The values to store in the ArgBuffer object
      * @returns {ArgBuffer} The created ArgBuffer object
      */
-    new (values: any[]): ArgBuffer;
+    new (...values: any[]): ArgBuffer;
+
+    /**
+     * Pushes values into the ArgBuffer, converting them to their Luau counterparts (see the README for luaufusion
+     * for more information on the conversion semantics).
+     * 
+     * @param {...any} values The values to push into the ArgBuffer
+     */
+    push: (...values: any[]) => void;
+
+    /**
+     * Pops a value from the end of the ArgBuffer, converting it to its Luau counterpart (see the README for luaufusion
+     * for more information on the conversion semantics).
+     * 
+     * Returns undefined if there are no values to pop (similar to Array.prototype.pop).
+     * 
+     * @returns {any} The popped value
+     */
+    pop: () => any;
 
     /**
      * Returns the length of the proxied values

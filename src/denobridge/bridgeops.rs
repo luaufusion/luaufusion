@@ -293,6 +293,69 @@ impl ArgBuffer {
         Ok(proxied_values)
     }
 
+    // Pushes a value, or set of values, to the ArgBuffer
+    #[fast]
+    #[method]
+    pub fn push<'a>(
+        &self,
+        scope: &mut v8::PinScope<'a, '_>,
+        op_state: &OpState,
+        #[varargs] fn_args: Option<&v8::FunctionCallbackArguments<'a>>,
+    ) -> Result<(), deno_error::JsErrorBox> {
+        let Some(args) = fn_args else {
+            return Ok(());
+        };
+        let state = op_state.try_borrow::<CommonState>()
+        .ok_or_else(|| deno_error::JsErrorBox::generic("CommonState not found".to_string()))?;
+
+        let mut ed = EmbedderDataContext::new(&state.ed);
+        {
+            let mut borrowed = self.proxied_values.lock();
+            let proxied_values = borrowed.as_mut()
+                .ok_or_else(|| deno_error::JsErrorBox::generic("ArgBuffer already consumed".to_string()))?;
+
+            for i in 0..args.length() {
+                let arg = args.get(i);
+                match ProxiedV8Value::from_v8(scope, arg, &state, &mut ed) {
+                    Ok(v) => {
+                        proxied_values.push(v);
+                    },
+                    Err(e) => {
+                        return Err(deno_error::JsErrorBox::generic(format!("Failed to convert argument {}: {}", i, e)));
+                    }
+                }
+            }
+        } // borrowed lock released here
+
+        Ok(())
+    }
+
+    #[method]
+    // Pops the last value from the ArgBuffer
+    pub fn pop<'a>(
+        &self,
+        scope: &mut v8::PinScope<'a, '_>,
+        op_state: &OpState,
+    ) -> Result<v8::Local<'a, v8::Value>, deno_error::JsErrorBox> {
+        let mut borrowed = self.proxied_values.lock();
+        let proxied_values = borrowed.as_mut()
+            .ok_or_else(|| deno_error::JsErrorBox::generic("ArgBuffer already consumed".to_string()))?;
+
+        match proxied_values.pop() {
+            Some(v) => {
+                let state = op_state.try_borrow::<CommonState>()
+                    .ok_or_else(|| deno_error::JsErrorBox::generic("CommonState not found".to_string()))?;
+
+                let ed = &mut EmbedderDataContext::new(&state.ed);
+                Ok(
+                    v.to_v8(scope, state, ed)
+                    .map_err(|e| deno_error::JsErrorBox::generic(format!("Failed to convert popped value: {}", e)))?
+                )
+            },
+            None => Ok(v8::undefined(scope).into()),
+        }
+    }
+
     #[fast]
     #[method]
     // Returns the length of the proxied values

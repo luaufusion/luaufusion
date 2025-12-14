@@ -72,6 +72,7 @@ Note: unless explicitly stated, all type conversions are lossless and bidirectio
 
 1. StaticLists (arrays) are snapshots of the data at the time of passing. If you modify the StaticList on either side, it will not be reflected on the other side. For example, if you send the array `[1,2,3]` from JS to Luau, then modify the array in JS to `[1,2,3,4]`, the Luau side will still see `{1,2,3}`.
 2. StaticMaps (maps) are also snapshots of the data at the time of passing. If you modify the StaticMap on either side, it will not be reflected on the other side. For example, if you send a map containing a=1, b=2 from JS to Luau, then modify the map in JS to a=1, b=2, c=3, the Luau side will still see `{a=1, b=2}`.
+3. Luaufusion does not guarantee that arguments passed through between Luau and JS will disposed. Use ``requestDispose`` API to manually dispose of objects if necessary.
 
 If you want a mutable array or map, you will want to wrap the object in an object to make it a object reference. As an example:
 
