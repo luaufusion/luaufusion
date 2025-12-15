@@ -94,6 +94,7 @@ export async function foo(luafunc) {
     console.log("foo, type:", `${luafunc.type}`);
     console.log("fooCall", `${await globalThis.lua.callSync(luafunc)}`);
     console.log("hi");
+    console.log(await luafunc.testApi([123, 456]))
     return 123 + (await globalThis.lua.callAsync(luafunc));
 }
 

@@ -68,24 +68,41 @@ impl ObjectRegistryType {
     }
 }
 
-#[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub enum LuauObjectOp {
-    FunctionCallSync = 1,
-    FunctionCallAsync = 2,
-    Index = 3,
+/// Messages sent to the Lua proxy bridge
+#[derive(Serialize, Deserialize)]
+pub enum LuaBridgeMessage<T: ProxyBridge> {
+    FunctionCall {
+        obj_id: LuauObjectRegistryID,
+        is_async: bool,
+        args: Vec<T::ValueType>,
+        resp: OneshotSender<Result<Vec<T::ValueType>, String>>,
+    },
+    Index {
+        obj_id: LuauObjectRegistryID,
+        key: T::ValueType,
+        resp: OneshotSender<Result<T::ValueType, String>>,
+    },
+    RequestDispose {
+        ids: Vec<LuauObjectRegistryID>,
+        resp: Option<OneshotSender<Result<(), String>>>,
+    },
+    Shutdown,
 }
 
-enum ValueOrMultiValue {
-    Value(mluau::Value),
-    MultiValue(mluau::MultiValue),
+/// Proxy bridge service to expose data from Luau and another language's proxy bridge
+pub struct LuaBridgeService<T: ProxyBridge> {
+    bridge: T,
+    rx: MultiReceiver<LuaBridgeMessage<T>>,
+    ed: EmbedderData,
 }
 
-impl LuauObjectOp {
-    fn create_value_from_args<T: ProxyBridge>(lua: &mluau::Lua, arg: T::ValueType, bridge: &T, plc: &ProxyLuaClient) -> Result<mluau::Value, String> {
-        bridge.to_source_lua_value(lua, arg, &plc)
-            .map_err(|e| format!("Failed to convert argument to Lua value: {}", e))
+impl<T: ProxyBridge + ProxyBridgeWithMultiprocessExt> LuaBridgeService<T> {
+    pub fn new(bridge: T, rx: MultiReceiver<LuaBridgeMessage<T>>, ed: EmbedderData) -> Self {
+        Self { bridge, rx, ed }
     }
-    fn create_multivalue_from_args<T: ProxyBridge>(lua: &mluau::Lua, args: Vec<T::ValueType>, bridge: &T, plc: &ProxyLuaClient) -> Result<mluau::MultiValue, String> {
+
+    // Helpers to create MultiValue from args
+    fn create_multivalue_from_args(lua: &mluau::Lua, args: Vec<T::ValueType>, bridge: &T, plc: &ProxyLuaClient) -> Result<mluau::MultiValue, String> {
         let mut mv = mluau::MultiValue::with_capacity(args.len());
         let mut err = None;
         for arg in args {
@@ -107,94 +124,26 @@ impl LuauObjectOp {
         Ok(mv)
     }
 
-    async fn run<T: ProxyBridge>(self, lua: &mluau::Lua, obj_id: LuauObjectRegistryID, args: Vec<T::ValueType>, bridge: T, plc: &ProxyLuaClient) -> Result<ValueOrMultiValue, Error> {
-        match self {
-            Self::FunctionCallSync => {
-                let obj = plc.obj_registry.get(obj_id)
-                    .map_err(|e| format!("Failed to get object from registry: {}", e))?;
-                let args = Self::create_multivalue_from_args(lua, args, &bridge, &plc)?;
-                let func = match obj {
-                    mluau::Value::Function(f) => f,
-                    _ => return Err("Object is not a function".into()),
-                };
-                func.call(args)
-                .map_err(|e| format!("Failed to call function: {}", e).into())
-                .map(ValueOrMultiValue::MultiValue)
-            }
-            Self::FunctionCallAsync => {
-                let obj = plc.obj_registry.get(obj_id)
-                    .map_err(|e| format!("Failed to get object from registry: {}", e))?;
-                let args = Self::create_multivalue_from_args(lua, args, &bridge, &plc)?;
-                let func = match obj {
-                    mluau::Value::Function(f) => f,
-                    _ => return Err("Object is not a function".into()),
-                };
-
-                let th = match lua.create_thread(func) {
-                    Ok(t) => t,
-                    Err(e) => return Err(format!("Failed to create Lua thread: {}", e).into()),
-                };
-
-                let taskmgr = mlua_scheduler::taskmgr::get(&lua);
-                
-                let Some(res) = taskmgr.spawn_thread_and_wait(th, args).await
-                    .map_err(|e| format!("Failed to call async function: {}", e))? else {
-                    return Err("Async function did not return due to an unknown error".into());
-                    };
-                
-                Ok(ValueOrMultiValue::MultiValue(res.map_err(|e| e.to_string())?))
-                
-            }
-            Self::Index => {
-                if args.len() != 1 {
-                    return Err("Index operation requires exactly one argument".into());
+    fn create_args_from_multivalue(lua: &mluau::Lua, mv: mluau::MultiValue, bridge: &T, plc: &ProxyLuaClient) -> Result<Vec<T::ValueType>, String> {
+        let mut args = Vec::with_capacity(mv.len());
+        let mut err = None;
+        for v in mv {
+            match bridge.from_source_lua_value(lua, &plc, v, &mut EmbedderDataContext::new(plc.ed)) {
+                Ok(pv) => {
+                    args.push(pv);
+                },
+                Err(e) => {
+                    err = Some(e);
+                    break;
                 }
-                let arg = args.into_iter().next().ok_or("Failed to get argument for index operation".to_string())?;
-                let key = Self::create_value_from_args(lua, arg, &bridge, &plc)?;
-
-                let obj = plc.obj_registry.get(obj_id)
-                    .map_err(|e| format!("Failed to get object from registry: {}", e))?;
-                let v = match obj {
-                    mluau::Value::Table(t) => {
-                        t.get::<mluau::Value>(key).map_err(|e| format!("Failed to index table: {}", e))
-                    }
-                    mluau::Value::UserData(u) => {
-                        u.get::<mluau::Value>(key).map_err(|e| format!("Failed to index userdata: {}", e))
-                    }
-                    _ => Err("Object is not indexable (not a table or userdata)".into()),
-                }?;
-                Ok(ValueOrMultiValue::Value(v))
             }
         }
-    }
-}
 
-/// Messages sent to the Lua proxy bridge
-#[derive(Serialize, Deserialize)]
-pub enum LuaBridgeMessage<T: ProxyBridge> {
-    OpCall {
-        obj_id: LuauObjectRegistryID,
-        op: LuauObjectOp,
-        args: Vec<T::ValueType>,
-        resp: OneshotSender<Result<Vec<T::ValueType>, String>>,
-    },
-    RequestDispose {
-        ids: Vec<LuauObjectRegistryID>,
-        resp: Option<OneshotSender<Result<(), String>>>,
-    },
-    Shutdown,
-}
+        if let Some(e) = err {
+            return Err(format!("Failed to convert argument to foreign language value: {}", e));
+        }
 
-/// Proxy bridge service to expose data from Luau and another language's proxy bridge
-pub struct LuaBridgeService<T: ProxyBridge> {
-    bridge: T,
-    rx: MultiReceiver<LuaBridgeMessage<T>>,
-    ed: EmbedderData,
-}
-
-impl<T: ProxyBridge + ProxyBridgeWithMultiprocessExt> LuaBridgeService<T> {
-    pub fn new(bridge: T, rx: MultiReceiver<LuaBridgeMessage<T>>, ed: EmbedderData) -> Self {
-        Self { bridge, rx, ed }
+        Ok(args)
     }
 
     /// Creates a new Lua proxy bridge
@@ -207,18 +156,118 @@ impl<T: ProxyBridge + ProxyBridgeWithMultiprocessExt> LuaBridgeService<T> {
             tokio::select! {
                 Ok(msg) = self.rx.recv() => {
                     match msg {
-                        LuaBridgeMessage::OpCall { obj_id, op, args, resp } => {
+                        LuaBridgeMessage::FunctionCall { obj_id, is_async, args, resp } => {
                             let Some(lua) = plc.weak_lua.try_upgrade() else {
                                 let _ = resp.server(server_ctx).send(Err("Lua state has been dropped".into()));
                                 continue;
                             };
 
-                            let bridge = self.bridge.clone();
-                            let plc = plc.clone();
+                            let obj = match plc.obj_registry.get(obj_id) {
+                                Ok(o) => o,
+                                Err(e) => {
+                                    let _ = resp.server(server_ctx).send(Err(format!("Failed to get object from registry: {}", e)));
+                                    continue;
+                                }
+                            };
+
+                            let func = match obj {
+                                mluau::Value::Function(f) => f,
+                                _ => {
+                                    let _ = resp.server(server_ctx).send(Err("Object is not a function".into()));
+                                    continue;
+                                },
+                            };
+
+                            let args = match Self::create_multivalue_from_args(&lua, args, &self.bridge, &plc) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    let _ = resp.server(server_ctx).send(Err(format!("Failed to convert argument to Lua value: {}", e)));
+                                    continue;
+                                }
+                            };
+
+                            // Non-async call
+                            if !is_async {
+                                match func.call::<mluau::MultiValue>(args) {
+                                    Ok(ret) => {
+                                        match Self::create_args_from_multivalue(&lua, ret, &self.bridge, &plc) {
+                                            Ok(ret_vals) => {
+                                                let _ = resp.server(server_ctx).send(Ok(ret_vals));
+                                            }
+                                            Err(e) => {
+                                                let _ = resp.server(server_ctx).send(Err(format!("Failed to convert return value to foreign language value: {}", e).into()));
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        let _ = resp.server(server_ctx).send(Err(format!("Failed to call function: {}", e).into()));
+                                    }
+                                }
+
+                                continue;
+                            }
+
+                            // Async calls get pushed to the op_call_queue
+                            let th = match lua.create_thread(func) {
+                                Ok(t) => t,
+                                Err(e) => {
+                                    let _ = resp.server(server_ctx).send(Err(format!("Failed to create Lua thread: {}", e).into()));
+                                    continue;
+                                }
+                            };
+
                             op_call_queue.push(async move {
-                                (op.run(&lua, obj_id, args, bridge, &plc).await, resp)
+                                let taskmgr = mlua_scheduler::taskmgr::get(&lua);
+                                (taskmgr.spawn_thread_and_wait(th, args).await, resp)
                             });
                         }
+                        LuaBridgeMessage::Index { obj_id, key, resp } => {
+                            let obj = match plc.obj_registry.get(obj_id) {
+                                Ok(o) => o,
+                                Err(e) => {
+                                    let _ = resp.server(server_ctx).send(Err(format!("Failed to get object from registry: {}", e)));
+                                    continue;
+                                }
+                            };
+
+                            let Some(lua) = plc.weak_lua.try_upgrade() else {
+                                let _ = resp.server(server_ctx).send(Err("Lua state has been dropped".into()));
+                                continue;
+                            };
+
+                            let key = match self.bridge.to_source_lua_value(&lua, key, &plc) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    let _ = resp.server(server_ctx).send(Err(format!("Failed to convert argument to Lua value: {}", e)));
+                                    continue;
+                                }
+                            };
+
+                            let v = match obj {
+                                mluau::Value::Table(t) => {
+                                    t.get::<mluau::Value>(key).map_err(|e| format!("Failed to index table: {}", e))
+                                }
+                                mluau::Value::UserData(u) => {
+                                    u.get::<mluau::Value>(key).map_err(|e| format!("Failed to index userdata: {}", e))
+                                }
+                                _ => Err("Object is not indexable (not a table or userdata)".into()),
+                            };
+
+                            let Ok(v) = v else {
+                                let _ = resp.server(server_ctx).send(Err(format!("Failed to get property: {}", v.err().unwrap())));
+                                continue;
+                            };
+                            
+                            let mut ed = EmbedderDataContext::new(plc.ed);
+                            match self.bridge.from_source_lua_value(&lua, &plc, v, &mut ed) {
+                                Ok(pv) => {
+                                    let _ = resp.server(server_ctx).send(Ok(pv));
+                                }
+                                Err(e) => {
+                                    let _ = resp.server(server_ctx).send(Err(format!("Failed to convert return value to foreign language value: {}", e).into()));
+                                }
+                            }
+                        },
                         LuaBridgeMessage::RequestDispose { ids, resp } => {
                             if !self.ed.object_disposal_enabled {
                                 continue;
@@ -261,53 +310,41 @@ impl<T: ProxyBridge + ProxyBridgeWithMultiprocessExt> LuaBridgeService<T> {
                     }
                     break; // Executor is shutting down
                 }
-                Some((result, resp)) = op_call_queue.next() => {                    
-                    match result {
+                Some((result, resp)) = op_call_queue.next() => {  
+                    let result = match result {
+                        Ok(v) => v,
+                        Err(e) => {
+                            let _ = resp.server(server_ctx).send(Err(format!("Failed to call async function: {}", e).into()));
+                            continue;
+                        }
+                    };
+
+                    let ret_v = match result {
+                        Some(ret) => ret,
+                        None => {
+                            let _ = resp.server(server_ctx).send(Err("Async function did not return due to an unknown error".into()));
+                            continue;
+                        }
+                    };
+
+                    match ret_v {
                         Ok(ret) => {
                             let Some(lua) = plc.weak_lua.try_upgrade() else {
                                 let _ = resp.server(server_ctx).send(Err("Lua state has been dropped".into()));
                                 continue;
                             };
 
-                            match ret {
-                                ValueOrMultiValue::Value(v) => {
-                                    let mut ed = EmbedderDataContext::new(plc.ed);
-                                    match self.bridge.from_source_lua_value(&lua, &plc, v, &mut ed) {
-                                        Ok(pv) => {
-                                            let _ = resp.server(server_ctx).send(Ok(vec![pv]));
-                                        }
-                                        Err(e) => {
-                                            let _ = resp.server(server_ctx).send(Err(format!("Failed to convert return value to foreign language value: {}", e).into()));
-                                        }
-                                    }
+                            match Self::create_args_from_multivalue(&lua, ret, &self.bridge, &plc) {
+                                Ok(ret_vals) => {
+                                    let _ = resp.server(server_ctx).send(Ok(ret_vals));
                                 }
-                                ValueOrMultiValue::MultiValue(v) => {
-                                    let mut args = Vec::with_capacity(v.len());
-                                    let mut err = None;
-                                    let mut ed = EmbedderDataContext::new(plc.ed);
-                                    for v in v {
-                                        match self.bridge.from_source_lua_value(&lua, &plc, v, &mut ed) {
-                                            Ok(pv) => {
-                                                args.push(pv);
-                                            }
-                                            Err(e) => {
-                                                err = Some(e);
-                                                break;
-                                            }
-                                        }
-                                    }
-
-                                    if let Some(e) = err {
-                                        let _ = resp.server(server_ctx).send(Err(format!("Failed to convert return value to foreign language value: {}", e).into()));
-                                        continue;
-                                    }
-
-                                    let _ = resp.server(server_ctx).send(Ok(args));
+                                Err(e) => {
+                                    let _ = resp.server(server_ctx).send(Err(format!("Failed to convert return value to foreign language value: {}", e).into()));
                                 }
                             }
                         }
                         Err(e) => {
-                            let _ = resp.server(server_ctx).send(Err(format!("Lua opcall failed: {}", e).into()));
+                            let _ = resp.server(server_ctx).send(Err(format!("Lua async function error: {}", e).into()));
                         }
                     }
                 }
@@ -336,16 +373,28 @@ impl<T: ProxyBridge> LuaBridgeServiceClient<T> {
     }
 
     /// Calls a Lua function by its ID with the given arguments, returning the results
-    pub async fn opcall(&self, obj_id: LuauObjectRegistryID, op: LuauObjectOp, args: Vec<T::ValueType>) -> Result<Vec<T::ValueType>, String> {
+    pub async fn call_function(&self, obj_id: LuauObjectRegistryID, is_async: bool, args: Vec<T::ValueType>) -> Result<Vec<T::ValueType>, String> {
         let (resp_tx, resp_rx) = self.client_context.oneshot();
-        let msg = LuaBridgeMessage::OpCall {
+        let msg = LuaBridgeMessage::FunctionCall {
             obj_id,
-            op,
+            is_async,
             args,
             resp: resp_tx,
         };
         self.tx.client(&self.client_context).send(msg).map_err(|e| format!("Failed to send opcall message: {}", e))?;
         resp_rx.recv().await.map_err(|e| format!("Failed to receive opcall response: {}", e))?
+    }
+
+    /// Indexes a Lua object by its ID with the given key, returning the result
+    pub async fn index(&self, obj_id: LuauObjectRegistryID, key: T::ValueType) -> Result<T::ValueType, String> {
+        let (resp_tx, resp_rx) = self.client_context.oneshot();
+        let msg = LuaBridgeMessage::Index {
+            obj_id,
+            key,
+            resp: resp_tx,
+        };
+        self.tx.client(&self.client_context).send(msg).map_err(|e| format!("Failed to send index message: {}", e))?;
+        resp_rx.recv().await.map_err(|e| format!("Failed to receive index response: {}", e))?
     }
 
     /// Requests disposal of a Lua object by its ID

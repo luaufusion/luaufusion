@@ -13,7 +13,7 @@ use crate::luau::bridge::{
     ObjectRegistryType, ProxyLuaClient
 };
 use super::inner::CommonState;
-use deno_core::v8;
+use deno_core::{FromV8, ToV8, v8};
 
 /// A V8 value that can now be easily proxied to Luau
 #[derive(Serialize, Deserialize)]
@@ -31,9 +31,46 @@ pub enum ProxiedV8Value {
     SourceOwnedObject((ObjectRegistryType, LuauObjectRegistryID)), // (Type, ID) of the source-owned object
 }
 
+// All ProxiedV8Values can be converted to/from V8 values
+impl<'a> FromV8<'a> for ProxiedV8Value {
+    type Error = deno_error::JsErrorBox;
+    fn from_v8<'i>(
+        scope: &mut v8::PinScope<'a, 'i>,
+        value: v8::Local<'a, v8::Value>,
+      ) -> Result<Self, Self::Error> {
+        let op_state_ref = deno_core::JsRuntime::op_state_from(scope);
+        let op_state = op_state_ref.try_borrow()
+            .map_err(|e| deno_error::JsErrorBox::generic(format!("Failed to borrow op state: {}", e)))?;
+        let common_state = op_state.try_borrow::<CommonState>()
+        .ok_or_else(|| deno_error::JsErrorBox::generic("CommonState not found".to_string()))?;
+
+        let mut ed = EmbedderDataContext::new(common_state.ed);
+        ProxiedV8Value::from_v8(scope, value, common_state, &mut ed)
+            .map_err(|e| deno_error::JsErrorBox::generic(format!("Failed to convert V8 value to ProxiedV8Value: {}", e)))
+    }
+}
+
+impl<'a> ToV8<'a> for ProxiedV8Value {
+    type Error = deno_error::JsErrorBox;
+    fn to_v8<'i>(
+        self,
+        scope: &mut v8::PinScope<'a, 'i>,
+    ) -> Result<v8::Local<'a, v8::Value>, Self::Error> {
+        let op_state_ref = deno_core::JsRuntime::op_state_from(scope);
+        let op_state = op_state_ref.try_borrow()
+            .map_err(|e| deno_error::JsErrorBox::generic(format!("Failed to borrow op state: {}", e)))?;
+        let common_state = op_state.try_borrow::<CommonState>()
+        .ok_or_else(|| deno_error::JsErrorBox::generic("CommonState not found".to_string()))?;
+
+        let mut ed = EmbedderDataContext::new(common_state.ed);
+        self.to_v8(scope, common_state, &mut ed)
+            .map_err(|e| deno_error::JsErrorBox::generic(format!("Failed to convert ProxiedV8Value to V8 value: {}", e)))
+    }
+}
+
 impl ProxiedV8Value {
-    /// Returns the list of owned object ids contained within this ProxiedV8Value
-    pub(crate) fn get_owned_object_ids(&self) -> (Vec<V8ObjectRegistryID>, Vec<LuauObjectRegistryID>) {
+    /// Returns the list of owned object ids (refs) contained within this ProxiedV8Value
+    pub(crate) fn get_refs(&self) -> (Vec<V8ObjectRegistryID>, Vec<LuauObjectRegistryID>) {
         match self {
             ProxiedV8Value::Primitive(_) => (Vec::with_capacity(0), Vec::with_capacity(0)),
             ProxiedV8Value::Psuedoprimitive(p) => {
@@ -42,7 +79,7 @@ impl ProxiedV8Value {
                         let mut v8_ids = Vec::new();
                         let mut luau_ids = Vec::new();
                         for item in v {
-                            let (v8s, luaus) = item.get_owned_object_ids();
+                            let (v8s, luaus) = item.get_refs();
                             v8_ids.extend(v8s);
                             luau_ids.extend(luaus);
                         }
@@ -52,8 +89,8 @@ impl ProxiedV8Value {
                         let mut v8_ids = Vec::new();
                         let mut luau_ids = Vec::new();
                         for (key, value) in v {
-                            let (v8s_key, luau_ids_key) = key.get_owned_object_ids();
-                            let (v8s_value, luau_ids_value) = value.get_owned_object_ids();
+                            let (v8s_key, luau_ids_key) = key.get_refs();
+                            let (v8s_value, luau_ids_value) = value.get_refs();
                             v8_ids.extend(v8s_key);
                             v8_ids.extend(v8s_value);
                             luau_ids.extend(luau_ids_key);
@@ -223,7 +260,7 @@ impl ProxiedV8Value {
                 Ok(obj.into())
             }
             Self::SourceOwnedObject((typ, id)) => {
-                let lua_obj = LuaObject::new(typ, id, common_state.bridge.clone());
+                let lua_obj = LuaObject::new(typ, id, common_state.bridge.clone(), common_state.v8_internal_tx.clone());
                 Ok(lua_obj.to_v8(scope))
             },
         }

@@ -1,4 +1,4 @@
-use crate::{luau::{LuauObjectRegistryID, bridge::{LuaBridgeServiceClient, LuauObjectOp, ObjectRegistryType}, embedder_api::EmbedderDataContext}, parallelluau::{ParallelLuaProxyBridge, ProxyPLuaClient, value::ProxiedLuauValue}};
+use crate::{luau::{LuauObjectRegistryID, bridge::{LuaBridgeServiceClient, ObjectRegistryType}, embedder_api::EmbedderDataContext}, parallelluau::{ParallelLuaProxyBridge, ProxyPLuaClient, value::ProxiedLuauValue}};
 use mlua_scheduler::LuaSchedulerAsyncUserData;
 use mluau::prelude::*;
 
@@ -54,9 +54,36 @@ impl LuaUserData for ForeignLuauValue {
                 .map_err(|e| mluau::Error::external(format!("Failed to proxy argument to ProxiedLuauValue: {}", e)))?;
                 p_args.push(p_arg);
             }
-            let ret = this.bridge.opcall(
+            let ret = this.bridge.call_function(
                 this.id,
-                LuauObjectOp::FunctionCallAsync,
+                true,
+                p_args
+            )
+            .await
+            .map_err(|e| mluau::Error::external(format!("Bridge call failed: {}", e)))?;
+
+            let mut proxied = mluau::MultiValue::with_capacity(ret.len());
+            let mut ed = EmbedderDataContext::new(this.plc.ed);
+            for v in ret {
+                let v = v.to_luau_child(&lua, &this.plc, &this.bridge, &mut ed)
+                .map_err(|e| mluau::Error::external(format!("Failed to convert return value to Lua: {}", e)))?;
+                proxied.push_back(v);
+            }
+
+            Ok(proxied)
+        }); 
+
+        methods.add_scheduler_async_method("callsync", async move |lua, this, args: mluau::MultiValue| {
+            let mut p_args = Vec::with_capacity(args.len());
+            let mut ed = EmbedderDataContext::new(this.plc.ed);
+            for arg in args {
+                let p_arg = ProxiedLuauValue::from_luau_child(&this.plc, arg, &mut ed)
+                .map_err(|e| mluau::Error::external(format!("Failed to proxy argument to ProxiedLuauValue: {}", e)))?;
+                p_args.push(p_arg);
+            }
+            let ret = this.bridge.call_function(
+                this.id,
+                false,
                 p_args
             )
             .await
