@@ -4,7 +4,7 @@
 */
 export class V8ObjectRegistry {
     // Reverse mapping of object to id for quick lookup
-    #objToId = new Map();
+    #objToId = new WeakMap();
     // Objects stored as [id] = {obj: obj, refcount: n}
     #idToObj = new Map();
     #lastid = 1;
@@ -14,7 +14,7 @@ export class V8ObjectRegistry {
     // Increments refcount if already present
     add(obj) {
         let potid = this.#objToId.get(obj);
-        if(this.#objToId.has(obj)) {
+        if(potid !== undefined) {
             // Increment refcount
             let entry = this.#idToObj.get(potid);
             entry.refcount++;

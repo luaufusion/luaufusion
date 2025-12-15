@@ -1,6 +1,6 @@
 pub const OBJ_REGISTRY_LUAU : &'static str = include_str!("objreg.luau");
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 /// An ID for an object in the object registry
 pub struct LuauObjectRegistryID {
     objid: i64, // Unique ID representing the object

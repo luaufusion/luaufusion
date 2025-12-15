@@ -65,7 +65,7 @@ impl ProxiedV8Value {
                 }
             },
             ProxiedV8Value::V8OwnedObject((_, id)) => (vec![*id], Vec::with_capacity(0)),
-            ProxiedV8Value::SourceOwnedObject((_, id)) => (Vec::with_capacity(0), vec![id.clone()]),
+            ProxiedV8Value::SourceOwnedObject((_, id)) => (Vec::with_capacity(0), vec![*id]),
         }
     }
 

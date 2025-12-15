@@ -25,14 +25,14 @@ pub struct EmbedderDataContext {
 }
 
 impl EmbedderDataContext {
-    pub fn new(ed: &EmbedderData) -> Self {
-        Self { ed: ed.clone(), size: 0, limit: true, depth: 0 }
+    pub fn new(ed: EmbedderData) -> Self {
+        Self { ed, size: 0, limit: true, depth: 0 }
     }
 
     // Used when a LangTransferValue is sent to disable limits during processing it
     pub fn disable_limits(&self) -> Self {
         Self {
-            ed: self.ed.clone(),
+            ed: self.ed,
             size: self.size,
             limit: false,
             depth: self.depth,
@@ -41,7 +41,7 @@ impl EmbedderDataContext {
 
     pub fn nest_in_depth(&self) -> Self {
         Self {
-            ed: self.ed.clone(),
+            ed: self.ed,
             size: self.size,
             limit: self.limit,
             depth: self.depth,
@@ -53,7 +53,7 @@ impl EmbedderDataContext {
             return Err("Maximum nesting depth exceeded".into());
         }
         Ok(Self {
-            ed: self.ed.clone(),
+            ed: self.ed,
             size: self.size,
             limit: self.limit,
             depth: self.depth + 1,

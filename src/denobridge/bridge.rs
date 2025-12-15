@@ -55,10 +55,10 @@ impl V8ObjectRegistryType {
     }  
 }
 
-#[derive(Clone)]
 /// The client side state for proxying Lua values
 /// 
 /// This struct is not thread safe and must be kept on the Lua side
+#[derive(Clone)]
 pub struct ProxyV8Client {
     pub obj_registry: V8ObjectRegistry
 }
@@ -185,7 +185,7 @@ impl V8ObjectOp {
                 };
 
                 let mut v8_args = Vec::with_capacity(args.len());
-                let mut ed = EmbedderDataContext::new(&inner.common_state.ed);
+                let mut ed = EmbedderDataContext::new(inner.common_state.ed);
                 for arg in args {
                     let v8_arg = match arg.to_v8(&mut context_scope, &inner.common_state, &mut ed) {
                         Ok(v) => v,
@@ -211,7 +211,7 @@ impl V8ObjectOp {
                     ProxiedV8Value::Primitive(p) => p,
                     _ => return Err("ObjectGetProperty key must be a primitive".into()),
                 };
-                let mut ed_a = EmbedderDataContext::new(&inner.common_state.ed);
+                let mut ed_a = EmbedderDataContext::new(inner.common_state.ed);
                 let key = match key.to_v8(&mut context_scope, &mut ed_a) {
                     Ok(v) => v,
                     Err(e) => return Err(format!("Failed to convert key to V8: {}", e).into()),
@@ -234,7 +234,7 @@ impl V8ObjectOp {
                 let prop_names = obj.get(&mut context_scope, key)
                     .ok_or("Failed to get property names")?;
                 
-                let mut ed_b = EmbedderDataContext::new(&inner.common_state.ed);
+                let mut ed_b = EmbedderDataContext::new(inner.common_state.ed);
 
                 let prop_names = ProxiedV8Value::from_v8(&mut context_scope, prop_names.into(), &inner.common_state, &mut ed_b)
                     .map_err(|e| format!("Failed to proxy property names: {}", e))?;
@@ -274,7 +274,7 @@ impl ConcurrentlyExecute for V8IsolateManagerClient {
         let (v8_internal_tx, mut v8_internal_rx) = unbounded_channel::<V8InternalMessage>();
 
         let mut inner = V8IsolateManagerInner::new(
-            LuaBridgeServiceClient::new(client_ctx.clone(), data.lua_bridge_tx, data.ed.clone()),
+            LuaBridgeServiceClient::new(client_ctx.clone(), data.lua_bridge_tx, data.ed),
             data.ed,
             FusionModuleLoader::new(data.vfs.into_iter().map(|(x, y)| (x, y.into()))),
             v8_internal_tx
@@ -312,7 +312,7 @@ impl ConcurrentlyExecute for V8IsolateManagerClient {
                                     let main_ctx = v8::Local::new(&mut scope, main_ctx);
                                     let context_scope = &mut v8::ContextScope::new(scope, main_ctx);
                                     let namespace_obj = v8::Local::new(context_scope, namespace_obj);
-                                    let mut ed = EmbedderDataContext::new(&inner.common_state.ed);
+                                    let mut ed = EmbedderDataContext::new(inner.common_state.ed);
                                     match ProxiedV8Value::from_v8(context_scope, namespace_obj.into(), &inner.common_state, &mut ed) {
                                         Ok(v) => v,
                                         Err(e) => {
@@ -491,7 +491,7 @@ impl ConcurrentlyExecute for V8IsolateManagerClient {
                             let main_ctx = v8::Local::new(&mut scope, main_ctx);
                             let mut context_scope = &mut v8::ContextScope::new(scope, main_ctx);
                             let res = v8::Local::new(&mut context_scope, res);
-                            let mut ed = EmbedderDataContext::new(&inner.common_state.ed);
+                            let mut ed = EmbedderDataContext::new(inner.common_state.ed);
                             let res = ProxiedV8Value::from_v8(context_scope, res, &inner.common_state, &mut ed);
                             match res {
                                 Ok(v) => {
@@ -529,7 +529,7 @@ impl ConcurrentlyExecute for V8IsolateManagerClient {
                         let main_ctx = v8::Local::new(&mut scope, main_ctx);
                         let context_scope = &mut v8::ContextScope::new(scope, main_ctx);
                         let namespace_obj = v8::Local::new(context_scope, namespace_obj);
-                        let mut ed = EmbedderDataContext::new(&inner.common_state.ed);
+                        let mut ed = EmbedderDataContext::new(inner.common_state.ed);
                         match ProxiedV8Value::from_v8(context_scope, namespace_obj.into(), &inner.common_state, &mut ed) {
                             Ok(v) => v,
                             Err(e) => {
@@ -662,7 +662,7 @@ impl ProxyBridge for V8IsolateManagerServer {
     }
 
     fn to_source_lua_value(&self, lua: &mluau::Lua, value: Self::ValueType, plc: &ProxyLuaClient) -> Result<mluau::Value, Error> {
-        let mut ed = EmbedderDataContext::new(&plc.ed);
+        let mut ed = EmbedderDataContext::new(plc.ed);
         Ok(value.to_luau(lua, plc, self, &mut ed).map_err(|e| e.to_string())?)
     }
 
@@ -702,8 +702,8 @@ impl ProxyBridge for V8IsolateManagerServer {
 
 impl ProxyBridgeWithMultiprocessExt for V8IsolateManagerServer {
     /// Returns the executor for concurrently executing tasks on a separate process
-    fn get_executor(&self) -> Arc<ConcurrentExecutor<Self::ConcurrentlyExecuteClient>> {
-        self.executor.clone()
+    fn get_executor(&self) -> &ConcurrentExecutor<Self::ConcurrentlyExecuteClient> {
+        self.executor.as_ref()
     }
 }
 

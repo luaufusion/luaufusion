@@ -13,7 +13,7 @@ pub struct ForeignLuauValue {
 
 impl Drop for ForeignLuauValue {
     fn drop(&mut self) {
-        self.bridge.fire_request_disposes(vec![self.id.clone()]);
+        self.bridge.fire_request_disposes(vec![self.id]);
     }
 }
 
@@ -38,7 +38,7 @@ impl LuaUserData for ForeignLuauValue {
 
         methods.add_scheduler_async_method("requestdispose", async move |_lua, this, ()| {
             this.bridge.request_dispose(
-                this.id.clone(),
+                this.id,
             )
             .await
             .map_err(|e| mluau::Error::external(format!("Bridge call failed: {}", e)))?;
@@ -48,14 +48,14 @@ impl LuaUserData for ForeignLuauValue {
 
         methods.add_scheduler_async_method("callasync", async move |lua, this, args: mluau::MultiValue| {
             let mut p_args = Vec::with_capacity(args.len());
-            let mut ed = EmbedderDataContext::new(&this.plc.ed);
+            let mut ed = EmbedderDataContext::new(this.plc.ed);
             for arg in args {
                 let p_arg = ProxiedLuauValue::from_luau_child(&this.plc, arg, &mut ed)
                 .map_err(|e| mluau::Error::external(format!("Failed to proxy argument to ProxiedLuauValue: {}", e)))?;
                 p_args.push(p_arg);
             }
             let ret = this.bridge.opcall(
-                this.id.clone(),
+                this.id,
                 LuauObjectOp::FunctionCallAsync,
                 p_args
             )
@@ -63,7 +63,7 @@ impl LuaUserData for ForeignLuauValue {
             .map_err(|e| mluau::Error::external(format!("Bridge call failed: {}", e)))?;
 
             let mut proxied = mluau::MultiValue::with_capacity(ret.len());
-            let mut ed = EmbedderDataContext::new(&this.plc.ed);
+            let mut ed = EmbedderDataContext::new(this.plc.ed);
             for v in ret {
                 let v = v.to_luau_child(&lua, &this.plc, &this.bridge, &mut ed)
                 .map_err(|e| mluau::Error::external(format!("Failed to convert return value to Lua: {}", e)))?;

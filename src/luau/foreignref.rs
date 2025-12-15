@@ -29,7 +29,7 @@ impl<T: StandardProxyBridge> ForeignRef<T> {
     }
 
     async fn get_property(&self, lua: &mluau::Lua, key: mluau::Value) -> Result<mluau::Value, Error> {
-        let mut ed = EmbedderDataContext::new(&self.plc.ed);
+        let mut ed = EmbedderDataContext::new(self.plc.ed);
         let key_proxied = self.bridge.from_source_lua_value(lua, &self.plc, key, &mut ed)
         .map_err(|e| format!("Failed to proxy argument to ProxiedValue: {}", e))?;
         match self.bridge.get_property(self.id, key_proxied)
@@ -45,7 +45,7 @@ impl<T: StandardProxyBridge> ForeignRef<T> {
     }
 
     async fn function_call(&self, lua: &mluau::Lua, args: mluau::MultiValue) -> Result<mluau::MultiValue, Error> {
-        let mut ed = EmbedderDataContext::new(&self.plc.ed);
+        let mut ed = EmbedderDataContext::new(self.plc.ed);
         
         let mut args_proxied = Vec::with_capacity(args.len());
         for arg in args {

@@ -60,7 +60,7 @@ impl<T: ProxyBridge> LangBridge<T> {
             return Err("Lua state has been dropped".into());
         };
 
-        let mut ed = EmbedderDataContext::new(&self.plc.ed);
+        let mut ed = EmbedderDataContext::new(self.plc.ed);
         if disable_limits {
             ed.disable_limits();
         }
@@ -88,7 +88,7 @@ impl<T: ProxyBridge> LangBridge<T> {
         vfs: HashMap<String, String>,
         from_luau_shutdown_timeouts: ShutdownTimeouts
     ) -> Result<Self, crate::base::Error> {
-        let plc = ProxyLuaClient::new(lua, ed.clone())
+        let plc = ProxyLuaClient::new(lua, ed)
             .map_err(|e| format!("Failed to create ProxyLuaClient: {}", e))?;
         let bridge_vals = T::new(
             cs_state,

@@ -26,10 +26,9 @@ impl V8ObjectRegistryID {
 
 #[derive(Clone)]
 pub struct V8ObjectRegistry {
-    // obj registry fields (addV8Object, getV8Object and removeV8Object)
-    pub add_v8_object: v8::Global<v8::Function>,
-    pub get_v8_object: v8::Global<v8::Function>,
-    pub drop_v8_object: v8::Global<v8::Function>,
+    add_v8_object: v8::Global<v8::Function>,
+    get_v8_object: v8::Global<v8::Function>,
+    drop_v8_object: v8::Global<v8::Function>,
 }
 
 impl V8ObjectRegistry {
@@ -71,10 +70,9 @@ impl V8ObjectRegistry {
         };
 
         Self {
-            add_v8_object: v8::Global::new(scope, add_v8_object),
-            get_v8_object: v8::Global::new(scope, get_v8_object), 
-            drop_v8_object: v8::Global::new(scope, remove_v8_object),
-
+            add_v8_object: v8::Global::new(scope, &add_v8_object),
+            get_v8_object: v8::Global::new(scope, &get_v8_object),
+            drop_v8_object: v8::Global::new(scope, &remove_v8_object),
         }
     }
 

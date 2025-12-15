@@ -200,7 +200,7 @@ impl<T: ProxyBridge + ProxyBridgeWithMultiprocessExt> LuaBridgeService<T> {
     /// Creates a new Lua proxy bridge
     pub async fn run(mut self, plc: ProxyLuaClient) {
         let mut op_call_queue = FuturesUnordered::new();
-        let executor = self.bridge.get_executor();
+        let executor = &self.bridge.get_executor();
         let server_ctx = executor.server_context();
         let state = executor.get_state();
         loop {
@@ -208,13 +208,13 @@ impl<T: ProxyBridge + ProxyBridgeWithMultiprocessExt> LuaBridgeService<T> {
                 Ok(msg) = self.rx.recv() => {
                     match msg {
                         LuaBridgeMessage::OpCall { obj_id, op, args, resp } => {
-                            let bridge = self.bridge.clone();
-                            let plc = plc.clone();
                             let Some(lua) = plc.weak_lua.try_upgrade() else {
                                 let _ = resp.server(server_ctx).send(Err("Lua state has been dropped".into()));
                                 continue;
                             };
 
+                            let bridge = self.bridge.clone();
+                            let plc = plc.clone();
                             op_call_queue.push(async move {
                                 (op.run(&lua, obj_id, args, bridge, &plc).await, resp)
                             });
@@ -271,7 +271,7 @@ impl<T: ProxyBridge + ProxyBridgeWithMultiprocessExt> LuaBridgeService<T> {
 
                             match ret {
                                 ValueOrMultiValue::Value(v) => {
-                                    let mut ed = EmbedderDataContext::new(&plc.ed);
+                                    let mut ed = EmbedderDataContext::new(plc.ed);
                                     match self.bridge.from_source_lua_value(&lua, &plc, v, &mut ed) {
                                         Ok(pv) => {
                                             let _ = resp.server(server_ctx).send(Ok(vec![pv]));
@@ -284,7 +284,7 @@ impl<T: ProxyBridge + ProxyBridgeWithMultiprocessExt> LuaBridgeService<T> {
                                 ValueOrMultiValue::MultiValue(v) => {
                                     let mut args = Vec::with_capacity(v.len());
                                     let mut err = None;
-                                    let mut ed = EmbedderDataContext::new(&plc.ed);
+                                    let mut ed = EmbedderDataContext::new(plc.ed);
                                     for v in v {
                                         match self.bridge.from_source_lua_value(&lua, &plc, v, &mut ed) {
                                             Ok(pv) => {

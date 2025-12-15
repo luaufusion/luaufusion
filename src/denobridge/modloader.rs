@@ -70,7 +70,7 @@ impl ModuleLoader for FusionModuleLoader {
     let res = if let Some(code) = self.map.get(path.as_str()) {
       Ok(ModuleSource::new(
         module_type.clone(),
-        ModuleSourceCode::String(code.try_clone().unwrap()),
+        ModuleSourceCode::String(code.try_clone().unwrap()), // SAFETY: This should never panic due to the into_cheap_copy above?
         module_specifier,
         None,
       ))

@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, time::Duration};
 
 use concurrentlyexec::{ConcurrentExecutor, ConcurrentExecutorState, ConcurrentlyExecute, ProcessOpts};
 use serde::{Deserialize, Serialize};
@@ -54,7 +54,7 @@ pub trait ProxyBridge: Clone + 'static {
 /// Extension trait for ProxyBridge's that support multiprocess execution via concurrentlyexec
 pub trait ProxyBridgeWithMultiprocessExt: ProxyBridge {
     /// Returns the executor for concurrently executing tasks on a separate process
-    fn get_executor(&self) -> Arc<ConcurrentExecutor<Self::ConcurrentlyExecuteClient>>;
+    fn get_executor(&self) -> &ConcurrentExecutor<Self::ConcurrentlyExecuteClient>;
 }
 
 /// Extension trait for ProxyBridge's that have a direct string variant

@@ -37,7 +37,7 @@ impl ParallelLuaClient {
         resp: OneshotSender<Result<Vec<ProxiedLuauValue>, String>>,
     ) {
         let mut lua_args = mluau::MultiValue::with_capacity(args.len());
-        let mut ed = EmbedderDataContext::new(&common_state.ed);
+        let mut ed = EmbedderDataContext::new(common_state.ed);
         let mut err = None;
         for arg in args {
             let lua_val = match arg.to_luau_child(&lua, &common_state.proxy_client, &common_state.bridge, &mut ed) {
@@ -298,7 +298,7 @@ impl ConcurrentlyExecute for ParallelLuaClient {
         lua.sandbox(true)
         .expect("Failed to sandbox Luau state");
 
-        let lbsc = LuaBridgeServiceClient::new(client_ctx.clone(), data.lua_bridge_tx, data.ed.clone());
+        let lbsc = LuaBridgeServiceClient::new(client_ctx.clone(), data.lua_bridge_tx, data.ed);
 
         let common_state = CommonState {
             bridge: lbsc,
@@ -306,9 +306,9 @@ impl ConcurrentlyExecute for ParallelLuaClient {
                 //weak_lua: lua.weak(),
                 array_mt: lua.array_metatable(),
                 obj_registry: PObjRegistryLuau::new(&lua).expect("Failed to create Luau object registry"),
-                ed: data.ed.clone(),
+                ed: data.ed,
             },
-            ed: data.ed.clone(),
+            ed: data.ed,
         };
 
         let mut function_cache: HashMap<String, mluau::Function> = HashMap::new();
@@ -384,7 +384,7 @@ impl ConcurrentlyExecute for ParallelLuaClient {
                                 }
                             };
 
-                            let mut ed = EmbedderDataContext::new(&common_state.ed);
+                            let mut ed = EmbedderDataContext::new(common_state.ed);
                             let prop_lua = match property.to_luau_child(&&lua, &common_state.proxy_client, &common_state.bridge, &mut ed) {
                                 Ok(v) => v,
                                 Err(e) => {
@@ -612,7 +612,7 @@ impl ProxyBridge for ParallelLuaProxyBridge {
     }
 
     fn to_source_lua_value(&self, lua: &mluau::Lua, value: Self::ValueType, plc: &ProxyLuaClient) -> Result<mluau::Value, crate::base::Error> {
-        let mut ed = EmbedderDataContext::new(&plc.ed);
+        let mut ed = EmbedderDataContext::new(plc.ed);
         Ok(value.to_luau_host(lua, plc, self, &mut ed).map_err(|e| e.to_string())?)
     }
 
@@ -652,8 +652,8 @@ impl ProxyBridge for ParallelLuaProxyBridge {
 
 impl ProxyBridgeWithMultiprocessExt for ParallelLuaProxyBridge {
     /// Returns the executor for concurrently executing tasks on a separate process
-    fn get_executor(&self) -> Arc<ConcurrentExecutor<Self::ConcurrentlyExecuteClient>> {
-        self.executor.clone()
+    fn get_executor(&self) -> &ConcurrentExecutor<Self::ConcurrentlyExecuteClient> {
+        self.executor.deref()
     }
 }
 

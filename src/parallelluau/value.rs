@@ -143,7 +143,7 @@ impl ProxiedLuauValue {
             mluau::Value::UserData(ud) => {
                 // Handle luau objects
                 if let Ok(flvalue) = ud.borrow::<ForeignLuauValue>() {
-                    return Ok(Self::SourceOwnedObject((flvalue.typ.clone(), flvalue.id.clone())));
+                    return Ok(Self::SourceOwnedObject((flvalue.typ, flvalue.id)));
                 }
 
                 let userdata_id = plc.obj_registry.add(mluau::Value::UserData(ud))

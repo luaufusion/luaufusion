@@ -26,7 +26,7 @@ impl ProxiedLuauPsuedoPrimitive {
             },
             mluau::Value::Table(t) => {
                 let mt = t.metatable();
-                if mt == Some(plc.array_mt.clone()) {
+                if let Some(ref mt) = mt && mt == &plc.array_mt {
                     ed.add(t.raw_len(), "ProxiedLuauPsuedoPrimitive -> LuaArray")?;
 
                     let mut list = Vec::with_capacity(t.raw_len());
@@ -85,7 +85,7 @@ impl ProxiedLuauPsuedoPrimitive {
             },
             mluau::Value::Table(t) => {
                 let mt = t.metatable();
-                if mt == Some(plc.array_mt.clone()) {
+                if let Some(ref mt) = mt && mt == &plc.array_mt {
                     ed.add(t.raw_len(), "ProxiedLuauPsuedoPrimitive -> LuaArray")?;
 
                     let mut list = Vec::with_capacity(t.raw_len());
