@@ -10,6 +10,7 @@ use deno_core::{PollEventLoopOptions, v8};
 use futures_util::stream::FuturesUnordered;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc::unbounded_channel;
 
 use crate::denobridge::modloader::FusionModuleLoader;
 use crate::denobridge::objreg::{V8ObjectRegistry, V8ObjectRegistryID};
@@ -78,7 +79,7 @@ pub(super) enum V8IsolateManagerMessage {
         magic: usize,
     },
     DropObject {
-        object_id: V8ObjectRegistryID,
+        ids: Vec<V8ObjectRegistryID>,
         resp: Option<OneshotSender<Result<(), String>>>,
         magic: usize,
     },
@@ -126,14 +127,14 @@ impl V8IsolateSendableMessage for OpCallMessage {
 }
 
 pub(super) struct DropObjectMessage {
-    pub object_id: V8ObjectRegistryID,
+    pub ids: Vec<V8ObjectRegistryID>,
 }
 
 impl V8IsolateSendableMessage for DropObjectMessage {
     type Response = Result<(), String>;
     fn to_message(self, resp: OneshotSender<Self::Response>) -> V8IsolateManagerMessage {
         V8IsolateManagerMessage::DropObject {
-            object_id: self.object_id,
+            ids: self.ids,
             resp: Some(resp),
             magic: V8_MESSAGE_MAGIC,
         }
@@ -244,6 +245,13 @@ impl V8ObjectOp {
     }
 }
 
+/// Sent when v8 wants to drop an object from v8 itself (but *may* be on a different (GC) thread)
+pub enum V8InternalMessage {
+    V8ObjectDrop {
+        ids: Vec<V8ObjectRegistryID>,
+    }
+}
+ 
 #[derive(Clone)]
 pub struct V8IsolateManagerClient {}
 
@@ -263,11 +271,13 @@ impl ConcurrentlyExecute for V8IsolateManagerClient {
     ) {
         let (tx, mut rx) = client_ctx.multi();
         data.messenger_tx.client(&client_ctx).send(tx).unwrap();
+        let (v8_internal_tx, mut v8_internal_rx) = unbounded_channel::<V8InternalMessage>();
 
         let mut inner = V8IsolateManagerInner::new(
             LuaBridgeServiceClient::new(client_ctx.clone(), data.lua_bridge_tx, data.ed.clone()),
             data.ed,
-            FusionModuleLoader::new(data.vfs.into_iter().map(|(x, y)| (x, y.into())))
+            FusionModuleLoader::new(data.vfs.into_iter().map(|(x, y)| (x, y.into()))),
+            v8_internal_tx
         );
 
         let mut evaluated_modules = HashMap::new();
@@ -371,7 +381,7 @@ impl ConcurrentlyExecute for V8IsolateManagerClient {
                                 }
                             }
                         },
-                        Ok(V8IsolateManagerMessage::DropObject { object_id, resp, magic }) => {
+                        Ok(V8IsolateManagerMessage::DropObject { ids, resp, magic }) => {
                             if magic != V8_MESSAGE_MAGIC {
                                 if let Some(resp) = resp {
                                     let _ = resp.client(&client_ctx).send(Err("Invalid magic number in DropObject message; are you sure you're running a V8 child process?".into()));
@@ -380,7 +390,7 @@ impl ConcurrentlyExecute for V8IsolateManagerClient {
                             }
 
                             if cfg!(feature = "debug_message_print_enabled") {
-                                println!("Host V8 received request to drop object ID {:?}", object_id);
+                                println!("Host V8 received request to drop object ID {:?}", ids);
                             }
 
                             if !inner.common_state.ed.object_disposal_enabled {
@@ -394,12 +404,22 @@ impl ConcurrentlyExecute for V8IsolateManagerClient {
                             let main_ctx = v8::Local::new(&mut scope, main_ctx);
                             let mut context_scope = &mut v8::ContextScope::new(scope, main_ctx);
 
-                            match inner.common_state.proxy_client.obj_registry.drop(&mut context_scope, object_id) {
-                                Ok(_) => {},
-                                Err(e) => {
-                                    if let Some(resp) = resp {
-                                        let _ = resp.client(&client_ctx).send(Err(format!("Failed to drop V8 object: {}", e).into()));
+                            let mut errors = Vec::new();
+                            for id in ids {
+                                match inner.common_state.proxy_client.obj_registry.drop(&mut context_scope, id) {
+                                    Ok(_) => {},
+                                    Err(e) => {
+                                        errors.push(e);
                                     }
+                                }
+                            }
+
+                            if let Some(resp) = resp {
+                                if errors.is_empty() {
+                                    let _ = resp.client(&client_ctx).send(Ok(()));
+                                } else {
+                                    let err_msg = format!("Failed to drop some V8 objects: {:?}", errors);
+                                    let _ = resp.client(&client_ctx).send(Err(err_msg));
                                 }
                             }
                         }
@@ -412,6 +432,40 @@ impl ConcurrentlyExecute for V8IsolateManagerClient {
                         Err(e) => {
                             eprintln!("Error receiving message in V8 isolate manager: {}", e);
                             //break;
+                        }
+                    }
+                }
+                msg = v8_internal_rx.recv() => {
+                    match msg {
+                        Some(V8InternalMessage::V8ObjectDrop { ids }) => {
+                            if cfg!(feature = "debug_message_print_enabled") {
+                                println!("V8 isolate received internal request to drop object ID {:?}", ids);
+                            }
+
+                            if !inner.common_state.ed.object_disposal_enabled {
+                                continue; // Skip disposal if disabled
+                            }
+
+                            let main_ctx = inner.deno.main_context();
+                            let isolate = inner.deno.v8_isolate();
+                            let scope = std::pin::pin!(v8::HandleScope::new(isolate));
+                            let mut scope = &mut scope.init();
+                            let main_ctx = v8::Local::new(&mut scope, main_ctx);
+                            let mut context_scope = &mut v8::ContextScope::new(scope, main_ctx);
+
+                            for id in ids {
+                                match inner.common_state.proxy_client.obj_registry.drop(&mut context_scope, id) {
+                                    Ok(_) => {},
+                                    Err(e) => {
+                                        eprintln!("Failed to drop V8 object from internal message: {}", e);
+                                    }
+                                }
+                            }
+                        }
+                        None => {
+                            // Channel closed
+                            println!("V8 isolate internal message channel closed");
+                            break;
                         }
                     }
                 }
@@ -697,14 +751,14 @@ impl StandardProxyBridge for V8IsolateManagerServer {
         }
 
         self.send(DropObjectMessage {
-            object_id: id,
+            ids: vec![id],
         }).await??;
         Ok(())
     }
 
-    fn fire_request_dispose(
+    fn fire_request_disposes(
         &self,
-        id: Self::ObjectRegistryID,
+        id: Vec<Self::ObjectRegistryID>,
     ) {
         if !self.ed.object_disposal_enabled || !self.ed.automatic_object_disposal_enabled {
             return;
@@ -712,7 +766,7 @@ impl StandardProxyBridge for V8IsolateManagerServer {
 
         let _ = self.messenger.server(self.executor.server_context()).send(
             V8IsolateManagerMessage::DropObject {
-                object_id: id,
+                ids: id,
                 resp: None,
                 magic: V8_MESSAGE_MAGIC,
             }

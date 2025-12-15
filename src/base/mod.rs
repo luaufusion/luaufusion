@@ -94,9 +94,9 @@ pub trait StandardProxyBridge: ProxyBridge {
     ) -> Result<Vec<Self::ValueType>, Error>;
 
     /// Fire a request dispose synchronously without waiting for the result
-    fn fire_request_dispose(
+    fn fire_request_disposes(
         &self,
-        id: Self::ObjectRegistryID,
+        id: Vec<Self::ObjectRegistryID>,
     );
 
     /// RequestDispose requests disposal of a foreign object by its registry ID

@@ -179,7 +179,7 @@ pub enum LuaBridgeMessage<T: ProxyBridge> {
         resp: OneshotSender<Result<Vec<T::ValueType>, String>>,
     },
     RequestDispose {
-        obj_id: LuauObjectRegistryID,
+        ids: Vec<LuauObjectRegistryID>,
         resp: Option<OneshotSender<Result<(), String>>>,
     },
     Shutdown,
@@ -219,25 +219,31 @@ impl<T: ProxyBridge + ProxyBridgeWithMultiprocessExt> LuaBridgeService<T> {
                                 (op.run(&lua, obj_id, args, bridge, &plc).await, resp)
                             });
                         }
-                        LuaBridgeMessage::RequestDispose { obj_id, resp } => {
+                        LuaBridgeMessage::RequestDispose { ids, resp } => {
                             if !self.ed.object_disposal_enabled {
                                 continue;
                             }
                             
                             if cfg!(feature = "debug_message_print_enabled") {
-                                println!("Host Luau received request to dispose object ID {:?}", obj_id);
+                                println!("Host Luau received request to dispose object IDs {:?}", ids);
                             }
 
-                            match plc.obj_registry.drop(obj_id) {
-                                Ok(_) => {
-                                    if let Some(resp) = resp {
-                                        let _ = resp.server(&server_ctx).send(Ok(()));
+                            let mut errors = Vec::new();
+                            for id in ids {
+                                match plc.obj_registry.drop(id) {
+                                    Ok(_) => {},
+                                    Err(e) => {
+                                        errors.push(e);
                                     }
-                                },
-                                Err(e) => {
-                                    if let Some(resp) = resp {
-                                        let _ = resp.server(&server_ctx).send(Err(format!("Failed to dispose object: {}", e)));
-                                    }
+                                }
+                            }
+
+                            if let Some(resp) = resp {
+                                if errors.is_empty() {
+                                    let _ = resp.server(server_ctx).send(Ok(()));
+                                } else {
+                                    let err_msg = format!("Failed to dispose some objects: {:?}", errors);
+                                    let _ = resp.server(server_ctx).send(Err(err_msg));
                                 }
                             }
                         }
@@ -350,7 +356,7 @@ impl<T: ProxyBridge> LuaBridgeServiceClient<T> {
 
         let (resp_tx, resp_rx) = self.client_context.oneshot();
         let msg = LuaBridgeMessage::RequestDispose {
-            obj_id,
+            ids: vec![obj_id],
             resp: Some(resp_tx),
         };
         self.tx.client(&self.client_context).send(msg).map_err(|e| format!("Failed to send request dispose message: {}", e))?;
@@ -358,13 +364,13 @@ impl<T: ProxyBridge> LuaBridgeServiceClient<T> {
     }
 
     /// Fires a dispose request without waiting for the result
-    pub fn fire_request_dispose(&self, obj_id: LuauObjectRegistryID) {
+    pub fn fire_request_disposes(&self, ids: Vec<LuauObjectRegistryID>) {
         if !self.ed.object_disposal_enabled || !self.ed.automatic_object_disposal_enabled {
             return;
         }
 
         let msg = LuaBridgeMessage::RequestDispose {
-            obj_id,
+            ids,
             resp: None,
         };
         let _ = self.tx.client(&self.client_context).send(msg);

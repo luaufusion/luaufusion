@@ -165,6 +165,8 @@ export async function tablepropget(obj) {
     console.log("In tablepropget", obj);
     let key = await globalThis.lua.get(obj, "foo");
     console.log("Got foo key:", key);
+    let key2 = await globalThis.lua.get(obj, {});
+    console.log("Got non-existent key:", key2);
     return key;
 }
 "#.to_string()),

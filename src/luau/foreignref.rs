@@ -13,7 +13,7 @@ pub struct ForeignRef<T: StandardProxyBridge> {
 
 impl<T: StandardProxyBridge> Drop for ForeignRef<T> {
     fn drop(&mut self) {
-        self.bridge.fire_request_dispose(self.id);
+        self.bridge.fire_request_disposes(vec![self.id]);
     }
 }
 

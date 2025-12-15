@@ -3,8 +3,11 @@ use std::rc::Rc;
 
 use deno_core::parking_lot::Mutex;
 use deno_core::{GarbageCollected, OpState, op2, v8};
+use tokio::sync::mpsc::UnboundedSender;
 
 use crate::denobridge::V8IsolateManagerServer;
+use crate::denobridge::bridge::V8InternalMessage;
+use crate::denobridge::objreg::V8ObjectRegistryID;
 use crate::luau::bridge::{LuaBridgeServiceClient, LuauObjectOp, ObjectRegistryType};
 use crate::luau::embedder_api::EmbedderDataContext;
 use crate::luau::LuauObjectRegistryID;
@@ -67,20 +70,13 @@ impl LuaObject {
     /// Verifies that the args passed in are valid for the opcall
     async fn opcall_impl(
         &self,
-        state_rc: Rc<RefCell<OpState>>,
         bound_args: &ArgBuffer,
         op_id: LuauObjectOp,
     ) -> Result<(), deno_error::JsErrorBox> {
-        let running_funcs = {
-            let state = state_rc.try_borrow()
-                .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
-            
-            state.try_borrow::<CommonState>()
-                .ok_or_else(|| deno_error::JsErrorBox::generic("CommonState not found".to_string()))?
-                .clone()
-        };
-
         let args = bound_args.consume()?;
+
+        // If anything drops during the opcall, ensure we clean up references
+        let _guard = RefIdDropGuard::from_args(&args, bound_args.v8_internal_tx.clone(), bound_args.bridge.clone());
 
         match op_id {
             LuauObjectOp::Index => {
@@ -91,7 +87,7 @@ impl LuaObject {
             _ => {}
         }
 
-        let lua_resp = running_funcs.bridge.opcall(
+        let lua_resp = bound_args.bridge.opcall(
             self.lua_id.clone(),
             op_id,
             args,
@@ -120,7 +116,7 @@ impl Drop for LuaObject {
         if cfg!(feature = "debug_message_print_enabled") {
             println!("LuaObject of type {} with ID {:?} dropped", self.lua_type.type_name(), self.lua_id);
         }
-        self.bridge.fire_request_dispose(self.lua_id.clone());
+        self.bridge.fire_request_disposes(vec![self.lua_id.clone()]);
     }
 }
 
@@ -151,10 +147,9 @@ impl LuaObject {
     // Synchronous function call opcall
     pub async fn call_sync(
         &self,
-        state_rc: Rc<RefCell<OpState>>,
         #[cppgc] bound_args: &ArgBuffer,
     ) -> Result<(), deno_error::JsErrorBox> {
-        self.opcall_impl(state_rc, bound_args, LuauObjectOp::FunctionCallSync).await
+        self.opcall_impl(bound_args, LuauObjectOp::FunctionCallSync).await
     }
 
     #[async_method]
@@ -162,10 +157,9 @@ impl LuaObject {
     // Asynchronous function call opcall
     pub async fn call_async(
         &self,
-        state_rc: Rc<RefCell<OpState>>,
         #[cppgc] bound_args: &ArgBuffer,
     ) -> Result<(), deno_error::JsErrorBox> {
-        self.opcall_impl(state_rc, bound_args, LuauObjectOp::FunctionCallAsync).await
+        self.opcall_impl(bound_args, LuauObjectOp::FunctionCallAsync).await
     }
 
     #[async_method]
@@ -173,10 +167,9 @@ impl LuaObject {
     // Index/get a property from the Lua object
     pub async fn get(
         &self,
-        state_rc: Rc<RefCell<OpState>>,
         #[cppgc] bound_args: &ArgBuffer,
     ) -> Result<(), deno_error::JsErrorBox> {
-        self.opcall_impl(state_rc, bound_args, LuauObjectOp::Index).await
+        self.opcall_impl(bound_args, LuauObjectOp::Index).await
     }
 
     #[async_method]
@@ -205,6 +198,54 @@ impl LuaObject {
     }
 }
 
+struct RefIdDropGuard {
+    v8_refs: Vec<V8ObjectRegistryID>,
+    lua_refs: Vec<LuauObjectRegistryID>,
+    v8_internal_tx: UnboundedSender<V8InternalMessage>,
+    bridge: LuaBridgeServiceClient<V8IsolateManagerServer>,
+}
+
+impl RefIdDropGuard {
+    fn from_args(
+        args: &[ProxiedV8Value],
+        v8_internal_tx: UnboundedSender<V8InternalMessage>,
+        bridge: LuaBridgeServiceClient<V8IsolateManagerServer>,
+    ) -> Self {
+        let mut v8_refs = Vec::new();
+        let mut lua_refs = Vec::new();
+
+        for val in args {
+            let (v8_ref_list, lua_ref_list) = val.get_owned_object_ids();
+            v8_refs.extend(v8_ref_list);
+            lua_refs.extend(lua_ref_list);
+        }
+
+        RefIdDropGuard {
+            v8_refs,
+            lua_refs,
+            v8_internal_tx,
+            bridge,
+        }
+    }
+}
+
+impl Drop for RefIdDropGuard {
+    fn drop(&mut self) {
+        // No fields to drop
+        if cfg!(feature = "debug_message_print_enabled") {
+            println!("RefIdDropGuard dropped with {} V8 refs and {} Lua refs", self.v8_refs.len(), self.lua_refs.len());
+        }
+
+        if !self.v8_refs.is_empty() && self.bridge.ed.object_disposal_enabled {
+            let _ = self.v8_internal_tx.send(V8InternalMessage::V8ObjectDrop { ids: self.v8_refs.clone() });
+        }
+
+        if !self.lua_refs.is_empty() {
+            self.bridge.fire_request_disposes(self.lua_refs.clone());
+        }
+    }
+}
+
 // A cppgc struct to hold proxied values for passing between ops
 //
 // We use a cppgc struct to ensure that in the event of errors etc, the values
@@ -212,12 +253,16 @@ impl LuaObject {
 // instead of leaking memory
 pub(super) struct ArgBuffer {
     proxied_values: Mutex<Option<Vec<ProxiedV8Value>>>,
+    v8_internal_tx: UnboundedSender<V8InternalMessage>,
+    bridge: LuaBridgeServiceClient<V8IsolateManagerServer>,
 }
 
 impl ArgBuffer {
-    fn new(values: Vec<ProxiedV8Value>) -> Self {
+    fn new(values: Vec<ProxiedV8Value>, common_state: &CommonState) -> Self {
         ArgBuffer {
             proxied_values: Mutex::new(Some(values)),
+            v8_internal_tx: common_state.v8_internal_tx.clone(),
+            bridge: common_state.bridge.clone(),
         }
     }
 
@@ -234,8 +279,13 @@ impl ArgBuffer {
 
     /// Consume the proxied values, leaving None in its place
     fn consume(&self) -> Result<Vec<ProxiedV8Value>, deno_error::JsErrorBox> {
+        self.take_out().ok_or_else(|| deno_error::JsErrorBox::generic("ArgBuffer already consumed".to_string()))
+    }
+
+    /// Takes out the values. Similar to consume but returns None if already consumed
+    fn take_out(&self) -> Option<Vec<ProxiedV8Value>> {
         let mut borrowed = self.proxied_values.lock();
-        borrowed.take().ok_or_else(|| deno_error::JsErrorBox::generic("ArgBuffer already consumed".to_string()))
+        borrowed.take()
     }
 }
 
@@ -244,6 +294,12 @@ impl Drop for ArgBuffer {
         // No fields to drop
         if cfg!(feature = "debug_message_print_enabled") {
             println!("ArgBuffer dropped");
+        }
+
+        let values = self.take_out();
+        if let Some(proxied_values) = values {
+            let _guard = RefIdDropGuard::from_args(&proxied_values, self.v8_internal_tx.clone(), self.bridge.clone());
+            drop(_guard); // Dropping the guard will hence drop the proxied values and finish the GC cycle
         }
     }
 }
@@ -267,12 +323,12 @@ impl ArgBuffer {
         scope: &mut v8::PinScope<'a, '_>,
         #[varargs] fn_args: Option<&v8::FunctionCallbackArguments<'a>>,
     ) -> Result<ArgBuffer, deno_error::JsErrorBox> {
-        let Some(args) = fn_args else {
-            return Ok(ArgBuffer::new(vec![]))
-        };
-
         let state = op_state.try_borrow::<CommonState>()
         .ok_or_else(|| deno_error::JsErrorBox::generic("CommonState not found".to_string()))?;
+
+        let Some(args) = fn_args else {
+            return Ok(ArgBuffer::new(vec![], state));
+        };
 
         let mut ed = EmbedderDataContext::new(&state.ed);
 
@@ -289,7 +345,7 @@ impl ArgBuffer {
             }
         }
 
-        let proxied_values = ArgBuffer::new(args_proxied);
+        let proxied_values = ArgBuffer::new(args_proxied, state);
         Ok(proxied_values)
     }
 

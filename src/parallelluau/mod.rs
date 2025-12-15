@@ -126,7 +126,7 @@ pub(super) enum ParallelLuaMessage {
         magic: usize,
     },
     RequestDispose {
-        obj_id: PLuauObjectRegistryID,
+        ids: Vec<PLuauObjectRegistryID>,
         resp: Option<OneshotSender<Result<(), String>>>,
         magic: usize,
     },
@@ -189,14 +189,14 @@ impl LuauSendableMessage for CallFunctionChildMessage {
 }
 
 pub struct RequestDisposeMessage {
-    pub obj_id: PLuauObjectRegistryID,
+    pub ids: Vec<PLuauObjectRegistryID>,
 }
 
 impl LuauSendableMessage for RequestDisposeMessage {
     type Response = Result<(), String>;
     fn to_message(self, resp: OneshotSender<Self::Response>) -> ParallelLuaMessage {
         ParallelLuaMessage::RequestDispose {
-            obj_id: self.obj_id,
+            ids: self.ids,
             resp: Some(resp),
             magic: PLUAU_MESSAGE_MAGIC,
         }
@@ -451,7 +451,7 @@ impl ConcurrentlyExecute for ParallelLuaClient {
                                 resp,
                             );
                         },
-                        Ok(ParallelLuaMessage::RequestDispose { obj_id, resp, magic }) => {
+                        Ok(ParallelLuaMessage::RequestDispose { ids, resp, magic }) => {
                             if !common_state.ed.object_disposal_enabled {
                                 continue;
                             }
@@ -463,18 +463,24 @@ impl ConcurrentlyExecute for ParallelLuaClient {
                                 continue;
                             }
 
-                            match common_state.proxy_client.obj_registry.drop(obj_id).map_err(|e| e.to_string()) {
-                                Ok(_) => {
-                                    if let Some(resp) = resp {
-                                        let _ = resp.client(&client_ctx).send(Ok(()));
+                            let mut errors = Vec::new();
+                            for obj_id in ids {
+                                match common_state.proxy_client.obj_registry.drop(obj_id).map_err(|e| e.to_string()) {
+                                    Ok(_) => {},
+                                    Err(e) => {
+                                        errors.push(e);
                                     }
-                                },
-                                Err(e) => {
-                                    if let Some(resp) = resp {
-                                        let _ = resp.client(&client_ctx).send(Err(format!("Failed to dispose object: {}", e)));
-                                    }
+                                };
+                            }
+
+                            if let Some(resp) = resp {
+                                if errors.is_empty() {
+                                    let _ = resp.client(&client_ctx).send(Ok(()));
+                                } else {
+                                    let err_msg = format!("Failed to dispose some objects: {:?}", errors);
+                                    let _ = resp.client(&client_ctx).send(Err(err_msg));
                                 }
-                            };
+                            }
                         },
                         Ok(ParallelLuaMessage::Shutdown) => {
                             break;
@@ -686,12 +692,12 @@ impl StandardProxyBridge for ParallelLuaProxyBridge {
             return Ok(());
         }
 
-        Ok(self.send(RequestDisposeMessage { obj_id: id }).await??)
+        Ok(self.send(RequestDisposeMessage { ids: vec![id] }).await??)
     }
 
-    fn fire_request_dispose(
+    fn fire_request_disposes(
         &self,
-        id: Self::ObjectRegistryID,
+        ids: Vec<Self::ObjectRegistryID>,
     ) {
         if !self.ed.object_disposal_enabled || !self.ed.automatic_object_disposal_enabled {
             return;
@@ -699,7 +705,7 @@ impl StandardProxyBridge for ParallelLuaProxyBridge {
 
         let _ = self.messenger.server(self.executor.server_context()).send(
             ParallelLuaMessage::RequestDispose {
-                obj_id: id,
+                ids,
                 resp: None,
                 magic: PLUAU_MESSAGE_MAGIC,
             }

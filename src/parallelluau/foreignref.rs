@@ -13,7 +13,7 @@ pub struct ForeignLuauValue {
 
 impl Drop for ForeignLuauValue {
     fn drop(&mut self) {
-        self.bridge.fire_request_dispose(self.id.clone());
+        self.bridge.fire_request_disposes(vec![self.id.clone()]);
     }
 }
 

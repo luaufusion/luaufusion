@@ -32,6 +32,43 @@ pub enum ProxiedV8Value {
 }
 
 impl ProxiedV8Value {
+    /// Returns the list of owned object ids contained within this ProxiedV8Value
+    pub(crate) fn get_owned_object_ids(&self) -> (Vec<V8ObjectRegistryID>, Vec<LuauObjectRegistryID>) {
+        match self {
+            ProxiedV8Value::Primitive(_) => (Vec::with_capacity(0), Vec::with_capacity(0)),
+            ProxiedV8Value::Psuedoprimitive(p) => {
+                match p {
+                    ProxiedV8PsuedoPrimitive::StaticList(v) => {
+                        let mut v8_ids = Vec::new();
+                        let mut luau_ids = Vec::new();
+                        for item in v {
+                            let (v8s, luaus) = item.get_owned_object_ids();
+                            v8_ids.extend(v8s);
+                            luau_ids.extend(luaus);
+                        }
+                        (v8_ids, luau_ids)
+                    },
+                    ProxiedV8PsuedoPrimitive::StaticMap(v) => {
+                        let mut v8_ids = Vec::new();
+                        let mut luau_ids = Vec::new();
+                        for (key, value) in v {
+                            let (v8s_key, luau_ids_key) = key.get_owned_object_ids();
+                            let (v8s_value, luau_ids_value) = value.get_owned_object_ids();
+                            v8_ids.extend(v8s_key);
+                            v8_ids.extend(v8s_value);
+                            luau_ids.extend(luau_ids_key);
+                            luau_ids.extend(luau_ids_value);
+                        }
+                        (v8_ids, luau_ids)
+                    },
+                    _ => (Vec::with_capacity(0), Vec::with_capacity(0)),
+                }
+            },
+            ProxiedV8Value::V8OwnedObject((_, id)) => (vec![*id], Vec::with_capacity(0)),
+            ProxiedV8Value::SourceOwnedObject((_, id)) => (Vec::with_capacity(0), vec![id.clone()]),
+        }
+    }
+
     /// Proxies a Luau value to a ProxiedV8Value
     pub(crate) fn from_luau(plc: &ProxyLuaClient, value: mluau::Value, ed: &mut EmbedderDataContext) -> Result<Self, Error> {
         let mut inner_ed_a = ed.nest_in_depth();
