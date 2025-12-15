@@ -71,9 +71,13 @@ impl ObjectRegistryType {
 /// Messages sent to the Lua proxy bridge
 #[derive(Serialize, Deserialize)]
 pub enum LuaBridgeMessage<T: ProxyBridge> {
-    FunctionCall {
+    FunctionCallSync {
         obj_id: LuauObjectRegistryID,
-        is_async: bool,
+        args: Vec<T::ValueType>,
+        resp: OneshotSender<Result<Vec<T::ValueType>, String>>,
+    },
+    FunctionCallAsync {
+        obj_id: LuauObjectRegistryID,
         args: Vec<T::ValueType>,
         resp: OneshotSender<Result<Vec<T::ValueType>, String>>,
     },
@@ -146,6 +150,32 @@ impl<T: ProxyBridge + ProxyBridgeWithMultiprocessExt> LuaBridgeService<T> {
         Ok(args)
     }
 
+    fn validate_func_call(
+        &self,
+        plc: &ProxyLuaClient,
+        obj_id: LuauObjectRegistryID,
+        args: Vec<T::ValueType>,
+    ) -> Result<(mluau::Function, mluau::MultiValue, mluau::Lua), String> {
+        // For now, we don't have any specific validation logic
+        // In the future, we could check if the object ID exists in a registry, etc.
+        let Some(lua) = plc.weak_lua.try_upgrade() else {
+            return Err("Lua state has been dropped".into());
+        };
+
+        let obj = plc.obj_registry.get(obj_id)
+            .map_err(|e| format!("Failed to get object from registry: {}", e))?;
+
+        let func = match obj {
+            mluau::Value::Function(f) => f,
+            _ => {
+                return Err("Object is not a function".into());
+            },
+        };
+
+        let args_mv = Self::create_multivalue_from_args(&lua, args, &self.bridge, &plc)?;
+        Ok((func, args_mv, lua))
+    }
+
     /// Creates a new Lua proxy bridge
     pub async fn run(mut self, plc: ProxyLuaClient) {
         let mut op_call_queue = FuturesUnordered::new();
@@ -156,59 +186,52 @@ impl<T: ProxyBridge + ProxyBridgeWithMultiprocessExt> LuaBridgeService<T> {
             tokio::select! {
                 Ok(msg) = self.rx.recv() => {
                     match msg {
-                        LuaBridgeMessage::FunctionCall { obj_id, is_async, args, resp } => {
-                            let Some(lua) = plc.weak_lua.try_upgrade() else {
-                                let _ = resp.server(server_ctx).send(Err("Lua state has been dropped".into()));
-                                continue;
-                            };
-
-                            let obj = match plc.obj_registry.get(obj_id) {
-                                Ok(o) => o,
-                                Err(e) => {
-                                    let _ = resp.server(server_ctx).send(Err(format!("Failed to get object from registry: {}", e)));
-                                    continue;
-                                }
-                            };
-
-                            let func = match obj {
-                                mluau::Value::Function(f) => f,
-                                _ => {
-                                    let _ = resp.server(server_ctx).send(Err("Object is not a function".into()));
-                                    continue;
-                                },
-                            };
-
-                            let args = match Self::create_multivalue_from_args(&lua, args, &self.bridge, &plc) {
+                        LuaBridgeMessage::FunctionCallSync { obj_id, args, resp } => {
+                            let (funct, args, lua) = match Self::validate_func_call(
+                                &self,
+                                &plc,
+                                obj_id,
+                                args,
+                            ) {
                                 Ok(v) => v,
                                 Err(e) => {
-                                    let _ = resp.server(server_ctx).send(Err(format!("Failed to convert argument to Lua value: {}", e)));
+                                    let _ = resp.server(server_ctx).send(Err(e));
                                     continue;
                                 }
                             };
 
-                            // Non-async call
-                            if !is_async {
-                                match func.call::<mluau::MultiValue>(args) {
-                                    Ok(ret) => {
-                                        match Self::create_args_from_multivalue(&lua, ret, &self.bridge, &plc) {
-                                            Ok(ret_vals) => {
-                                                let _ = resp.server(server_ctx).send(Ok(ret_vals));
-                                            }
-                                            Err(e) => {
-                                                let _ = resp.server(server_ctx).send(Err(format!("Failed to convert return value to foreign language value: {}", e).into()));
-                                            }
+                            match funct.call::<mluau::MultiValue>(args) {
+                                Ok(ret) => {
+                                    match Self::create_args_from_multivalue(&lua, ret, &self.bridge, &plc) {
+                                        Ok(ret_vals) => {
+                                            let _ = resp.server(server_ctx).send(Ok(ret_vals));
+                                        }
+                                        Err(e) => {
+                                            let _ = resp.server(server_ctx).send(Err(format!("Failed to convert return value to foreign language value: {}", e).into()));
                                         }
                                     }
-                                    Err(e) => {
-                                        let _ = resp.server(server_ctx).send(Err(format!("Failed to call function: {}", e).into()));
-                                    }
                                 }
-
-                                continue;
+                                Err(e) => {
+                                    let _ = resp.server(server_ctx).send(Err(format!("Failed to call function: {}", e).into()));
+                                }
                             }
+                        },
+                        LuaBridgeMessage::FunctionCallAsync { obj_id, args, resp } => {
+                            let (funct, args, lua) = match Self::validate_func_call(
+                                &self,
+                                &plc,
+                                obj_id,
+                                args,
+                            ) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    let _ = resp.server(server_ctx).send(Err(e));
+                                    continue;
+                                }
+                            };
 
                             // Async calls get pushed to the op_call_queue
-                            let th = match lua.create_thread(func) {
+                            let th = match lua.create_thread(funct) {
                                 Ok(t) => t,
                                 Err(e) => {
                                     let _ = resp.server(server_ctx).send(Err(format!("Failed to create Lua thread: {}", e).into()));
@@ -372,12 +395,23 @@ impl<T: ProxyBridge> LuaBridgeServiceClient<T> {
         Self { client_context, tx, ed }
     }
 
-    /// Calls a Lua function by its ID with the given arguments, returning the results
-    pub async fn call_function(&self, obj_id: LuauObjectRegistryID, is_async: bool, args: Vec<T::ValueType>) -> Result<Vec<T::ValueType>, String> {
+    /// Calls a Lua function by its ID with the given arguments, returning the results (sync/mainthread mode)
+    pub async fn call_function_sync(&self, obj_id: LuauObjectRegistryID, args: Vec<T::ValueType>) -> Result<Vec<T::ValueType>, String> {
         let (resp_tx, resp_rx) = self.client_context.oneshot();
-        let msg = LuaBridgeMessage::FunctionCall {
+        let msg = LuaBridgeMessage::FunctionCallSync {
             obj_id,
-            is_async,
+            args,
+            resp: resp_tx,
+        };
+        self.tx.client(&self.client_context).send(msg).map_err(|e| format!("Failed to send opcall message: {}", e))?;
+        resp_rx.recv().await.map_err(|e| format!("Failed to receive opcall response: {}", e))?
+    }
+
+    /// Calls a Lua function by its ID with the given arguments, returning the results (async mode)
+    pub async fn call_function_async(&self, obj_id: LuauObjectRegistryID, args: Vec<T::ValueType>) -> Result<Vec<T::ValueType>, String> {
+        let (resp_tx, resp_rx) = self.client_context.oneshot();
+        let msg = LuaBridgeMessage::FunctionCallAsync {
+            obj_id,
             args,
             resp: resp_tx,
         };

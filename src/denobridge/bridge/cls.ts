@@ -17,10 +17,10 @@ interface LuaObject {
      * 
      * Currently only supported on functions (tables with __call metamethods are not supported yet).
      * 
-     * @param {any[]} args The arguments to pass
+     * @param {any[]} args The arguments to pass. If no args are provided, an empty argument list is used.
      * @returns {Promise<any[]>} The returned values from the function call.
      */
-    callSync: (args: any[]) => Promise<any[]>;
+    callSync: (args: any[] | undefined) => Promise<any[]>;
 
     /**
      * Calls the function asynchronously/in a new Luau thread
@@ -31,10 +31,10 @@ interface LuaObject {
      * 
      * Currently only supported on functions (tables with __call metamethods are not supported yet).
      * 
-     * @param {any[]} args The arguments to pass
+     * @param {any[]} args The arguments to pass. If no args are provided, an empty argument list is used.
      * @returns {Promise<any[]>} The returned values from the function call.
      */
-    callAsync: (args: any[]) => Promise<any[]>;
+    callAsync: (args: any[] | undefined) => Promise<any[]>;
 
     /**
      * Index the object with the provided key

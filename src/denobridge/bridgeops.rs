@@ -110,14 +110,14 @@ impl LuaObject {
     // Synchronous function call opcall
     pub async fn call_sync(
         &self,
-        #[from_v8] args: Vec<ProxiedV8Value>,
+        #[from_v8] args: Option<Vec<ProxiedV8Value>>,
     ) -> Result<Vec<ProxiedV8Value>, deno_error::JsErrorBox> {
-        // If anything drops during the opcall, ensure we clean up references
+        let args = args.unwrap_or_default();
+        // If anything errors during the bridge call, ensure we clean up references
         let _guard = RefIdDropGuard::from_args(&args, &self.v8_internal_tx, &self.bridge);
 
-        let resp = self.bridge.call_function(
+        let resp = self.bridge.call_function_sync(
             self.lua_id,
-            false,
             args,
         )
         .await
@@ -129,17 +129,17 @@ impl LuaObject {
     #[async_method]
     #[rename("callAsync")]
     #[to_v8]
-    // Asynchronous function call opcall
+    // Asynchronous function call
     pub async fn call_async(
         &self,
-        #[from_v8] args: Vec<ProxiedV8Value>,
+        #[from_v8] args: Option<Vec<ProxiedV8Value>>,
     ) -> Result<Vec<ProxiedV8Value>, deno_error::JsErrorBox> {
-        // If anything drops during the opcall, ensure we clean up references
+        let args = args.unwrap_or_default();
+        // If anything errors during the bridge call, ensure we clean up references
         let _guard = RefIdDropGuard::from_args(&args, &self.v8_internal_tx, &self.bridge);
 
-        let resp = self.bridge.call_function(
+        let resp = self.bridge.call_function_async(
             self.lua_id,
-            true,
             args,
         )
         .await

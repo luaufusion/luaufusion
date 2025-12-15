@@ -46,6 +46,25 @@ impl LuaUserData for ForeignLuauValue {
             Ok(())
         }); 
 
+        methods.add_scheduler_async_method("index", async move |lua, this, key: mluau::Value| {
+            let mut ed = EmbedderDataContext::new(this.plc.ed);
+            let key = ProxiedLuauValue::from_luau_child(&this.plc, key, &mut ed)
+                .map_err(|e| mluau::Error::external(format!("Failed to proxy argument to ProxiedLuauValue: {}", e)))?;
+
+            let ret = this.bridge.index(
+                this.id,
+                key
+            )
+            .await
+            .map_err(|e| mluau::Error::external(format!("Bridge call failed: {}", e)))?;
+
+            let mut ed = EmbedderDataContext::new(this.plc.ed);
+            let v = ret.to_luau_child(&lua, &this.plc, &this.bridge, &mut ed)
+                .map_err(|e| mluau::Error::external(format!("Failed to convert return value to Lua: {}", e)))?;
+
+            Ok(v)
+        }); 
+
         methods.add_scheduler_async_method("callasync", async move |lua, this, args: mluau::MultiValue| {
             let mut p_args = Vec::with_capacity(args.len());
             let mut ed = EmbedderDataContext::new(this.plc.ed);
@@ -54,9 +73,8 @@ impl LuaUserData for ForeignLuauValue {
                 .map_err(|e| mluau::Error::external(format!("Failed to proxy argument to ProxiedLuauValue: {}", e)))?;
                 p_args.push(p_arg);
             }
-            let ret = this.bridge.call_function(
+            let ret = this.bridge.call_function_async(
                 this.id,
-                true,
                 p_args
             )
             .await
@@ -81,9 +99,8 @@ impl LuaUserData for ForeignLuauValue {
                 .map_err(|e| mluau::Error::external(format!("Failed to proxy argument to ProxiedLuauValue: {}", e)))?;
                 p_args.push(p_arg);
             }
-            let ret = this.bridge.call_function(
+            let ret = this.bridge.call_function_sync(
                 this.id,
-                false,
                 p_args
             )
             .await

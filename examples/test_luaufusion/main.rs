@@ -92,10 +92,9 @@ fn main() {
 export async function foo(luafunc) { 
     console.log("foo [func class]: ", luafunc, luafunc.constructor.name);
     console.log("foo, type:", `${luafunc.type}`);
-    console.log("fooCall", `${await globalThis.lua.callSync(luafunc)}`);
+    console.log("fooCall", `${await luafunc.callSync()}`);
     console.log("hi");
-    console.log(await luafunc.testApi([123, 456]))
-    return 123 + (await globalThis.lua.callAsync(luafunc));
+    return 123 + (await luafunc.callAsync())[0];
 }
 
 export function s(s) {
@@ -164,9 +163,9 @@ export function testEmbedderJson(evj) {
 
 export async function tablepropget(obj) {
     console.log("In tablepropget", obj);
-    let key = await globalThis.lua.get(obj, "foo");
+    let key = await obj.get("foo");
     console.log("Got foo key:", key);
-    let key2 = await globalThis.lua.get(obj, {});
+    let key2 = await obj.get({});
     console.log("Got non-existent key:", key2);
     return key;
 }
