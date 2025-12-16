@@ -5,13 +5,11 @@ use std::rc::Rc;
 //use deno_core::error::{CoreError, CoreErrorKind};
 use deno_core::v8::CreateParams;
 use deno_core::v8;
-use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
 use super::{
     modloader::FusionModuleLoader,
 };
-use crate::denobridge::bridge::V8InternalMessage;
 use crate::denobridge::objreg::V8ObjectRegistry;
 use crate::luau::bridge::LuaBridgeServiceClient;
 use crate::luau::embedder_api::EmbedderData;
@@ -29,7 +27,6 @@ const _: () = {
 #[derive(Clone)]
 pub struct CommonState {
     pub(super) bridge: LuaBridgeServiceClient<V8IsolateManagerServer>,
-    pub(super) v8_internal_tx: UnboundedSender<V8InternalMessage>,
     pub(super) proxy_client: ProxyV8Client,
     pub(super) ed: EmbedderData,
 }
@@ -157,7 +154,7 @@ impl V8IsolateManagerInner {
         }
     }
 
-    pub fn new(bridge: LuaBridgeServiceClient<V8IsolateManagerServer>, ed: EmbedderData, loader: FusionModuleLoader, v8_internal_tx: UnboundedSender<V8InternalMessage>) -> Self {
+    pub fn new(bridge: LuaBridgeServiceClient<V8IsolateManagerServer>, ed: EmbedderData, loader: FusionModuleLoader) -> Self {
         let runtime = Self::setup_runtime(&ed, loader);
 
         let common_state = CommonState {
@@ -165,7 +162,6 @@ impl V8IsolateManagerInner {
             proxy_client: ProxyV8Client {
                 obj_registry: runtime.obj_registry,
             },
-            v8_internal_tx,
             ed
         };
 

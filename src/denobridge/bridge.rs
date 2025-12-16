@@ -10,7 +10,6 @@ use deno_core::{PollEventLoopOptions, v8};
 use futures_util::stream::FuturesUnordered;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc::unbounded_channel;
 
 use crate::denobridge::modloader::FusionModuleLoader;
 use crate::denobridge::objreg::{V8ObjectRegistry, V8ObjectRegistryID};
@@ -244,13 +243,6 @@ impl V8ObjectOp {
         }
     }
 }
-
-/// Sent when v8 wants to drop an object from v8 itself (but *may* be on a different (GC) thread)
-pub enum V8InternalMessage {
-    V8ObjectDrop {
-        ids: Vec<V8ObjectRegistryID>,
-    }
-}
  
 #[derive(Clone)]
 pub struct V8IsolateManagerClient {}
@@ -271,13 +263,11 @@ impl ConcurrentlyExecute for V8IsolateManagerClient {
     ) {
         let (tx, mut rx) = client_ctx.multi();
         data.messenger_tx.client(&client_ctx).send(tx).unwrap();
-        let (v8_internal_tx, mut v8_internal_rx) = unbounded_channel::<V8InternalMessage>();
 
         let mut inner = V8IsolateManagerInner::new(
             LuaBridgeServiceClient::new(client_ctx.clone(), data.lua_bridge_tx, data.ed),
             data.ed,
             FusionModuleLoader::new(data.vfs.into_iter().map(|(x, y)| (x, y.into()))),
-            v8_internal_tx
         );
 
         let mut evaluated_modules = HashMap::new();
@@ -432,40 +422,6 @@ impl ConcurrentlyExecute for V8IsolateManagerClient {
                         Err(e) => {
                             eprintln!("Error receiving message in V8 isolate manager: {}", e);
                             //break;
-                        }
-                    }
-                }
-                msg = v8_internal_rx.recv() => {
-                    match msg {
-                        Some(V8InternalMessage::V8ObjectDrop { ids }) => {
-                            if cfg!(feature = "debug_message_print_enabled") {
-                                println!("V8 isolate received internal request to drop object ID {:?}", ids);
-                            }
-
-                            if !inner.common_state.ed.object_disposal_enabled {
-                                continue; // Skip disposal if disabled
-                            }
-
-                            let main_ctx = inner.deno.main_context();
-                            let isolate = inner.deno.v8_isolate();
-                            let scope = std::pin::pin!(v8::HandleScope::new(isolate));
-                            let mut scope = &mut scope.init();
-                            let main_ctx = v8::Local::new(&mut scope, main_ctx);
-                            let mut context_scope = &mut v8::ContextScope::new(scope, main_ctx);
-
-                            for id in ids {
-                                match inner.common_state.proxy_client.obj_registry.drop(&mut context_scope, id) {
-                                    Ok(_) => {},
-                                    Err(e) => {
-                                        eprintln!("Failed to drop V8 object from internal message: {}", e);
-                                    }
-                                }
-                            }
-                        }
-                        None => {
-                            // Channel closed
-                            println!("V8 isolate internal message channel closed");
-                            break;
                         }
                     }
                 }

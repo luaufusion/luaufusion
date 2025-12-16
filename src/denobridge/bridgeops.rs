@@ -1,11 +1,8 @@
 use std::sync::atomic::AtomicBool;
 
 use deno_core::{GarbageCollected, op2, v8};
-use tokio::sync::mpsc::UnboundedSender;
 
 use crate::denobridge::V8IsolateManagerServer;
-use crate::denobridge::bridge::V8InternalMessage;
-use crate::denobridge::objreg::V8ObjectRegistryID;
 use crate::luau::bridge::{LuaBridgeServiceClient, ObjectRegistryType};
 use crate::luau::LuauObjectRegistryID;
 use super::value::ProxiedV8Value;
@@ -14,7 +11,6 @@ pub(super) struct LuaObject {
     pub(super) lua_type: ObjectRegistryType,
     pub(super) lua_id: LuauObjectRegistryID,
     pub(super) bridge: LuaBridgeServiceClient<V8IsolateManagerServer>,
-    pub(super) v8_internal_tx: UnboundedSender<V8InternalMessage>,
     pub(super) dropped: AtomicBool,
 }
 
@@ -43,12 +39,11 @@ impl LuaObject {
     }
 
     /// Creates a new LuaObject with the specified type and ID
-    pub(super) fn new(lua_type: ObjectRegistryType, lua_id: LuauObjectRegistryID, bridge: LuaBridgeServiceClient<V8IsolateManagerServer>, v8_internal_tx: UnboundedSender<V8InternalMessage>) -> Self {
+    pub(super) fn new(lua_type: ObjectRegistryType, lua_id: LuauObjectRegistryID, bridge: LuaBridgeServiceClient<V8IsolateManagerServer>) -> Self {
         LuaObject {
             lua_type,
             lua_id,
             bridge,
-            v8_internal_tx,
             dropped: AtomicBool::new(false),
         }
     }
@@ -113,8 +108,10 @@ impl LuaObject {
         #[from_v8] args: Option<Vec<ProxiedV8Value>>,
     ) -> Result<Vec<ProxiedV8Value>, deno_error::JsErrorBox> {
         let args = args.unwrap_or_default();
-        // If anything errors during the bridge call, ensure we clean up references
-        let _guard = RefIdDropGuard::from_args(&args, &self.v8_internal_tx, &self.bridge);
+
+        // NOTE: It is highly tempting to put a scope guard and just GC all v8 refs however this is *usually*
+        // wrong. As long as the luau call finishes the ProxiedV8Value::to_luau correctly, the Luau side will automatically
+        // GC the v8 references by itself. In short, we don't need to do anything here regarding GC/object drop.
 
         let resp = self.bridge.call_function_sync(
             self.lua_id,
@@ -135,8 +132,10 @@ impl LuaObject {
         #[from_v8] args: Option<Vec<ProxiedV8Value>>,
     ) -> Result<Vec<ProxiedV8Value>, deno_error::JsErrorBox> {
         let args = args.unwrap_or_default();
-        // If anything errors during the bridge call, ensure we clean up references
-        let _guard = RefIdDropGuard::from_args(&args, &self.v8_internal_tx, &self.bridge);
+
+        // NOTE: It is highly tempting to put a scope guard and just GC all v8 refs however this is *usually*
+        // wrong. As long as the luau call finishes the ProxiedV8Value::to_luau correctly, the Luau side will automatically
+        // GC the v8 references by itself. In short, we don't need to do anything here regarding GC/object drop.
 
         let resp = self.bridge.call_function_async(
             self.lua_id,
@@ -156,8 +155,9 @@ impl LuaObject {
         &self,
         #[from_v8] key: ProxiedV8Value,
     ) -> Result<ProxiedV8Value, deno_error::JsErrorBox> {
-        // If anything drops during the opcall, ensure we clean up references
-        let _guard = RefIdDropGuard::from_arg(&key, &self.v8_internal_tx, &self.bridge);
+        // NOTE: It is highly tempting to put a scope guard and just GC all v8 refs however this is *usually*
+        // wrong. As long as the luau call finishes the ProxiedV8Value::to_luau correctly, the Luau side will automatically
+        // GC the v8 references by itself. In short, we don't need to do anything here regarding GC/object drop.
 
         let resp = self.bridge.index(
             self.lua_id,
@@ -187,70 +187,5 @@ impl LuaObject {
         self.dropped.store(true, std::sync::atomic::Ordering::SeqCst);
 
         Ok(())
-    }
-}
-
-struct RefIdDropGuard<'a> {
-    v8_refs: Vec<V8ObjectRegistryID>,
-    lua_refs: Vec<LuauObjectRegistryID>,
-    v8_internal_tx: &'a UnboundedSender<V8InternalMessage>,
-    bridge: &'a LuaBridgeServiceClient<V8IsolateManagerServer>,
-}
-
-impl<'a> RefIdDropGuard<'a> {
-    fn from_arg(
-        s: &ProxiedV8Value, 
-        v8_internal_tx: &'a UnboundedSender<V8InternalMessage>,
-        bridge: &'a LuaBridgeServiceClient<V8IsolateManagerServer>,
-    ) -> Self {
-        let (v8_refs, lua_refs) = s.get_refs();
-
-        Self {
-            v8_refs,
-            lua_refs,
-            v8_internal_tx,
-            bridge,
-        }
-    }
-
-    fn from_args(
-        args: &[ProxiedV8Value],
-        v8_internal_tx: &'a UnboundedSender<V8InternalMessage>,
-        bridge: &'a LuaBridgeServiceClient<V8IsolateManagerServer>,
-    ) -> Self {
-        let mut v8_refs = Vec::new();
-        let mut lua_refs = Vec::new();
-
-        for val in args {
-            let (v8_ref_list, lua_ref_list) = val.get_refs();
-            v8_refs.extend(v8_ref_list);
-            lua_refs.extend(lua_ref_list);
-        }
-
-        RefIdDropGuard {
-            v8_refs,
-            lua_refs,
-            v8_internal_tx,
-            bridge,
-        }
-    }
-}
-
-impl<'a> Drop for RefIdDropGuard<'a> {
-    fn drop(&mut self) {
-        // No fields to drop
-        if cfg!(feature = "debug_message_print_enabled") {
-            println!("RefIdDropGuard dropped with {} V8 refs and {} Lua refs", self.v8_refs.len(), self.lua_refs.len());
-        }
-
-        if !self.v8_refs.is_empty() && self.bridge.ed.object_disposal_enabled {
-            let refs = std::mem::take(&mut self.v8_refs);
-            let _ = self.v8_internal_tx.send(V8InternalMessage::V8ObjectDrop { ids: refs });
-        }
-
-        if !self.lua_refs.is_empty() {
-            let refs = std::mem::take(&mut self.lua_refs);
-            self.bridge.fire_request_disposes(refs);
-        }
     }
 }

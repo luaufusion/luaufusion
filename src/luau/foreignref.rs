@@ -13,6 +13,9 @@ pub struct ForeignRef<T: StandardProxyBridge> {
 
 impl<T: StandardProxyBridge> Drop for ForeignRef<T> {
     fn drop(&mut self) {
+        if cfg!(feature = "debug_message_print_enabled") {
+            println!("ForeignRef ({}) of type {} with ID {} dropped", std::any::type_name::<T>(), self.typ.into(), self.id.into());
+        }
         self.bridge.fire_request_disposes(vec![self.id]);
     }
 }

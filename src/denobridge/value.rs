@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use crate::base::Error;
 use crate::denobridge::bridgeops::LuaObject;
+use crate::luau::unknownvalue::UnknownHostLuauValue;
 use crate::{denobridge::bridge::V8ObjectRegistryType, luau::foreignref::ForeignRef};
 use crate::luau::embedder_api::EmbedderDataContext;
 use crate::denobridge::psuedoprimitive::ProxiedV8PsuedoPrimitive;
@@ -25,9 +26,15 @@ pub enum ProxiedV8Value {
     Psuedoprimitive(ProxiedV8PsuedoPrimitive),
 
     /// v8-owned stuff
+    /// 
+    /// Note that V8OwnedObjects are created by V8, creating/extracting within Luau does not affect refcount etc.
+    /// although creating from v8 will increase refcount 
     V8OwnedObject((V8ObjectRegistryType, V8ObjectRegistryID)), // (Type, ID) of the v8-owned object
 
     /// Source-owned stuff
+    /// 
+    /// Note that SourceOwnedObjects are created by the source, creating/extracting within v8 does not
+    /// affect refcount although creating from luau will increase refcount
     SourceOwnedObject((ObjectRegistryType, LuauObjectRegistryID)), // (Type, ID) of the source-owned object
 }
 
@@ -69,43 +76,6 @@ impl<'a> ToV8<'a> for ProxiedV8Value {
 }
 
 impl ProxiedV8Value {
-    /// Returns the list of owned object ids (refs) contained within this ProxiedV8Value
-    pub(crate) fn get_refs(&self) -> (Vec<V8ObjectRegistryID>, Vec<LuauObjectRegistryID>) {
-        match self {
-            ProxiedV8Value::Primitive(_) => (Vec::with_capacity(0), Vec::with_capacity(0)),
-            ProxiedV8Value::Psuedoprimitive(p) => {
-                match p {
-                    ProxiedV8PsuedoPrimitive::StaticList(v) => {
-                        let mut v8_ids = Vec::new();
-                        let mut luau_ids = Vec::new();
-                        for item in v {
-                            let (v8s, luaus) = item.get_refs();
-                            v8_ids.extend(v8s);
-                            luau_ids.extend(luaus);
-                        }
-                        (v8_ids, luau_ids)
-                    },
-                    ProxiedV8PsuedoPrimitive::StaticMap(v) => {
-                        let mut v8_ids = Vec::new();
-                        let mut luau_ids = Vec::new();
-                        for (key, value) in v {
-                            let (v8s_key, luau_ids_key) = key.get_refs();
-                            let (v8s_value, luau_ids_value) = value.get_refs();
-                            v8_ids.extend(v8s_key);
-                            v8_ids.extend(v8s_value);
-                            luau_ids.extend(luau_ids_key);
-                            luau_ids.extend(luau_ids_value);
-                        }
-                        (v8_ids, luau_ids)
-                    },
-                    _ => (Vec::with_capacity(0), Vec::with_capacity(0)),
-                }
-            },
-            ProxiedV8Value::V8OwnedObject((_, id)) => (vec![*id], Vec::with_capacity(0)),
-            ProxiedV8Value::SourceOwnedObject((_, id)) => (Vec::with_capacity(0), vec![*id]),
-        }
-    }
-
     /// Proxies a Luau value to a ProxiedV8Value
     pub(crate) fn from_luau(plc: &ProxyLuaClient, value: mluau::Value, ed: &mut EmbedderDataContext) -> Result<Self, Error> {
         let mut inner_ed_a = ed.nest_in_depth();
@@ -194,10 +164,19 @@ impl ProxiedV8Value {
             }
 
             // Source-owned values (lua values being proxied back from v8 to lua)
-            ProxiedV8Value::SourceOwnedObject((_typ, id)) => {
-                let value = plc.obj_registry.get(id)
-                    .map_err(|e| mluau::Error::external(format!("Failed to get object from registry: {}", e)))?;
-                Ok(value)
+            ProxiedV8Value::SourceOwnedObject((typ, id)) => {
+                match plc.obj_registry.get(id) {
+                    Ok(value) => return Ok(value),
+                    Err(e) => {
+                        // fallback to UnknownHostLuauValue
+                        //
+                        // this is important as it ensures we still represent the sent value and don't error
+                        // out unnecessarily, which could lead to handle leaks upstream
+                        let ud = UnknownHostLuauValue::new(id, typ, e);
+                        let ud = lua.create_userdata(ud)?;
+                        Ok(mluau::Value::UserData(ud))
+                    },
+                }
             }
         }
     }
@@ -260,7 +239,7 @@ impl ProxiedV8Value {
                 Ok(obj.into())
             }
             Self::SourceOwnedObject((typ, id)) => {
-                let lua_obj = LuaObject::new(typ, id, common_state.bridge.clone(), common_state.v8_internal_tx.clone());
+                let lua_obj = LuaObject::new(typ, id, common_state.bridge.clone());
                 Ok(lua_obj.to_v8(scope))
             },
         }
