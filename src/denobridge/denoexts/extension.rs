@@ -1,6 +1,8 @@
 use deno_core::Extension;
 use deno_core::extension;
 
+use crate::denobridge::denoexts::base_deno::web::deno_web;
+
 pub(crate) trait ExtensionTrait<A> {
     fn init(options: A) -> Extension;
 
@@ -97,22 +99,14 @@ pub(crate) fn webidl_extensions(is_snapshot: bool) -> Vec<Extension> {
     ]
 }
 
-extension!(
-    init_b64,
-    ops = [
-        super::base64_ops::op_base64_decode, super::base64_ops::op_base64_atob, super::base64_ops::op_base64_encode, super::base64_ops::op_base64_btoa,
-    ],
-    esm_entry_point = "ext:init_b64/base64.js",
-    esm = [ dir "src/denobridge/denoexts", "base64.js" ],
-);
-impl ExtensionTrait<()> for init_b64 {
+impl ExtensionTrait<()> for deno_web {
     fn init((): ()) -> Extension {
-        init_b64::init()
+        deno_web::init()
     }
 }
 
-pub(crate) fn b64_extensions(is_snapshot: bool) -> Vec<Extension> {
-    vec![init_b64::build((), is_snapshot)]
+pub(crate) fn web_extensions(is_snapshot: bool) -> Vec<Extension> {
+    vec![deno_web::build((), is_snapshot)]
 }
 
 extension!(
@@ -152,8 +146,8 @@ pub(crate) fn all_extensions(is_snapshot: bool) -> Vec<Extension> {
     let mut exts = vec![];
     exts.extend(console_extensions(is_snapshot));
     exts.extend(webidl_extensions(is_snapshot));
+    exts.extend(web_extensions(is_snapshot));
     exts.extend(url_extensions(is_snapshot));
-    exts.extend(b64_extensions(is_snapshot));
     exts.extend(structuredclone_extensions(is_snapshot));
     exts.extend(luau_bridge_extension(is_snapshot));
     exts

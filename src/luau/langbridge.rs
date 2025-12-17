@@ -97,7 +97,10 @@ impl<T: ProxyBridge> mluau::UserData for LangBridge<T> {
         methods.add_scheduler_async_method("receivebinary", async move |lua, this, _: ()| {
             let msg = this.bridge.receive_binary().await
                 .map_err(|e| mluau::Error::external(format!("Failed to receive text message: {}", e)))?;
-            let buf = lua.create_buffer(msg.into_vec())?;
+            let buf = match msg {
+                Some(msg) => mluau::Value::Buffer(lua.create_buffer(msg.into_vec())?),
+                None => mluau::Value::Nil,
+            };
             Ok(buf)
         });
 

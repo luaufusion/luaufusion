@@ -49,17 +49,7 @@ function btoa(data) {
     }
 }
 
-const writable = (value) => {
-    return {
-        'value': value,
-        writable: true,
-        enumerable: true,
-        configurable: true
-    }
-}
-const applyToGlobal = (properties) => Object.defineProperties(globalThis, properties);
-
-applyToGlobal({
-    atob: writable(atob),
-    btoa: writable(btoa),
-});
+export {
+    atob,
+    btoa
+};

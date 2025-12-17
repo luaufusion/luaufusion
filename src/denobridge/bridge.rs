@@ -366,20 +366,26 @@ impl ProxyBridge for V8IsolateManagerServer {
         Ok(())
     }
 
-    async fn receive_text(&self) -> Result<String, Error> {
+    async fn receive_text(&self) -> Result<Option<String>, Error> {
         if self.text_rx.try_lock().is_err() {
             return Err("Lua bridge text receiver is already locked".into());
         }
         let mut text_rx = self.text_rx.lock().await;
-        text_rx.recv().await.ok_or_else(|| "Lua bridge text channel closed".into())
+        match text_rx.recv().await {
+            Some(msg) => Ok(Some(msg)),
+            None => Ok(None),
+        }
     }
 
-    async fn receive_binary(&self) -> Result<serde_bytes::ByteBuf, Error> {
+    async fn receive_binary(&self) -> Result<Option<serde_bytes::ByteBuf>, Error> {
         if self.binary_rx.try_lock().is_err() {
             return Err("Lua bridge binary receiver is already locked".into());
         }
         let mut binary_rx = self.binary_rx.lock().await;
-        binary_rx.recv().await.ok_or_else(|| "Lua bridge binary channel closed".into())
+        match binary_rx.recv().await {
+            Some(msg) => Ok(Some(msg)),
+            None => Ok(None),
+        }
     }
 
     async fn eval_from_source(&self, modname: String) -> Result<(), crate::base::Error> {

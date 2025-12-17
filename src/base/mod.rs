@@ -32,10 +32,10 @@ pub trait ProxyBridge: 'static + Sized {
     async fn send_binary(&self, msg: serde_bytes::ByteBuf) -> Result<(), Error>;
 
     /// Receive a text message from the foreign language
-    async fn receive_text(&self) -> Result<String, Error>;
+    async fn receive_text(&self) -> Result<Option<String>, Error>;
 
     /// Receive a binary message from the foreign language
-    async fn receive_binary(&self) -> Result<serde_bytes::ByteBuf, Error>;
+    async fn receive_binary(&self) -> Result<Option<serde_bytes::ByteBuf>, Error>;
 
     /// Evaluates code (string) from the source Luau to the foreign language
     /// 

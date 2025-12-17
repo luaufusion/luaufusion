@@ -91,27 +91,39 @@ fn main() {
             ("foo.js".to_string(), r#"
 const eventHandler = async () => {
     let eb = globalThis.lua.eventBridge;
-    console.log("eb", eb);
-    console.log("Sending INIT message to Luau");
+    console.log("[v8] eb", eb);
+    console.log("[v8] Sending INIT message to Luau");
     try {
         eb.sendText("INIT")
     } catch(e) {
-        console.error("Failed to send INIT message to Luau", e);
+        console.error("[v8] Failed to send INIT message to Luau", e);
     }
-    console.log("Sent INIT message to Luau");
+    console.log("[v8] Sent INIT message to Luau");
     while(true) {
         let msg = await eb.receiveText();
-        console.log("Received message from Luau", msg);
+        console.log("[v8] Received message from Luau", msg);
         if(msg == "SHUTDOWN") {
-            console.log("Received SHUTDOWN, exiting event handler");
+            console.log("[v8] Received SHUTDOWN, exiting event handler");
             eb.sendText("DOWN");
             break;
+        } else if (msg == "GETBUFFER") {
+            console.log("[v8] Receiving buffer from Luau");
+            let buf = await eb.receiveBinary();
+            console.log("[v8] Received buffer from Luau", buf);
+            const decoder = new TextDecoder('utf-8');
+            console.log("[v8] Buffer from Luau as string:", decoder.decode(buf));
+            eb.sendText("BUFFERRECEIVED");
         }
     }
 };
 
+console.log(URL, URLPattern, new URL("https://google.com"))
 console.log(`In foo.js ${structuredClone({})}`);
-await eventHandler();
+try {
+    await eventHandler();
+} catch(e) {
+    console.error(`Error in foo.js ${e}`);
+}
 "#.to_string()),
     ("foo1.json".to_string(), "{\"foo\":1929}".to_string()),
     ("dir/foo.js".to_string(), r#"
@@ -188,12 +200,23 @@ local v8 = ...
 task.spawn(function() 
     while true do
         local msg = v8:receivetext()
-        print("Received from v8:", msg)
+        if not msg then
+            print("[Luau] Failed to receive message from v8")
+            break
+        end
+        print("[Luau] Received from v8:", msg)
         if msg == "INIT" then
-            print("Sending SHUTDOWN to v8")
+            -- Send a buffer to v8
+            print("[Luau] Sending buffer to v8")
+            local buf = buffer.fromstring("Hello from Luau!")
+            v8:sendtext("GETBUFFER")
+            v8:sendbinary(buf)
+            continue
+        elseif msg == "BUFFERRECEIVED" then
+            print("[Luau] Sending SHUTDOWN to v8")
             v8:sendtext("SHUTDOWN")
         elseif msg == "DOWN" then
-            print("Received DOWN message, exiting loop")
+            print("[Luau] Received DOWN message, exiting loop")
             break
         end
     end

@@ -65,22 +65,30 @@ impl EventBridge {
     #[async_method]
     #[rename("receiveText")]
     #[string]
-    async fn receive_text(&self) -> Result<String, deno_error::JsErrorBox> {
+    async fn receive_text(&self) -> Result<Option<String>, deno_error::JsErrorBox> {
+        if self.text_rx.try_lock().is_err() {
+            return Err(deno_error::JsErrorBox::generic("Text message channel is already locked".to_string()));
+        }
+
         let mut text_rx = self.text_rx.lock().await;
         match text_rx.recv().await {
-            Some(msg) => Ok(msg),
-            None => Err(deno_error::JsErrorBox::generic("Text message channel closed".to_string())),
+            Some(msg) => Ok(Some(msg)),
+            None => Ok(None),
         }
     }
 
     #[async_method]
     #[rename("receiveBinary")]
-    #[arraybuffer]
-    async fn receive_binary(&self) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+    #[buffer]
+    async fn receive_binary(&self) -> Result<Option<Vec<u8>>, deno_error::JsErrorBox> {
+        if self.binary_rx.try_lock().is_err() {
+            return Err(deno_error::JsErrorBox::generic("Binary message channel is already locked".to_string()));
+        }
+
         let mut binary_rx = self.binary_rx.lock().await;
         match binary_rx.recv().await {
-            Some(msg) => Ok(msg.into_vec()),
-            None => Err(deno_error::JsErrorBox::generic("Binary message channel closed".to_string())),
+            Some(msg) => Ok(Some(msg.into_vec())),
+            None => Ok(None),
         }   
     }
 }

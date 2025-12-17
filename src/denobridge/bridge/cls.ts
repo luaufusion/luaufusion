@@ -15,10 +15,10 @@ interface Bridge {
     /**
      * Receive a text message from the bridge
     */
-    receiveText(): Promise<string>;
+    receiveText(): Promise<string | undefined>;
 
     /**
      * Receive a binary message (ArrayBuffer) from the bridge
      */
-    receiveBinary(): Promise<ArrayBuffer>;
+    receiveBinary(): Promise<Uint8Array | undefined>;
 }
