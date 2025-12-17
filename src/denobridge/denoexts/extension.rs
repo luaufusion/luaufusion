@@ -133,10 +133,10 @@ pub(crate) fn structuredclone_extensions(is_snapshot: bool) -> Vec<Extension> {
 extension!(
     luau_bridge,
     objects = [
-        crate::denobridge::bridgeops::LuaObject,
+        crate::denobridge::event::EventBridge,
     ],
     esm_entry_point = "ext:luau_bridge/cls.js",
-    esm = [ dir "src/denobridge/bridge", "cls.js", "objreg.js" ],
+    esm = [ dir "src/denobridge/bridge", "cls.js" ],
 );
 impl ExtensionTrait<()> for luau_bridge {
     fn init((): ()) -> Extension {

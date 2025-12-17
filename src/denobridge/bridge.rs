@@ -1,25 +1,24 @@
-use super::value::ProxiedV8Value;
-
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
 use concurrentlyexec::{ConcurrentExecutor, ConcurrentExecutorState, ConcurrentlyExecute, MultiSender, OneshotSender, ProcessOpts};
-use deno_core::{PollEventLoopOptions, v8};
+use deno_core::PollEventLoopOptions;
 use futures_util::stream::FuturesUnordered;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
+use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
+use crate::denobridge::inner::EventBridgeSetupData;
 use crate::denobridge::modloader::FusionModuleLoader;
-use crate::denobridge::objreg::{V8ObjectRegistry, V8ObjectRegistryID};
-use crate::denobridge::primitives::ProxiedV8Primitive;
 use crate::luau::bridge::{
-    LuaBridgeMessage, LuaBridgeService, LuaBridgeServiceClient, ProxyLuaClient,
+    LuaBridgeMessage, LuaBridgeService, LuaBridgeServiceClient,
 };
 
-use crate::base::{Error, ProxyBridge, ProxyBridgeWithMultiprocessExt, ProxyBridgeWithStringExt, ShutdownTimeouts, StandardProxyBridge};
-use crate::luau::embedder_api::{EmbedderData, EmbedderDataContext};
+use crate::base::{Error, ProxyBridge, ProxyBridgeWithMultiprocessExt, ShutdownTimeouts};
+use crate::luau::embedder_api::EmbedderData;
 use super::inner::V8IsolateManagerInner;
 
 /// Minimum heap size for V8 isolates
@@ -29,57 +28,22 @@ pub const MIN_HEAP_LIMIT: usize = 10 * 1024 * 1024; // 10MB
 /// Helpful to avoid common user errors like running a parallel luau child with a v8 server instead of a v8 child
 pub const V8_MESSAGE_MAGIC: usize = 1;
 
-#[derive(Clone, Copy, Serialize, Deserialize)]
-pub enum V8ObjectRegistryType {
-    ArrayBuffer,
-    Object,
-    Function,
-    Promise,
-}
-
-impl Into<&'static str> for V8ObjectRegistryType {
-    fn into(self) -> &'static str {
-        self.type_name()
-    }  
-}
-
-impl V8ObjectRegistryType {
-    pub fn type_name(&self) -> &'static str {
-        match self {
-            V8ObjectRegistryType::Function => "Function",
-            V8ObjectRegistryType::Object => "Object",
-            V8ObjectRegistryType::ArrayBuffer => "ArrayBuffer",
-            V8ObjectRegistryType::Promise => "Promise",
-        }
-    }  
-}
-
-/// The client side state for proxying Lua values
-/// 
-/// This struct is not thread safe and must be kept on the Lua side
-#[derive(Clone)]
-pub struct ProxyV8Client {
-    pub obj_registry: V8ObjectRegistry
-}
-
 #[derive(Serialize, Deserialize)]
 /// Internal representation of a message that can be sent to the V8 isolate manager
 pub(super) enum V8IsolateManagerMessage {
     CodeExec {
         modname: String,
-        resp: OneshotSender<Result<Vec<ProxiedV8Value>, String>>,
+        resp: OneshotSender<Result<(), String>>,
         magic: usize,
     },
-    OpCall {
-        obj_id: V8ObjectRegistryID,
-        op: V8ObjectOp,
-        args: Vec<ProxiedV8Value>,
-        resp: OneshotSender<Result<Vec<ProxiedV8Value>, String>>,
+    SendText {
+        msg: String,
+        resp: OneshotSender<Result<(), String>>,
         magic: usize,
     },
-    DropObject {
-        ids: Vec<V8ObjectRegistryID>,
-        resp: Option<OneshotSender<Result<(), String>>>,
+    SendBinary {
+        msg: serde_bytes::ByteBuf,
+        resp: OneshotSender<Result<(), String>>,
         magic: usize,
     },
     Shutdown,
@@ -96,7 +60,7 @@ pub(super) struct CodeExecMessage {
 }
 
 impl V8IsolateSendableMessage for CodeExecMessage {
-    type Response = Result<Vec<ProxiedV8Value>, String>;
+    type Response = Result<(), String>;
     fn to_message(self, resp: OneshotSender<Self::Response>) -> V8IsolateManagerMessage {
         V8IsolateManagerMessage::CodeExec {
             modname: self.modname,
@@ -106,35 +70,31 @@ impl V8IsolateSendableMessage for CodeExecMessage {
     }
 }
 
-pub(super) struct OpCallMessage {
-    pub obj_id: V8ObjectRegistryID,
-    pub op: V8ObjectOp,
-    pub args: Vec<ProxiedV8Value>,
+pub(super) struct SendTextMessage {
+    pub msg: String,
 }
 
-impl V8IsolateSendableMessage for OpCallMessage {
-    type Response = Result<Vec<ProxiedV8Value>, String>;
+impl V8IsolateSendableMessage for SendTextMessage {
+    type Response = Result<(), String>;
     fn to_message(self, resp: OneshotSender<Self::Response>) -> V8IsolateManagerMessage {
-        V8IsolateManagerMessage::OpCall {
-            obj_id: self.obj_id,
-            op: self.op,
-            args: self.args,
+        V8IsolateManagerMessage::SendText {
+            msg: self.msg,
             resp,
             magic: V8_MESSAGE_MAGIC,
         }
     }
 }
 
-pub(super) struct DropObjectMessage {
-    pub ids: Vec<V8ObjectRegistryID>,
+pub(super) struct SendBinaryMessage {
+    pub msg: serde_bytes::ByteBuf,
 }
 
-impl V8IsolateSendableMessage for DropObjectMessage {
+impl V8IsolateSendableMessage for SendBinaryMessage {
     type Response = Result<(), String>;
     fn to_message(self, resp: OneshotSender<Self::Response>) -> V8IsolateManagerMessage {
-        V8IsolateManagerMessage::DropObject {
-            ids: self.ids,
-            resp: Some(resp),
+        V8IsolateManagerMessage::SendBinary {
+            msg: self.msg,
+            resp,
             magic: V8_MESSAGE_MAGIC,
         }
     }
@@ -148,101 +108,6 @@ impl V8IsolateSendableMessage for ShutdownMessage {
         V8IsolateManagerMessage::Shutdown
     }
 }
-
-#[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub enum V8ObjectOp {
-    ObjectGetProperty,
-    FunctionCall,
-}
-
-enum OpCallRet {
-    ProxiedMulti(Vec<ProxiedV8Value>),
-    FunctAsync((v8::Global<v8::Function>, Vec<v8::Global<v8::Value>>))
-}
-
-impl V8ObjectOp {
-    fn run<'s>(self, inner: &mut V8IsolateManagerInner, obj_id: V8ObjectRegistryID, args: Vec<ProxiedV8Value>) -> Result<OpCallRet, Error> {        
-        match self {
-            Self::FunctionCall => {
-                let main_ctx = inner.deno.main_context();
-                let isolate = inner.deno.v8_isolate();
-                let scope = std::pin::pin!(v8::HandleScope::new(isolate));
-                let mut scope = &mut scope.init();
-                let main_ctx = v8::Local::new(&mut scope, main_ctx);
-                let mut context_scope = &mut v8::ContextScope::new(scope, main_ctx);
-
-                let func = match inner.common_state.proxy_client.obj_registry.get(context_scope, obj_id, |tc, v| {
-                    if !v.is_function() {
-                        return Err("Object is not a function".into());
-                    }
-                    let func = v8::Local::<v8::Function>::try_from(v)
-                        .map_err(|e| format!("Failed to convert V8 value to function: {}", e))?;
-                    Ok(v8::Global::new(tc, func))
-                }) {
-                    Ok(o) => o,
-                    Err(e) => return Err(format!("Failed to get V8 object from registry: {}", e).into()),
-                };
-
-                let mut v8_args = Vec::with_capacity(args.len());
-                let mut ed = EmbedderDataContext::new(inner.common_state.ed);
-                for arg in args {
-                    let v8_arg = match arg.to_v8(&mut context_scope, &inner.common_state, &mut ed) {
-                        Ok(v) => v,
-                        Err(e) => return Err(format!("Failed to convert argument to V8: {}", e).into()),
-                    };
-                    v8_args.push(v8::Global::new(&mut context_scope, v8_arg));
-                }
-
-                Ok(OpCallRet::FunctAsync((func, v8_args)))
-            }
-            Self::ObjectGetProperty => {
-                let main_ctx = inner.deno.main_context();
-                let isolate = inner.deno.v8_isolate();
-                let scope = std::pin::pin!(v8::HandleScope::new(isolate));
-                let mut scope = &mut scope.init();
-                let main_ctx = v8::Local::new(&mut scope, main_ctx);
-                let mut context_scope = &mut v8::ContextScope::new(scope, main_ctx);
-
-                if args.len() != 1 {
-                    return Err("ObjectGetProperty requires exactly one argument".into());
-                }
-                let key = match args.into_iter().next().unwrap() {
-                    ProxiedV8Value::Primitive(p) => p,
-                    _ => return Err("ObjectGetProperty key must be a primitive".into()),
-                };
-                let mut ed_a = EmbedderDataContext::new(inner.common_state.ed);
-                let key = match key.to_v8(&mut context_scope, &mut ed_a) {
-                    Ok(v) => v,
-                    Err(e) => return Err(format!("Failed to convert key to V8: {}", e).into()),
-                };
-
-                let obj = match inner.common_state.proxy_client.obj_registry.get(context_scope, obj_id, |tc, v| {
-                    if !v.is_object() {
-                        return Err("Object is not an object".into());
-                    }
-                    let obj = v8::Local::<v8::Object>::try_from(v)
-                        .map_err(|e| format!("Failed to convert V8 value to object: {}", e))?;
-                    Ok(v8::Global::new(tc, obj))
-                }) {
-                    Ok(o) => o,
-                    Err(e) => return Err(format!("Failed to get V8 object from registry: {}", e).into()),
-                };
-
-                let obj = v8::Local::new(&mut context_scope, &obj);
-
-                let prop_names = obj.get(&mut context_scope, key)
-                    .ok_or("Failed to get property names")?;
-                
-                let mut ed_b = EmbedderDataContext::new(inner.common_state.ed);
-
-                let prop_names = ProxiedV8Value::from_v8(&mut context_scope, prop_names.into(), &inner.common_state, &mut ed_b)
-                    .map_err(|e| format!("Failed to proxy property names: {}", e))?;
-
-                Ok(OpCallRet::ProxiedMulti(vec![prop_names]))
-            }
-        }
-    }
-}
  
 #[derive(Clone)]
 pub struct V8IsolateManagerClient {}
@@ -251,7 +116,7 @@ pub struct V8IsolateManagerClient {}
 pub struct V8BootstrapData {
     ed: EmbedderData,
     messenger_tx: OneshotSender<MultiSender<V8IsolateManagerMessage>>,
-    lua_bridge_tx: MultiSender<LuaBridgeMessage<V8IsolateManagerServer>>,
+    lua_bridge_tx: MultiSender<LuaBridgeMessage>,
     vfs: HashMap<String, String>,
 }
 
@@ -261,18 +126,24 @@ impl ConcurrentlyExecute for V8IsolateManagerClient {
         data: Self::BootstrapData,
         client_ctx: concurrentlyexec::ClientContext
     ) {
+        let (send_text_tx, send_text_rx) = unbounded_channel();
+        let (send_binary_tx, send_binary_rx) = unbounded_channel();
+
         let (tx, mut rx) = client_ctx.multi();
         data.messenger_tx.client(&client_ctx).send(tx).unwrap();
 
         let mut inner = V8IsolateManagerInner::new(
-            LuaBridgeServiceClient::new(client_ctx.clone(), data.lua_bridge_tx, data.ed),
+            LuaBridgeServiceClient::new(client_ctx.clone(), data.lua_bridge_tx),
             data.ed,
             FusionModuleLoader::new(data.vfs.into_iter().map(|(x, y)| (x, y.into()))),
+            EventBridgeSetupData {
+                text_rx: send_text_rx,
+                binary_rx: send_binary_rx,
+            }
         );
 
         let mut evaluated_modules = HashMap::new();
         let mut module_evaluate_queue = FuturesUnordered::new();
-        let mut op_call_queue = FuturesUnordered::new();
 
         loop {
             tokio::select! {
@@ -284,35 +155,9 @@ impl ConcurrentlyExecute for V8IsolateManagerClient {
                                 continue;
                             }
 
-                            if let Some(module_id) = evaluated_modules.get(&modname) {
-                                // Module already evaluated, just return the namespace object
-                                let namespace_obj = match inner.deno.get_module_namespace(*module_id) {
-                                    Ok(obj) => obj,
-                                    Err(e) => {
-                                        let _ = resp.client(&client_ctx).send(Err(format!("Failed to get module namespace: {}", e).into()));
-                                        continue;
-                                    }
-                                };
-                                // Proxy the namespace object to a ProxiedV8Value
-                                let proxied = {
-                                    let main_ctx = inner.deno.main_context();
-                                    let isolate = inner.deno.v8_isolate();
-                                    let scope = std::pin::pin!(v8::HandleScope::new(isolate));
-                                    let mut scope = &mut scope.init();
-                                    let main_ctx = v8::Local::new(&mut scope, main_ctx);
-                                    let context_scope = &mut v8::ContextScope::new(scope, main_ctx);
-                                    let namespace_obj = v8::Local::new(context_scope, namespace_obj);
-                                    let mut ed = EmbedderDataContext::new(inner.common_state.ed);
-                                    match ProxiedV8Value::from_v8(context_scope, namespace_obj.into(), &inner.common_state, &mut ed) {
-                                        Ok(v) => v,
-                                        Err(e) => {
-                                            let _ = resp.client(&client_ctx).send(Err(format!("Failed to proxy module namespace: {}", e).into()));
-                                            continue;
-                                        }
-                                    }
-                                };
-
-                                let _ = resp.client(&client_ctx).send(Ok(vec![proxied]));
+                            if evaluated_modules.contains_key(&modname) {
+                                // Module already evaluated, just return early
+                                let _ = resp.client(&client_ctx).send(Ok(()));
                                 continue;
                             }
 
@@ -345,74 +190,24 @@ impl ConcurrentlyExecute for V8IsolateManagerClient {
                                 (modname, module_id, resp)
                             });
                         },
-                        Ok(V8IsolateManagerMessage::OpCall { obj_id, op, args, resp, magic }) => {
+                        Ok(V8IsolateManagerMessage::SendText { msg, resp, magic }) => {
                             if magic != V8_MESSAGE_MAGIC {
                                 let _ = resp.client(&client_ctx).send(Err("Invalid magic number in CodeExec message; are you sure you're running a V8 child process?".into()));
                                 continue;
                             }
 
-                            let fut = match op.run(&mut inner, obj_id, args) {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    let _ = resp.client(&client_ctx).send(Err(format!("Failed to run op: {}", e).into()));
-                                    continue;
-                                }
-                            };
-                            match fut {
-                                OpCallRet::ProxiedMulti(v) => {
-                                    let _ = resp.client(&client_ctx).send(Ok(v));
-                                }
-                                OpCallRet::FunctAsync((func, args)) => {
-                                    let fut = inner.deno.call_with_args(&func, &args);
-                                    op_call_queue.push(async move {
-                                        let result = fut.await;
-                                        (result, resp)
-                                    });
-                                }
-                            }
+                            let _ = send_text_tx.send(msg);
+                            let _ = resp.client(&client_ctx).send(Ok(()));
                         },
-                        Ok(V8IsolateManagerMessage::DropObject { ids, resp, magic }) => {
+                        Ok(V8IsolateManagerMessage::SendBinary { msg, resp, magic }) => {
                             if magic != V8_MESSAGE_MAGIC {
-                                if let Some(resp) = resp {
-                                    let _ = resp.client(&client_ctx).send(Err("Invalid magic number in DropObject message; are you sure you're running a V8 child process?".into()));
-                                }
+                                let _ = resp.client(&client_ctx).send(Err("Invalid magic number in CodeExec message; are you sure you're running a V8 child process?".into()));
                                 continue;
                             }
 
-                            if cfg!(feature = "debug_message_print_enabled") {
-                                println!("Host V8 received request to drop object ID {:?}", ids);
-                            }
-
-                            if !inner.common_state.ed.object_disposal_enabled {
-                                continue; // Skip disposal if disabled
-                            }
-
-                            let main_ctx = inner.deno.main_context();
-                            let isolate = inner.deno.v8_isolate();
-                            let scope = std::pin::pin!(v8::HandleScope::new(isolate));
-                            let mut scope = &mut scope.init();
-                            let main_ctx = v8::Local::new(&mut scope, main_ctx);
-                            let mut context_scope = &mut v8::ContextScope::new(scope, main_ctx);
-
-                            let mut errors = Vec::new();
-                            for id in ids {
-                                match inner.common_state.proxy_client.obj_registry.drop(&mut context_scope, id) {
-                                    Ok(_) => {},
-                                    Err(e) => {
-                                        errors.push(e);
-                                    }
-                                }
-                            }
-
-                            if let Some(resp) = resp {
-                                if errors.is_empty() {
-                                    let _ = resp.client(&client_ctx).send(Ok(()));
-                                } else {
-                                    let err_msg = format!("Failed to drop some V8 objects: {:?}", errors);
-                                    let _ = resp.client(&client_ctx).send(Err(err_msg));
-                                }
-                            }
-                        }
+                            let _ = send_binary_tx.send(msg);
+                            let _ = resp.client(&client_ctx).send(Ok(()));
+                        },
                         Ok(V8IsolateManagerMessage::Shutdown) => {
                             if cfg!(feature = "debug_message_print_enabled") {
                                 println!("V8 isolate manager received shutdown message");
@@ -437,65 +232,13 @@ impl ConcurrentlyExecute for V8IsolateManagerClient {
                 }) => {
                     tokio::task::yield_now().await;
                 },
-                Some((result, resp)) = op_call_queue.next() => {
-                    match result {
-                        Ok(res) => {
-                            let main_ctx = inner.deno.main_context();
-                            let isolate = inner.deno.v8_isolate();
-                            let scope = std::pin::pin!(v8::HandleScope::new(isolate));
-                            let mut scope = &mut scope.init();
-                            let main_ctx = v8::Local::new(&mut scope, main_ctx);
-                            let mut context_scope = &mut v8::ContextScope::new(scope, main_ctx);
-                            let res = v8::Local::new(&mut context_scope, res);
-                            let mut ed = EmbedderDataContext::new(inner.common_state.ed);
-                            let res = ProxiedV8Value::from_v8(context_scope, res, &inner.common_state, &mut ed);
-                            match res {
-                                Ok(v) => {
-                                    let _ = resp.client(&client_ctx).send(Ok(vec![v]));
-                                }
-                                Err(e) => {
-                                    let _ = resp.client(&client_ctx).send(Err(format!("Failed to proxy function result: {}", e).into()));
-                                }
-                            }
-                        },
-                        Err(e) => {
-                            let _ = resp.client(&client_ctx).send(Err(e.to_string()));
-                        }
-                    }
-                }
                 Some((modname, result, resp)) = module_evaluate_queue.next() => {
                     let Ok(result) = result else {
                         let _ = resp.client(&client_ctx).send(Err("Failed to evaluate module".to_string().into()));
                         continue;
                     };
                     evaluated_modules.insert(modname, result);
-                    let namespace_obj = match inner.deno.get_module_namespace(result) {
-                        Ok(obj) => obj,
-                        Err(e) => {
-                            let _ = resp.client(&client_ctx).send(Err(format!("Failed to get module namespace: {}", e).into()));
-                            continue;
-                        }
-                    };
-                    // Proxy the namespace object to a ProxiedV8Value
-                    let proxied = {
-                        let main_ctx = inner.deno.main_context();
-                        let isolate = inner.deno.v8_isolate();
-                        let scope = std::pin::pin!(v8::HandleScope::new(isolate));
-                        let mut scope = &mut scope.init();
-                        let main_ctx = v8::Local::new(&mut scope, main_ctx);
-                        let context_scope = &mut v8::ContextScope::new(scope, main_ctx);
-                        let namespace_obj = v8::Local::new(context_scope, namespace_obj);
-                        let mut ed = EmbedderDataContext::new(inner.common_state.ed);
-                        match ProxiedV8Value::from_v8(context_scope, namespace_obj.into(), &inner.common_state, &mut ed) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                let _ = resp.client(&client_ctx).send(Err(format!("Failed to proxy module namespace: {}", e).into()));
-                                continue;
-                            }
-                        }
-                    };
-
-                    let _ = resp.client(&client_ctx).send(Ok(vec![proxied]));
+                    let _ = resp.client(&client_ctx).send(Ok(()));
                 }
             }
         }
@@ -507,10 +250,10 @@ pub struct V8IsolateManagerServerInner {
     messenger: Arc<MultiSender<V8IsolateManagerMessage>>,
 }
 
-#[derive(Clone)]
 pub struct V8IsolateManagerServer {
     inner: Rc<V8IsolateManagerServerInner>,
-    ed: EmbedderData,
+    text_rx: Mutex<UnboundedReceiver<String>>,
+    binary_rx: Mutex<UnboundedReceiver<serde_bytes::ByteBuf>>,
 }
 
 impl std::ops::Deref for V8IsolateManagerServer {
@@ -526,7 +269,6 @@ impl V8IsolateManagerServer {
         cs_state: ConcurrentExecutorState<V8IsolateManagerClient>, 
         ed: EmbedderData, 
         process_opts: ProcessOpts,
-        plc: ProxyLuaClient,
         vfs: HashMap<String, String>,
     ) -> Result<Self, crate::base::Error> {
         let (executor, (lua_bridge_rx, ms_rx)) = ConcurrentExecutor::new(
@@ -545,22 +287,21 @@ impl V8IsolateManagerServer {
         ).await.map_err(|e| format!("Failed to create V8 isolate manager executor: {}", e))?;
         let messenger = ms_rx.recv().await.map_err(|e| format!("Failed to receive messenger: {}", e))?;
 
+        let (lua_bridge_service, handle) = LuaBridgeService::new(lua_bridge_rx);
+
+        let ctoken = executor.get_state().cancel_token.clone();
+        tokio::task::spawn_local(async move {
+            lua_bridge_service.run(ctoken).await;
+        });
+
         let self_ret = Self { 
             inner: Rc::new(V8IsolateManagerServerInner {
                 executor: Arc::new(executor), 
                 messenger: Arc::new(messenger),
             }),
-            ed
-         };
-        let self_ref = self_ret.clone();
-        tokio::task::spawn_local(async move {
-            let lua_bridge_service = LuaBridgeService::new(
-                self_ref,
-                lua_bridge_rx,
-                ed,
-            );
-            lua_bridge_service.run(plc).await;
-        });
+            text_rx: Mutex::new(handle.text_rx),
+            binary_rx: Mutex::new(handle.binary_rx),
+        };
 
         Ok(self_ret)
     }
@@ -600,7 +341,6 @@ impl V8IsolateManagerServer {
 
 
 impl ProxyBridge for V8IsolateManagerServer {
-    type ValueType = ProxiedV8Value;
     type ConcurrentlyExecuteClient = V8IsolateManagerClient;
 
     fn name() -> &'static str {
@@ -611,22 +351,38 @@ impl ProxyBridge for V8IsolateManagerServer {
         cs_state: ConcurrentExecutorState<Self::ConcurrentlyExecuteClient>, 
         ed: EmbedderData,
         process_opts: ProcessOpts,
-        plc: ProxyLuaClient,
         vfs: HashMap<String, String>,
     ) -> Result<Self, crate::base::Error> {
-        Self::new(cs_state, ed, process_opts, plc, vfs).await        
+        Self::new(cs_state, ed, process_opts, vfs).await        
     }
 
-    fn to_source_lua_value(&self, lua: &mluau::Lua, value: Self::ValueType, plc: &ProxyLuaClient) -> Result<mluau::Value, Error> {
-        let mut ed = EmbedderDataContext::new(plc.ed);
-        Ok(value.to_luau(lua, plc, self, &mut ed).map_err(|e| e.to_string())?)
+    async fn send_text(&self, msg: String) -> Result<(), Error> {
+        self.send(SendTextMessage { msg }).await??;
+        Ok(())
     }
 
-    fn from_source_lua_value(&self, _lua: &mluau::Lua, plc: &ProxyLuaClient, value: mluau::Value, ed: &mut EmbedderDataContext) -> Result<Self::ValueType, crate::base::Error> {
-        Ok(ProxiedV8Value::from_luau(plc, value, ed).map_err(|e| e.to_string())?)
+    async fn send_binary(&self, msg: serde_bytes::ByteBuf) -> Result<(), Error> {
+        self.send(SendBinaryMessage { msg }).await??;
+        Ok(())
     }
 
-    async fn eval_from_source(&self, modname: String) -> Result<Vec<Self::ValueType>, crate::base::Error> {
+    async fn receive_text(&self) -> Result<String, Error> {
+        if self.text_rx.try_lock().is_err() {
+            return Err("Lua bridge text receiver is already locked".into());
+        }
+        let mut text_rx = self.text_rx.lock().await;
+        text_rx.recv().await.ok_or_else(|| "Lua bridge text channel closed".into())
+    }
+
+    async fn receive_binary(&self) -> Result<serde_bytes::ByteBuf, Error> {
+        if self.binary_rx.try_lock().is_err() {
+            return Err("Lua bridge binary receiver is already locked".into());
+        }
+        let mut binary_rx = self.binary_rx.lock().await;
+        binary_rx.recv().await.ok_or_else(|| "Lua bridge binary channel closed".into())
+    }
+
+    async fn eval_from_source(&self, modname: String) -> Result<(), crate::base::Error> {
         Ok(self.send(CodeExecMessage { modname }).await??)
     }
 
@@ -660,73 +416,6 @@ impl ProxyBridgeWithMultiprocessExt for V8IsolateManagerServer {
     /// Returns the executor for concurrently executing tasks on a separate process
     fn get_executor(&self) -> &ConcurrentExecutor<Self::ConcurrentlyExecuteClient> {
         self.executor.as_ref()
-    }
-}
-
-impl ProxyBridgeWithStringExt for V8IsolateManagerServer {
-    /// Creates the foreign language value type from a string
-    fn from_string(s: String) -> Self::ValueType {
-        ProxiedV8Value::Primitive(ProxiedV8Primitive::String(s))
-    }
-}
-
-impl StandardProxyBridge for V8IsolateManagerServer {
-    type ObjectRegistryID = V8ObjectRegistryID;
-    type ObjectRegistryType = V8ObjectRegistryType;
-
-    async fn function_call(
-        &self,
-        id: Self::ObjectRegistryID,
-        args: Vec<Self::ValueType>,
-    ) -> Result<Vec<Self::ValueType>, Error> {
-        Ok(self.send(OpCallMessage {
-            obj_id: id,
-            op: V8ObjectOp::FunctionCall,
-            args,
-        }).await??)
-    }
-
-    async fn get_property(
-        &self,
-        id: Self::ObjectRegistryID,
-        property: Self::ValueType,
-    ) -> Result<Self::ValueType, Error> {
-        Ok(self.send(OpCallMessage {
-            obj_id: id,
-            op: V8ObjectOp::ObjectGetProperty,
-            args: vec![property],
-        }).await??.into_iter().next().ok_or("No value returned from get_property".to_string())?)
-    }
-
-    async fn request_dispose(
-        &self,
-        id: Self::ObjectRegistryID,
-    ) -> Result<(), Error> {
-        if !self.ed.object_disposal_enabled {
-            return Ok(());
-        }
-
-        self.send(DropObjectMessage {
-            ids: vec![id],
-        }).await??;
-        Ok(())
-    }
-
-    fn fire_request_disposes(
-        &self,
-        id: Vec<Self::ObjectRegistryID>,
-    ) {
-        if !self.ed.object_disposal_enabled || !self.ed.automatic_object_disposal_enabled {
-            return;
-        }
-
-        let _ = self.messenger.server(self.executor.server_context()).send(
-            V8IsolateManagerMessage::DropObject {
-                ids: id,
-                resp: None,
-                magic: V8_MESSAGE_MAGIC,
-            }
-        );        
     }
 }
 

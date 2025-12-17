@@ -1,4 +1,4 @@
-use super::bridge::V8IsolateManagerServer;
+use super::event::EventBridge;
 
 use std::rc::Rc;
 
@@ -10,11 +10,10 @@ use tokio_util::sync::CancellationToken;
 use super::{
     modloader::FusionModuleLoader,
 };
-use crate::denobridge::objreg::V8ObjectRegistry;
 use crate::luau::bridge::LuaBridgeServiceClient;
 use crate::luau::embedder_api::EmbedderData;
 
-use super::bridge::{ProxyV8Client, MIN_HEAP_LIMIT};
+use super::bridge::MIN_HEAP_LIMIT;
 use super::denoexts;
 
 #[cfg(feature = "deno_include_snapshot")]
@@ -24,13 +23,6 @@ const _: () = {
     compile_error!("Including V8 snapshot in binary is only supported on Linux x86_64 targets at this time.");
 };
 
-#[derive(Clone)]
-pub struct CommonState {
-    pub(super) bridge: LuaBridgeServiceClient<V8IsolateManagerServer>,
-    pub(super) proxy_client: ProxyV8Client,
-    pub(super) ed: EmbedderData,
-}
-
 /// Internal manager for a single V8 isolate with a minimal Deno runtime.
 /// 
 /// This should not be used directly, use V8IsolateManager instead
@@ -38,12 +30,10 @@ pub struct CommonState {
 pub struct V8IsolateManagerInner {
     pub deno: deno_core::JsRuntime,
     pub cancellation_token: CancellationToken,
-    pub common_state: CommonState
 }
 
 pub struct SetupRuntime {
     pub deno: deno_core::JsRuntime,
-    pub obj_registry: V8ObjectRegistry,
     pub heap_exhausted_token: CancellationToken,
 }
 
@@ -52,7 +42,33 @@ pub struct SetupRuntimeForSnapshot {
     pub heap_exhausted_token: CancellationToken,
 }
 
+pub(super) struct EventBridgeSetupData {
+    pub(super) text_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+    pub(super) binary_rx: tokio::sync::mpsc::UnboundedReceiver<serde_bytes::ByteBuf>,
+}
+
 impl V8IsolateManagerInner {  
+    fn set_event_bridge<'a>(scope: &mut v8::PinScope<'a, '_>, ed: &EmbedderData, bridge: LuaBridgeServiceClient, ebsd: EventBridgeSetupData) -> Result<(), crate::base::Error> {
+        let event_bridge = EventBridge::new(
+            ed.clone(),
+            bridge,
+            ebsd.text_rx,
+            ebsd.binary_rx
+        );
+
+        let global = scope.get_current_context().global(scope);
+        let event_bridge_obj = deno_core::cppgc::make_cppgc_object(scope, event_bridge);
+        let lua_str = v8::String::new(scope, "lua").unwrap();
+        let lua_obj = global.get(scope, lua_str.into()).unwrap();
+        assert!(lua_obj.is_object());
+        let lua_obj = lua_obj.to_object(scope).unwrap();
+        let key = v8::String::new(scope, "eventBridge").unwrap();
+        lua_obj.set(scope, key.into(), event_bridge_obj.into()).unwrap();
+        assert!(lua_obj.set_integrity_level(scope, v8::IntegrityLevel::Frozen).unwrap());
+
+        Ok(())
+    }
+
     /// Sets up a new Deno runtime with the specified embedder data and module loader  
     pub fn setup_runtime_for_snapshot(loader: FusionModuleLoader) -> SetupRuntimeForSnapshot {
         let extensions = denoexts::extension::all_extensions(false);
@@ -91,7 +107,7 @@ impl V8IsolateManagerInner {
     }
 
     /// Sets up a new Deno runtime with the specified embedder data and module loader  
-    pub fn setup_runtime(ed: &EmbedderData, loader: FusionModuleLoader) -> SetupRuntime {
+    pub(super) fn setup_runtime(ed: &EmbedderData, loader: FusionModuleLoader, ebsd: EventBridgeSetupData, bridge: LuaBridgeServiceClient) -> SetupRuntime {
         let heap_limit = ed.heap_limit.max(MIN_HEAP_LIMIT);
 
         #[cfg(feature = "deno_include_snapshot")]
@@ -137,40 +153,29 @@ impl V8IsolateManagerInner {
             5 * current_value
         });
 
-        let obj_registry = {
+        {
             let main_ctx = deno.main_context();
             let isolate = deno.v8_isolate();
             let scope = std::pin::pin!(v8::HandleScope::new(isolate));
             let scope = &mut scope.init();
             let main_ctx = v8::Local::new(scope, main_ctx);
             let scope = &mut v8::ContextScope::new(scope, main_ctx);
-            V8ObjectRegistry::new(scope)
-        };
+
+            Self::set_event_bridge(scope, &ed, bridge.clone(), ebsd).expect("Failed to set event bridge");
+        }
 
         SetupRuntime {
             deno,
-            obj_registry,
             heap_exhausted_token,
         }
     }
 
-    pub fn new(bridge: LuaBridgeServiceClient<V8IsolateManagerServer>, ed: EmbedderData, loader: FusionModuleLoader) -> Self {
-        let runtime = Self::setup_runtime(&ed, loader);
-
-        let common_state = CommonState {
-            bridge,
-            proxy_client: ProxyV8Client {
-                obj_registry: runtime.obj_registry,
-            },
-            ed
-        };
-
-        runtime.deno.op_state().borrow_mut().put(common_state.clone());
+    pub(super) fn new(bridge: LuaBridgeServiceClient, ed: EmbedderData, loader: FusionModuleLoader, ebsd: EventBridgeSetupData) -> Self {
+        let runtime = Self::setup_runtime(&ed, loader, ebsd, bridge);
 
         Self {
             deno: runtime.deno,
             cancellation_token: runtime.heap_exhausted_token,
-            common_state
         }
     }
 }

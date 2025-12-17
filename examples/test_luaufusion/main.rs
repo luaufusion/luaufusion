@@ -6,8 +6,8 @@ use mluau::IntoLua;
 use luaufusion::base::{ProxyBridge, ShutdownTimeouts};
 use luaufusion::denobridge::{V8IsolateManagerServer, run_v8_process_client};
 use luaufusion::luau::embedder_api::EmbedderData;
-use luaufusion::luau::langbridge::{LangBridge, ProxiedValue};
-use luaufusion::parallelluau::{ParallelLuaProxyBridge, run_luau_process_client};
+use luaufusion::luau::langbridge::LangBridge;
+//use luaufusion::parallelluau::{ParallelLuaProxyBridge, run_luau_process_client};
 use tokio::runtime::LocalOptions;
 
 const HEAP_LIMIT: usize = 10 * 1024 * 1024; // 10 MB
@@ -38,7 +38,7 @@ fn main() {
                 },
                 "luau" => {
                     println!("[child] Starting child process mode [luau]");
-                    run_luau_process_client().await;
+                    //run_luau_process_client().await;
                 }
                 _ => panic!("Invalid child type"),
             }
@@ -89,25 +89,29 @@ fn main() {
 
         let vfs = HashMap::from([
             ("foo.js".to_string(), r#"
-export async function foo(luafunc) { 
-    console.log("foo [func class]: ", luafunc, luafunc.constructor.name);
-    console.log("foo, type:", `${luafunc.type}`);
-    console.log("fooCall", `${await luafunc.callSync()}`);
-    console.log("hi");
-    return 123 + (await luafunc.callAsync())[0];
-}
+const eventHandler = async () => {
+    let eb = globalThis.lua.eventBridge;
+    console.log("eb", eb);
+    console.log("Sending INIT message to Luau");
+    try {
+        eb.sendText("INIT")
+    } catch(e) {
+        console.error("Failed to send INIT message to Luau", e);
+    }
+    console.log("Sent INIT message to Luau");
+    while(true) {
+        let msg = await eb.receiveText();
+        console.log("Received message from Luau", msg);
+        if(msg == "SHUTDOWN") {
+            console.log("Received SHUTDOWN, exiting event handler");
+            eb.sendText("DOWN");
+            break;
+        }
+    }
+};
 
-export function s(s) {
-    console.log("Derefing string", s);
-    return s
-}
-
-export function bar(x) {
-    return x * 2;
-}
-
-await Promise.resolve(); // Force async
 console.log(`In foo.js ${structuredClone({})}`);
+await eventHandler();
 "#.to_string()),
     ("foo1.json".to_string(), "{\"foo\":1929}".to_string()),
     ("dir/foo.js".to_string(), r#"
@@ -125,50 +129,6 @@ console.log("In dir/baz.js");
 import * as foobar from "./dir/foo.js";
 import a from "./foo1.json" with { type: "json" };
 console.log("In bar.js, imported foo1.json:", a);
-export function foo2() {
-    return 123 
-}
-
-export function baz(x) {
-    return x * 2;
-}
-// Sleep for 2 seconds
-console.log("In bar.js, sleeping for 5 seconds...");
-await new Promise(resolve => setTimeout(resolve, 5000));
-console.log("Awake now!");
-console.log(`In foo2.js ${structuredClone} ${structuredClone([1,2,3,4,{},JSON.stringify({a:1,b:2})])}`);
-
-let timeNow = Date.now();
-console.log("Time now is: " + timeNow);
-// Sleep for 0 seconds
-await new Promise(resolve => setTimeout(resolve, 0));
-console.log("Awake now again! Time now is: " + Date.now() + ", timeNow -  Date.now()", Date.now() - timeNow);
-//console.log(WebAssembly);
-
-export function keysGetter(obj) {
-    console.log("In keysGetter", obj);
-    return Object.keys(obj).join(", ");
-}
-
-export function staticmaptest(m) {
-    console.log("In staticmaptest", m);
-    m.set("v8", "is pog");
-    m.set("v8arr", [1,2,3,4,5]);
-    return m;
-}
-
-export function testEmbedderJson(evj) {
-    console.log("In testEmbedderJson", JSON.parse(evj));
-}
-
-export async function tablepropget(obj) {
-    console.log("In tablepropget", obj);
-    let key = await obj.get("foo");
-    console.log("Got foo key:", key);
-    let key2 = await obj.get({});
-    console.log("Got non-existent key:", key2);
-    return key;
-}
 "#.to_string()),
         ]);
 
@@ -177,8 +137,8 @@ export async function tablepropget(obj) {
             EmbedderData {
                 heap_limit: HEAP_LIMIT,
                 max_payload_size: None,
-                object_disposal_enabled: true,
-                automatic_object_disposal_enabled: true,
+                //object_disposal_enabled: true,
+                //automatic_object_disposal_enabled: true,
             },
             ProcessOpts {
                 debug_print: false,
@@ -191,7 +151,7 @@ export async function tablepropget(obj) {
             FROM_LUAU_SHUTDOWN_TIMEOUTS
         ).await.expect("Failed to create Lua-V8 bridge");
 
-        let vfs_luau = HashMap::from([
+        /*let vfs_luau = HashMap::from([
             ("init.luau".to_string(), r#"
 print("In init.luau")
 return {
@@ -220,92 +180,28 @@ return {
             ConcurrentExecutorState::new(1),
             vfs_luau,
             FROM_LUAU_SHUTDOWN_TIMEOUTS
-        ).await.expect("Failed to create Lua-V8 bridge");
-
-        let test_embedder_json = r#"{"embeddedJson":"embedded22","mynestedMap":{"a":{"b":123,"c":null,"d":{}}}}"#;
-        let ev = ProxiedValue::<V8IsolateManagerServer>::from_str(
-            test_embedder_json.to_string(), 
-        );
+        ).await.expect("Failed to create Lua-V8 bridge");*/
 
         // Call the v8 function now as a async script
         let lua_code = r#"
-local function myfooer()
-    print("In myfooer")
-    return 42
-end
-
-local v8, luau, ed = ...
-local result = v8:run("foo.js")
--- args to pass to foo: function() print('am here'); return task.wait(1) end, v8, buffer.create(10)
-print("Result from V8:", result)
-local fooprop = result:getproperty("foo")
-local res = fooprop:call(myfooer)
-print("foo prop:", fooprop, res)
-assert(res == 123 + 42, "Invalid result from foo prop call")
-
--- Test calling multiple times to ensure caching works
-local result2 = v8:run("foo.js")
-print("Result2 from V8:", result2)
-local result3 = v8:run("bar.js")
-print("Result3 from V8:", result3)
-local result4 = v8:run("bar.js")
-print("Result4 from V8:", result4)
-
-local keysGetter = result4:getproperty("keysGetter")
-print("keys getter", keysGetter:call(result4))
-
-local staticmaptest = result4:getproperty("staticmaptest")
-local function abcfunc() end
-local smap = {
-    abc = 123,
-    luau = "is great",
-    meow = { nested = "object", ["\xf0\x28\x8c\x28"] = "with null string", [abcfunc] = 44 },
-    myarr = {'a','b','c'},
-    null = v8:null(),
-}
-
-local smap = staticmaptest:call(smap)
-for k, v in smap do
-    print("staticmap key/value", k, v)
-    if type(v) == "table" then
-        for k2, v2 in v do
-            print("  nested key/value", k2, v2)
+local v8 = ...
+task.spawn(function() 
+    while true do
+        local msg = v8:receivetext()
+        print("Received from v8:", msg)
+        if msg == "INIT" then
+            print("Sending SHUTDOWN to v8")
+            v8:sendtext("SHUTDOWN")
+        elseif msg == "DOWN" then
+            print("Received DOWN message, exiting loop")
+            break
         end
     end
-end
-assert(smap.v8 == "is pog", "Invalid static map value for v8 key")
-
-local testEmbedderJson = result4:getproperty("testEmbedderJson")
-testEmbedderJson:call(ed)
-
-local tablepropget = result4:getproperty("tablepropget")
-local tbl = setmetatable({}, {
-    __index = function(t, k)
-        print("Indexing table for key:", k)
-        if k == "foo" then
-            return "barvalue"
-        end
-        return nil
-    end
-})
-local foo_key = tablepropget:call(tbl)
-print("foo_key from tablepropget:", foo_key)
-assert(foo_key == "barvalue", "Invalid foo_key from tablepropget")
-
+end)
+local result = v8:run("foo.js") -- This should keep running until we are fully done
 v8:shutdown()
 
-print("Running Luau code now")
-local luau_result = luau:run("init.luau")
-print("Luau result:", luau_result, luau_result.greeting)
-assert(luau_result.greeting == "Hello from Luau!", "Invalid greeting from Luau")
-local greetFromParallelLuau = luau_result.greetFromParallelLuau
-print("greetFromParallelLuau:", greetFromParallelLuau)
-assert(type(greetFromParallelLuau) == "userdata", "Invalid type for greetFromParallelLuau")
-local greet_msg = greetFromParallelLuau:call("my love")
-print("greet_msg:", greet_msg)
-assert(greet_msg == "Hello, my love, from Parallel Luau!", "Invalid greet_msg from Parallel Luau")
-
-luau:shutdown()
+return v8
 "#;
 
         let func = lua.load(lua_code)
@@ -314,11 +210,7 @@ luau:shutdown()
         let th = lua.create_thread(func).expect("Failed to create Lua thread");
         
         let mut args = mluau::MultiValue::new();
-        let bridgy = bridge_v8.bridge().clone();
-        let bridgy_luau = bridge_luau.bridge().clone();
         args.push_back(bridge_v8.into_lua(&lua).expect("Failed to push v8 runtime to Lua"));
-        args.push_back(bridge_luau.into_lua(&lua).expect("Failed to push luau runtime to Lua"));
-        args.push_back(ev.into_lua(&lua).expect("Failed to push embeddable json"));
 
         let output = task_mgr
             .spawn_thread_and_wait(th, args)
@@ -328,11 +220,17 @@ luau:shutdown()
             .expect("Lua thread returned an error");
         
         println!("Output: {:?}", output);
+        assert!(output.len() == 1, "Expected single return value from Lua main chunk");
+        let v8 = match output.into_iter().next().unwrap() {
+            mluau::Value::UserData(ud) => {
+                let v8bridge = ud.take::<LangBridge<V8IsolateManagerServer>>().expect("Failed to get V8 bridge from userdata");
+                v8bridge
+            },
+            _ => panic!("Expected userdata return value from Lua main chunk"),
+        };
 
         println!("Shutting down v8 bridge");
-        bridgy.shutdown(SHUTDOWN_TIMEOUTS).await.expect("Failed to shutdown bridge");
-        println!("Shutting down luau bridge");
-        bridgy_luau.shutdown(SHUTDOWN_TIMEOUTS).await.expect("Failed to shutdown luau bridge");
+        v8.bridge().shutdown(SHUTDOWN_TIMEOUTS).await.expect("Failed to shutdown bridge");
         println!("Shutdown complete");
         tokio::time::sleep(std::time::Duration::from_secs(1)).await; // Wait a bit for the child process to exit
     });
