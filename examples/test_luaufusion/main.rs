@@ -90,6 +90,13 @@ fn main() {
         let vfs = HashMap::from([
             ("foo.js".to_string(), r#"
 const eventHandler = async () => {
+    // Event handler test
+    addEventListener("v8msg", async (msg) => {
+        console.log("[v8] Received message to event handler:", msg);
+    });
+    dispatchEvent(new CustomEvent("v8msg"));
+
+    // Now send a message to Luau
     let eb = globalThis.lua.eventBridge;
     console.log("[v8] eb", eb);
     console.log("[v8] Sending INIT message to Luau");

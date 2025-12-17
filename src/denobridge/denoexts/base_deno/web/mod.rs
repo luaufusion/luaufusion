@@ -31,7 +31,10 @@ deno_core::extension!(
         op_base64_btoa,
     ],
     esm_entry_point = "ext:deno_web/export.js",
-    esm = [dir "src/denobridge/denoexts/base_deno/web/", "00_text_encoding.js", "01_base64.js", "export.js"],
+    esm = [dir "src/denobridge/denoexts/base_deno/web/", 
+        "00_text_encoding.js", "01_base64.js", "01_dom_exception.js", "02_events.js", "03_global_interfaces.js", "export.js",
+        "98_global_scope_window.js"
+    ],
 );
 
 #[derive(Debug, thiserror::Error, deno_error::JsError)]
