@@ -8,14 +8,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::{base::{ProxyBridge, ProxyBridgeWithMultiprocessExt, ProxyBridgeWithStringExt, ShutdownTimeouts, StandardProxyBridge}, luau::{bridge::{LuaBridgeMessage, LuaBridgeService, LuaBridgeServiceClient, ObjectRegistryType, ProxyLuaClient}, embedder_api::{EmbedderData, EmbedderDataContext}}, parallelluau::{objreg::{PLuauObjectRegistryID, PObjRegistryLuau}, primitives::ProxiedLuauPrimitive, value::ProxiedLuauValue}};
 
-// NOT WORKING YET: TO BE IMPLEMENTED LATER
-mod objreg;
-mod primitives;
-mod psuedoprimitive;
-mod value;
-mod foreignref;
-//use crate::{base::{ObjectRegistryID, ProxyBridge}, luau::bridge::{LuaBridgeObject, ProxyLuaClient}};
-
 /// Memory limit for Luau isolates
 const MIN_HEAP_LIMIT: usize = 5 * 1024 * 1024; // 5 MB
 /// Magic number for Parallel Luau messages
@@ -26,108 +18,16 @@ pub const PLUAU_MESSAGE_MAGIC: usize = 2;
 #[derive(Clone)]
 pub struct ParallelLuaClient {}
 
-impl ParallelLuaClient {
-    fn spawn_function_async(
-        lua: &mluau::Lua,
-        scheduler: &TaskManager,
-        common_state: &CommonState,
-        func: mluau::Function,
-        args: Vec<ProxiedLuauValue>,
-        client_ctx: &concurrentlyexec::ClientContext,
-        resp: OneshotSender<Result<Vec<ProxiedLuauValue>, String>>,
-    ) {
-        let mut lua_args = mluau::MultiValue::with_capacity(args.len());
-        let mut ed = EmbedderDataContext::new(common_state.ed);
-        let mut err = None;
-        for arg in args {
-            let lua_val = match arg.to_luau_child(&lua, &common_state.proxy_client, &common_state.bridge, &mut ed) {
-                Ok(v) => v,
-                Err(e) => {
-                    err = Some(format!("Failed to convert argument to Lua value: {}", e));
-                    break;
-                }
-            };
-            lua_args.push_back(lua_val);
-        }
-
-        if let Some(e) = err {
-            let _ = resp.client(&client_ctx).send(Err(e));
-            return;
-        }
-
-        let th = match lua.create_thread(func) {
-            Ok(t) => t,
-            Err(e) => {
-                let _ = resp.client(&client_ctx).send(Err(format!("Failed to create thread for function call: {}", e)));
-                return;
-            }
-        };
-
-        let scheduler_ref = scheduler.clone();
-        let proxy_client_ref = common_state.proxy_client.clone();
-        let client_ctx_ref = client_ctx.clone();
-        tokio::task::spawn_local(async move {
-            let res = match scheduler_ref.spawn_thread_and_wait(th, lua_args).await {
-                Ok(Some(v)) => v,
-                Ok(None) => {
-                    let _ = resp.client(&client_ctx_ref).send(Err("Function yielded unexpectedly".to_string()));
-                    return;
-                },
-                Err(e) => {
-                    let _ = resp.client(&client_ctx_ref).send(Err(format!("Function call failed: {}", e)));
-                    return;
-                }
-            };
-
-            let ret = match res {
-                Ok(v) => v,
-                Err(e) => {
-                    let _ = resp.client(&client_ctx_ref).send(Err(format!("Function call error: {}", e)));
-                    return;
-                }
-            };
-
-            // Convert return values to ProxiedLuauValue
-            let mut proxied_rets = Vec::with_capacity(ret.len());
-            for rv in ret {
-                let proxied = match ProxiedLuauValue::from_luau_child(&proxy_client_ref, rv, &mut ed) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        let _ = resp.client(&client_ctx_ref).send(Err(format!("Failed to convert return value to ProxiedLuauValue: {}", e)));
-                        return;
-                    }
-                };
-                proxied_rets.push(proxied);
-            }
-
-            let _ = resp.client(&client_ctx_ref).send(Ok(proxied_rets));
-        });
-    }
-}
-
 #[derive(Serialize, Deserialize)]
 /// Internal representation of a message that can be sent to the parallel luau instance
 pub(super) enum ParallelLuaMessage {
     CodeExec {
         filename: String,
-        resp: OneshotSender<Result<Vec<ProxiedLuauValue>, String>>,
+        resp: OneshotSender<Result<(), String>>,
         magic: usize,
     },
-    GetProperty {
-        obj_id: PLuauObjectRegistryID,
-        property: ProxiedLuauValue,
-        resp: OneshotSender<Result<ProxiedLuauValue, String>>,
-        magic: usize,
-    },
-    CallFunctionChild {
-        obj_id: PLuauObjectRegistryID,
-        args: Vec<ProxiedLuauValue>,
-        resp: OneshotSender<Result<Vec<ProxiedLuauValue>, String>>,
-        magic: usize,
-    },
-    RequestDispose {
-        ids: Vec<PLuauObjectRegistryID>,
-        resp: Option<OneshotSender<Result<(), String>>>,
+    SendText {
+        msg: String,
         magic: usize,
     },
     Shutdown,

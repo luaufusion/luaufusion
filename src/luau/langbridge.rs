@@ -68,22 +68,20 @@ impl<T: ProxyBridge> mluau::UserData for LangBridge<T> {
             this.run(modname).await
         });
 
-        methods.add_scheduler_async_method("sendtext", async move |lua, this, msg: mluau::Value| {
+        methods.add_method("sendtext", move |lua, this, msg: mluau::Value| {
             let mut ed = EmbedderDataContext::new(this.plc.ed);
             let v = from_lua_text(msg, &lua, &mut ed)
                 .map_err(|e| mluau::Error::external(format!("Failed to convert argument to string: {}", e)))?;
             this.bridge.send_text(v)
-                .await
                 .map_err(|e| mluau::Error::external(format!("Failed to send text message: {}", e)))?;
             Ok(())
         });
 
-        methods.add_scheduler_async_method("sendbinary", async move |lua, this, msg: mluau::Value| {
+        methods.add_method("sendbinary", move |lua, this, msg: mluau::Value| {
             let mut ed = EmbedderDataContext::new(this.plc.ed);
             let v = from_lua_binary(msg, &lua, &mut ed)
                 .map_err(|e| mluau::Error::external(format!("Failed to convert argument to binary: {}", e)))?;
             this.bridge.send_binary(v)
-                .await
                 .map_err(|e| mluau::Error::external(format!("Failed to send binary message: {}", e)))?;
             Ok(())
         });

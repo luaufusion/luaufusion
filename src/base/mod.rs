@@ -26,10 +26,10 @@ pub trait ProxyBridge: 'static + Sized {
     ) -> Result<Self, Error>;
 
     /// Push a text message to the foreign language
-    async fn send_text(&self, msg: String) -> Result<(), Error>;
+    fn send_text(&self, msg: String) -> Result<(), Error>;
 
     /// Push a binary message to the foreign language
-    async fn send_binary(&self, msg: serde_bytes::ByteBuf) -> Result<(), Error>;
+    fn send_binary(&self, msg: serde_bytes::ByteBuf) -> Result<(), Error>;
 
     /// Receive a text message from the foreign language
     async fn receive_text(&self) -> Result<Option<String>, Error>;

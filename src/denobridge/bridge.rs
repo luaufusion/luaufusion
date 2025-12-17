@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
 
 use concurrentlyexec::{ConcurrentExecutor, ConcurrentExecutorState, ConcurrentlyExecute, MultiSender, OneshotSender, ProcessOpts};
 use deno_core::PollEventLoopOptions;
@@ -38,75 +37,11 @@ pub(super) enum V8IsolateManagerMessage {
     },
     SendText {
         msg: String,
-        resp: OneshotSender<Result<(), String>>,
-        magic: usize,
     },
     SendBinary {
         msg: serde_bytes::ByteBuf,
-        resp: OneshotSender<Result<(), String>>,
-        magic: usize,
     },
     Shutdown,
-}
-
-/// A message that can be sent to the V8 isolate manager
-pub(super) trait V8IsolateSendableMessage: Send + 'static {
-    type Response: Send + serde::Serialize + for<'de> serde::Deserialize<'de> + 'static;
-    fn to_message(self, resp: OneshotSender<Self::Response>) -> V8IsolateManagerMessage;
-}
-
-pub(super) struct CodeExecMessage {
-    pub modname: String,
-}
-
-impl V8IsolateSendableMessage for CodeExecMessage {
-    type Response = Result<(), String>;
-    fn to_message(self, resp: OneshotSender<Self::Response>) -> V8IsolateManagerMessage {
-        V8IsolateManagerMessage::CodeExec {
-            modname: self.modname,
-            resp,
-            magic: V8_MESSAGE_MAGIC,
-        }
-    }
-}
-
-pub(super) struct SendTextMessage {
-    pub msg: String,
-}
-
-impl V8IsolateSendableMessage for SendTextMessage {
-    type Response = Result<(), String>;
-    fn to_message(self, resp: OneshotSender<Self::Response>) -> V8IsolateManagerMessage {
-        V8IsolateManagerMessage::SendText {
-            msg: self.msg,
-            resp,
-            magic: V8_MESSAGE_MAGIC,
-        }
-    }
-}
-
-pub(super) struct SendBinaryMessage {
-    pub msg: serde_bytes::ByteBuf,
-}
-
-impl V8IsolateSendableMessage for SendBinaryMessage {
-    type Response = Result<(), String>;
-    fn to_message(self, resp: OneshotSender<Self::Response>) -> V8IsolateManagerMessage {
-        V8IsolateManagerMessage::SendBinary {
-            msg: self.msg,
-            resp,
-            magic: V8_MESSAGE_MAGIC,
-        }
-    }
-}
-
-pub(super) struct ShutdownMessage;
-
-impl V8IsolateSendableMessage for ShutdownMessage {
-    type Response = ();
-    fn to_message(self, _resp: OneshotSender<Self::Response>) -> V8IsolateManagerMessage {
-        V8IsolateManagerMessage::Shutdown
-    }
 }
  
 #[derive(Clone)]
@@ -190,23 +125,11 @@ impl ConcurrentlyExecute for V8IsolateManagerClient {
                                 (modname, module_id, resp)
                             });
                         },
-                        Ok(V8IsolateManagerMessage::SendText { msg, resp, magic }) => {
-                            if magic != V8_MESSAGE_MAGIC {
-                                let _ = resp.client(&client_ctx).send(Err("Invalid magic number in CodeExec message; are you sure you're running a V8 child process?".into()));
-                                continue;
-                            }
-
+                        Ok(V8IsolateManagerMessage::SendText { msg }) => {
                             let _ = send_text_tx.send(msg);
-                            let _ = resp.client(&client_ctx).send(Ok(()));
                         },
-                        Ok(V8IsolateManagerMessage::SendBinary { msg, resp, magic }) => {
-                            if magic != V8_MESSAGE_MAGIC {
-                                let _ = resp.client(&client_ctx).send(Err("Invalid magic number in CodeExec message; are you sure you're running a V8 child process?".into()));
-                                continue;
-                            }
-
+                        Ok(V8IsolateManagerMessage::SendBinary { msg }) => {
                             let _ = send_binary_tx.send(msg);
-                            let _ = resp.client(&client_ctx).send(Ok(()));
                         },
                         Ok(V8IsolateManagerMessage::Shutdown) => {
                             if cfg!(feature = "debug_message_print_enabled") {
@@ -306,36 +229,16 @@ impl V8IsolateManagerServer {
         Ok(self_ret)
     }
 
-    /// Send a message to the V8 isolate process and wait for a response
-    pub(super) async fn send<T: V8IsolateSendableMessage>(&self, msg: T) -> Result<T::Response, crate::base::Error> {
-        let (resp_tx, resp_rx) = self.executor.create_oneshot();
-        self.messenger.server(self.executor.server_context()).send(msg.to_message(resp_tx))
-            .map_err(|e| format!("Failed to send message to V8 isolate: {}", e))?;
-        
-        let resp = resp_rx.recv().await;
-
-        if self.is_shutdown() {
-            return Err("V8 isolate manager is shut down (likely due to timeout)".into());
-        }
-        
-        resp.map_err(|e| format!("Failed to receive response from V8 isolate: {}", e).into())
-    }
-
     /// Send a message to the V8 isolate process with a timeout and wait for a response
-    pub(super) async fn send_timeout<T: V8IsolateSendableMessage>(&self, msg: T, timeout: Duration) -> Result<T::Response, crate::base::Error> {
-        let (resp_tx, resp_rx) = self.executor.create_oneshot();
-        self.messenger.server(self.executor.server_context()).send(msg.to_message(resp_tx))
+    pub(super) fn shutdown_timeout(&self) -> Result<(), crate::base::Error> {
+        self.messenger.server(self.executor.server_context()).send(V8IsolateManagerMessage::Shutdown {})
             .map_err(|e| format!("Failed to send message to V8 isolate: {}", e))?;
         
-        let resp = tokio::time::timeout(timeout, resp_rx.recv()).await
-            .map_err(|e| format!("Timeout waiting for response from V8 isolate: {}", e))?
-            .map_err(|e| format!("Failed to receive response from V8 isolate: {}", e))?;
-
         if self.is_shutdown() {
             return Err("V8 isolate manager is shut down (likely due to timeout)".into());
         }
         
-        Ok(resp)
+        Ok(())
     }
 }
 
@@ -356,13 +259,15 @@ impl ProxyBridge for V8IsolateManagerServer {
         Self::new(cs_state, ed, process_opts, vfs).await        
     }
 
-    async fn send_text(&self, msg: String) -> Result<(), Error> {
-        self.send(SendTextMessage { msg }).await??;
+    fn send_text(&self, msg: String) -> Result<(), Error> {
+        self.messenger.server(self.executor.server_context()).send(V8IsolateManagerMessage::SendText { msg })
+            .map_err(|e| format!("Failed to send message to V8 isolate: {}", e))?;
         Ok(())
     }
 
-    async fn send_binary(&self, msg: serde_bytes::ByteBuf) -> Result<(), Error> {
-        self.send(SendBinaryMessage { msg }).await??;
+    fn send_binary(&self, msg: serde_bytes::ByteBuf) -> Result<(), Error> {
+        self.messenger.server(self.executor.server_context()).send(V8IsolateManagerMessage::SendBinary { msg })
+            .map_err(|e| format!("Failed to send message to V8 isolate: {}", e))?;
         Ok(())
     }
 
@@ -389,11 +294,21 @@ impl ProxyBridge for V8IsolateManagerServer {
     }
 
     async fn eval_from_source(&self, modname: String) -> Result<(), crate::base::Error> {
-        Ok(self.send(CodeExecMessage { modname }).await??)
+        let (resp_tx, resp_rx) = self.executor.create_oneshot();
+        self.messenger.server(self.executor.server_context()).send(V8IsolateManagerMessage::CodeExec { modname, resp: resp_tx, magic: V8_MESSAGE_MAGIC })
+            .map_err(|e| format!("Failed to send message to V8 isolate: {}", e))?;
+        
+        let resp = resp_rx.recv().await?;
+
+        if self.is_shutdown() {
+            return Err("V8 isolate manager is shut down (likely due to timeout)".into());
+        }
+        
+        resp.map_err(|e| format!("Failed to receive response from V8 isolate: {}", e).into())
     }
 
     async fn shutdown(&self, timeouts: ShutdownTimeouts) -> Result<(), crate::base::Error> {
-        let _ = self.send_timeout(ShutdownMessage, timeouts.bridge_shutdown).await;
+        let _ = self.shutdown_timeout();
         tokio::time::timeout(timeouts.executor_shutdown, self.executor.shutdown())
             .await
             .map_err(|e| format!("Timeout shutting down V8 isolate manager executor: {}", e))??;
