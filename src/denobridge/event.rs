@@ -54,7 +54,7 @@ impl EventBridge {
     #[fast]
     #[method]
     #[rename("sendBinary")]
-    fn send_text(&self, #[arraybuffer] msg: &[u8]) -> Result<(), deno_error::JsErrorBox> {
+    fn send_text(&self, #[buffer] msg: &[u8]) -> Result<(), deno_error::JsErrorBox> {
         let mut ed = EmbedderDataContext::new(self.ed);
         ed.add(msg.len(), "Bridge::sendBinary")
             .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
