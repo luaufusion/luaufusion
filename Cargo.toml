@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 mlua_scheduler = { git = "https://github.com/mluau/scheduler", version = "1.0.0" }
 mluau = { git = "https://github.com/mluau/mluau", version = "0.11.2", features = ["serde"] }
-concurrentlyexec = { git = "https://github.com/luaufusion/concurrentlyexecute" }
+concurrentlyexec = { git = "https://github.com/luaufusion/concurrentlyexecute", optional = true }
 
 tokio = { version = "1.47.1", features = ["full", "process"] }
 tokio-util = "0.7"
@@ -22,8 +22,9 @@ mluau-require = { git = "https://github.com/mluau/mluau-require", optional = tru
 encoding_rs = "=0.8.35"
 
 [features]
-default = ["deno", "parallel_luau", "deno_include_snapshot", "debug_message_print_enabled"]
+default = ["deno", "parallel_luau", "deno_include_snapshot", "debug_message_print_enabled", "concurrentlyexec_transport"]
 deno = ["dep:deno_core", "dep:deno_error", "dep:thiserror", "dep:base64-simd", "dep:urlpattern"]
 deno_include_snapshot = ["deno"]
 parallel_luau = ["dep:mluau-require"]
 debug_message_print_enabled = []
+concurrentlyexec_transport = ["dep:concurrentlyexec"]

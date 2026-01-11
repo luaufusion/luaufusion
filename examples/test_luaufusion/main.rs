@@ -1,24 +1,16 @@
 use std::collections::HashMap;
 
 use concurrentlyexec::{ConcurrentExecutorState, ProcessOpts};
+use luaufusion::base::ServerTransport;
+use luaufusion::transport::concurrentlyexec::{ConcurrentlyExecuteServer, ConcurrentlyExecuteServerData, run_process_client, set_use_v8};
 use mlua_scheduler::{taskmgr::NoopHooks, LuaSchedulerAsync, XRc};
 use mluau::IntoLua;
-use luaufusion::base::{ProxyBridge, ShutdownTimeouts};
-use luaufusion::denobridge::{V8IsolateManagerServer, run_v8_process_client};
 use luaufusion::luau::embedder_api::EmbedderData;
 use luaufusion::luau::langbridge::LangBridge;
 //use luaufusion::parallelluau::{ParallelLuaProxyBridge, run_luau_process_client};
 use tokio::runtime::LocalOptions;
 
 const HEAP_LIMIT: usize = 10 * 1024 * 1024; // 10 MB
-const SHUTDOWN_TIMEOUTS: ShutdownTimeouts = ShutdownTimeouts {
-    bridge_shutdown: std::time::Duration::from_millis(100),
-    executor_shutdown: std::time::Duration::from_secs(5),
-};
-const FROM_LUAU_SHUTDOWN_TIMEOUTS: ShutdownTimeouts = ShutdownTimeouts {
-    bridge_shutdown: std::time::Duration::from_millis(100),
-    executor_shutdown: std::time::Duration::from_secs(5),
-};
 
 fn main() {
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -34,14 +26,16 @@ fn main() {
             match args[2].as_str() {
                 "v8" => {
                     println!("[child] Starting child process mode [v8]");
-                    run_v8_process_client().await;
+                    set_use_v8().await;
+
                 },
-                "luau" => {
-                    println!("[child] Starting child process mode [luau]");
-                    //run_luau_process_client().await;
-                }
+                //"luau" => {
+                //    println!("[child] Starting child process mode [luau]");
+                //    //run_luau_process_client().await;
+                //}
                 _ => panic!("Invalid child type"),
             }
+            run_process_client().await;
             println!("[child] Exiting child process mode");
             return;
         }
@@ -91,10 +85,10 @@ fn main() {
             ("foo.js".to_string(), r#"
 const eventHandler = async () => {
     // Event handler test
-    addEventListener("v8msg", async (msg) => {
-        console.log("[v8] Received message to event handler:", msg);
-    });
-    dispatchEvent(new CustomEvent("v8msg"));
+    //addEventListener("v8msg", async (msg) => {
+    //    console.log("[v8] Received message to event handler:", msg);
+    //});
+    //dispatchEvent(new CustomEvent("v8msg"));
 
     // Now send a message to Luau
     let eb = globalThis.lua.eventBridge;
@@ -151,85 +145,57 @@ console.log("In bar.js, imported foo1.json:", a);
 "#.to_string()),
         ]);
 
-        let bridge_v8 = LangBridge::<V8IsolateManagerServer>::new_from_bridge(
-            &lua, 
-            EmbedderData {
-                heap_limit: HEAP_LIMIT,
-                max_payload_size: None,
-                //object_disposal_enabled: true,
-                //automatic_object_disposal_enabled: true,
-            },
+        let v8_server = ConcurrentlyExecuteServer::new(
+            ConcurrentExecutorState::new(1),
             ProcessOpts {
                 debug_print: false,
                 start_timeout: std::time::Duration::from_secs(10),
                 cmd_argv: vec!["-".to_string(), "child".to_string(), "v8".to_string()],
                 cmd_envs: vec![],
             },
-            ConcurrentExecutorState::new(1),
-            vfs,
-            FROM_LUAU_SHUTDOWN_TIMEOUTS
-        ).await.expect("Failed to create Lua-V8 bridge");
+            ConcurrentlyExecuteServerData {
+                ed: EmbedderData {
+                    heap_limit: HEAP_LIMIT,
+                    max_payload_size: None,
+                },
+                vfs: vfs.clone(),
+                module_name: "foo.js".to_string(),
+            }
+        ).await.expect("Failed to create V8 server");
 
-        /*let vfs_luau = HashMap::from([
-            ("init.luau".to_string(), r#"
-print("In init.luau")
-return {
-    greeting = "Hello from Luau!",
-    greetFromParallelLuau = function(name)
-        return "Hello, " .. name .. ", from Parallel Luau!"
-    end
-}
-"#.to_string()),
-        ]);
-
-        let bridge_luau: LangBridge<ParallelLuaProxyBridge> = LangBridge::<ParallelLuaProxyBridge>::new_from_bridge(
-            &lua, 
+        let bridge_v8 = LangBridge::new(
+            v8_server, 
             EmbedderData {
                 heap_limit: HEAP_LIMIT,
                 max_payload_size: None,
-                object_disposal_enabled: true,
-                automatic_object_disposal_enabled: true,
             },
-            ProcessOpts {
-                debug_print: false,
-                start_timeout: std::time::Duration::from_secs(10),
-                cmd_argv: vec!["-".to_string(), "child".to_string(), "luau".to_string()],
-                cmd_envs: vec![],
-            },
-            ConcurrentExecutorState::new(1),
-            vfs_luau,
-            FROM_LUAU_SHUTDOWN_TIMEOUTS
-        ).await.expect("Failed to create Lua-V8 bridge");*/
+        );
 
         // Call the v8 function now as a async script
         let lua_code = r#"
 local v8 = ...
-task.spawn(function() 
-    while true do
-        local msg = v8:receivetext()
-        if not msg then
-            print("[Luau] Failed to receive message from v8")
-            break
-        end
-        print("[Luau] Received from v8:", msg)
-        if msg == "INIT" then
-            -- Send a buffer to v8
-            print("[Luau] Sending buffer to v8")
-            local buf = buffer.fromstring("Hello from Luau!")
-            v8:sendtext("GETBUFFER")
-            v8:sendbinary(buf)
-            continue
-        elseif msg == "BUFFERRECEIVED" then
-            print("[Luau] Sending SHUTDOWN to v8")
-            v8:sendtext("SHUTDOWN")
-        elseif msg == "DOWN" then
-            print("[Luau] Received DOWN message, exiting loop")
-            break
-        end
+while true do
+    local msg = v8:receive()
+    if not msg then
+        print("[Luau] Failed to receive message from v8")
+        break
     end
-end)
-local result = v8:run("foo.js") -- This should keep running until we are fully done
-v8:shutdown()
+    print("[Luau] Received from v8:", msg)
+    if msg == "INIT" then
+        -- Send a buffer to v8
+        print("[Luau] Sending buffer to v8")
+        local buf = buffer.fromstring("Hello from Luau!")
+        v8:sendtext("GETBUFFER")
+        v8:sendbinary(buf)
+        continue
+    elseif msg == "BUFFERRECEIVED" then
+        print("[Luau] Sending SHUTDOWN to v8")
+        v8:sendtext("SHUTDOWN")
+    elseif msg == "DOWN" then
+        print("[Luau] Received DOWN message, exiting loop")
+        break
+    end
+end
 
 return v8
 "#;
@@ -253,14 +219,14 @@ return v8
         assert!(output.len() == 1, "Expected single return value from Lua main chunk");
         let v8 = match output.into_iter().next().unwrap() {
             mluau::Value::UserData(ud) => {
-                let v8bridge = ud.take::<LangBridge<V8IsolateManagerServer>>().expect("Failed to get V8 bridge from userdata");
+                let v8bridge = ud.take::<LangBridge<ConcurrentlyExecuteServer>>().expect("Failed to get V8 bridge from userdata");
                 v8bridge
             },
             _ => panic!("Expected userdata return value from Lua main chunk"),
         };
 
         println!("Shutting down v8 bridge");
-        v8.bridge().shutdown(SHUTDOWN_TIMEOUTS).await.expect("Failed to shutdown bridge");
+        v8.bridge().shutdown().await.expect("Failed to shutdown bridge");
         println!("Shutdown complete");
         tokio::time::sleep(std::time::Duration::from_secs(1)).await; // Wait a bit for the child process to exit
     });

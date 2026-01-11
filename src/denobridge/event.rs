@@ -1,12 +1,12 @@
 use deno_core::{GarbageCollected, op2, v8};
-use tokio::sync::{Mutex, mpsc::UnboundedReceiver};
+use tokio::sync::{Mutex, mpsc::{UnboundedReceiver, UnboundedSender}};
 
-use crate::luau::{bridge::LuaBridgeServiceClient, embedder_api::{EmbedderData, EmbedderDataContext}};
+use crate::{base::ClientMessage, luau::embedder_api::EmbedderData};
 
 /// Bridge object for sending and receiving events between Luau and V8
 pub struct EventBridge {
     pub(super) ed: EmbedderData,
-    pub(super) bridge: LuaBridgeServiceClient,
+    pub(super) msg_tx: UnboundedSender<ClientMessage>,
     pub(super) text_rx: Mutex<UnboundedReceiver<String>>,
     pub(super) binary_rx: Mutex<UnboundedReceiver<serde_bytes::ByteBuf>>,
 }
@@ -15,13 +15,13 @@ impl EventBridge {
     /// Creates a new EventBridge object with channels for text and binary messages
     pub fn new(
         ed: EmbedderData,
-        bridge: LuaBridgeServiceClient,
+        msg_tx: UnboundedSender<ClientMessage>,
         text_rx: UnboundedReceiver<String>,
         binary_rx: UnboundedReceiver<serde_bytes::ByteBuf>,
     ) -> Self {
         Self {
             ed,
-            bridge,
+            msg_tx,
             text_rx: Mutex::new(text_rx),
             binary_rx: Mutex::new(binary_rx),
         }
@@ -44,21 +44,31 @@ impl EventBridge {
     #[method]
     #[rename("sendText")]
     fn send_text(&self, #[string] msg: String) -> Result<(), deno_error::JsErrorBox> {
-        let mut ed = EmbedderDataContext::new(self.ed);
-        ed.add(msg.len(), "Bridge::sendText")
-            .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
-        self.bridge.send_text(msg).map_err(|e| deno_error::JsErrorBox::generic(format!("Failed to send text message: {}", e)))?;
+        if let Some(max_payload_size) = self.ed.max_payload_size && msg.len() > max_payload_size {
+            return Err(deno_error::JsErrorBox::generic(format!(
+                "Payload size {} exceeds maximum allowed size of {} bytes",
+                msg.len(),
+                max_payload_size
+            )));
+        }
+        self.msg_tx.send(ClientMessage::SendText { msg })
+            .map_err(|e| deno_error::JsErrorBox::generic(format!("Failed to send text message: {}", e)))?;
         Ok(())
     }
 
     #[fast]
     #[method]
     #[rename("sendBinary")]
-    fn send_text(&self, #[buffer] msg: &[u8]) -> Result<(), deno_error::JsErrorBox> {
-        let mut ed = EmbedderDataContext::new(self.ed);
-        ed.add(msg.len(), "Bridge::sendBinary")
-            .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
-        self.bridge.send_binary(msg.to_vec().into()).map_err(|e| deno_error::JsErrorBox::generic(format!("Failed to send text message: {}", e)))?;
+    fn send_binary(&self, #[buffer] msg: &[u8]) -> Result<(), deno_error::JsErrorBox> {
+        if let Some(max_payload_size) = self.ed.max_payload_size && msg.len() > max_payload_size {
+            return Err(deno_error::JsErrorBox::generic(format!(
+                "Payload size {} exceeds maximum allowed size of {} bytes",
+                msg.len(),
+                max_payload_size
+            )));
+        }
+        self.msg_tx.send(ClientMessage::SendBinary { msg: serde_bytes::ByteBuf::from(msg) })
+            .map_err(|e| deno_error::JsErrorBox::generic(format!("Failed to send text message: {}", e)))?;
         Ok(())
     }
 

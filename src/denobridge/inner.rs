@@ -5,12 +5,13 @@ use std::rc::Rc;
 //use deno_core::error::{CoreError, CoreErrorKind};
 use deno_core::v8::CreateParams;
 use deno_core::v8;
+use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
 use super::{
     modloader::FusionModuleLoader,
 };
-use crate::luau::bridge::LuaBridgeServiceClient;
+use crate::base::ClientMessage;
 use crate::luau::embedder_api::EmbedderData;
 
 use super::bridge::MIN_HEAP_LIMIT;
@@ -48,10 +49,10 @@ pub(super) struct EventBridgeSetupData {
 }
 
 impl V8IsolateManagerInner {  
-    fn set_event_bridge<'a>(scope: &mut v8::PinScope<'a, '_>, ed: &EmbedderData, bridge: LuaBridgeServiceClient, ebsd: EventBridgeSetupData) -> Result<(), crate::base::Error> {
+    fn set_event_bridge<'a>(scope: &mut v8::PinScope<'a, '_>, ed: &EmbedderData, msg_tx: UnboundedSender<ClientMessage>, ebsd: EventBridgeSetupData) -> Result<(), crate::base::Error> {
         let event_bridge = EventBridge::new(
             ed.clone(),
-            bridge,
+            msg_tx,
             ebsd.text_rx,
             ebsd.binary_rx
         );
@@ -107,7 +108,7 @@ impl V8IsolateManagerInner {
     }
 
     /// Sets up a new Deno runtime with the specified embedder data and module loader  
-    pub(super) fn setup_runtime(ed: &EmbedderData, loader: FusionModuleLoader, ebsd: EventBridgeSetupData, bridge: LuaBridgeServiceClient) -> SetupRuntime {
+    pub(super) fn setup_runtime(ed: &EmbedderData, loader: FusionModuleLoader, ebsd: EventBridgeSetupData, msg_tx: UnboundedSender<ClientMessage>) -> SetupRuntime {
         let heap_limit = ed.heap_limit.max(MIN_HEAP_LIMIT);
 
         #[cfg(feature = "deno_include_snapshot")]
@@ -161,7 +162,7 @@ impl V8IsolateManagerInner {
             let main_ctx = v8::Local::new(scope, main_ctx);
             let scope = &mut v8::ContextScope::new(scope, main_ctx);
 
-            Self::set_event_bridge(scope, &ed, bridge.clone(), ebsd).expect("Failed to set event bridge");
+            Self::set_event_bridge(scope, &ed, msg_tx, ebsd).expect("Failed to set event bridge");
         }
 
         SetupRuntime {
@@ -170,8 +171,8 @@ impl V8IsolateManagerInner {
         }
     }
 
-    pub(super) fn new(bridge: LuaBridgeServiceClient, ed: EmbedderData, loader: FusionModuleLoader, ebsd: EventBridgeSetupData) -> Self {
-        let runtime = Self::setup_runtime(&ed, loader, ebsd, bridge);
+    pub(super) fn new(msg_tx: UnboundedSender<ClientMessage>, ed: EmbedderData, loader: FusionModuleLoader, ebsd: EventBridgeSetupData) -> Self {
+        let runtime = Self::setup_runtime(&ed, loader, ebsd, msg_tx);
 
         Self {
             deno: runtime.deno,

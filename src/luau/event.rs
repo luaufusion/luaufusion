@@ -1,4 +1,4 @@
-use crate::luau::embedder_api::EmbedderDataContext;
+use crate::luau::embedder_api::EmbedderData;
 
 /// Place this inside a Lua state to convert UserData to MessageEvent
 /// if you desire extra logic here as an embedder
@@ -19,11 +19,16 @@ pub struct LuauUserDataTextConverter(
 );
 
 /// Converts a Luau value to a byte buffer for sending as a message
-pub(super) fn from_lua_binary(value: mluau::Value, lua: &mluau::Lua, ed: &mut EmbedderDataContext) -> mluau::Result<serde_bytes::ByteBuf> {
+pub(super) fn from_lua_binary(value: mluau::Value, lua: &mluau::Lua, ed: EmbedderData) -> mluau::Result<serde_bytes::ByteBuf> {
     match value {
         mluau::Value::String(s) => {
-            ed.add(s.as_bytes().len(), "MessageEvent::Binary")
-                .map_err(|e| mluau::Error::external(e.to_string()))?;
+            if let Some(max_payload_size) = ed.max_payload_size && s.as_bytes().len() > max_payload_size {
+                return Err(mluau::Error::external(format!(
+                    "Payload size {} exceeds maximum allowed size of {} bytes",
+                    s.as_bytes().len(),
+                    max_payload_size
+                )));
+            }
 
             let bytes = s.as_bytes();
             Ok(bytes.to_vec().into())
@@ -45,8 +50,13 @@ pub(super) fn from_lua_binary(value: mluau::Value, lua: &mluau::Lua, ed: &mut Em
             }
         },
         mluau::Value::Buffer(b) => {
-            ed.add(b.len(), "MessageEvent::Binary")
-                .map_err(|e| mluau::Error::external(e.to_string()))?;
+            if let Some(max_payload_size) = ed.max_payload_size && b.len() > max_payload_size {
+                return Err(mluau::Error::external(format!(
+                    "Payload size {} exceeds maximum allowed size of {} bytes",
+                    b.len(),
+                    max_payload_size
+                )));
+            }
 
             let bytes = b.to_vec();
             Ok(bytes.into())
@@ -60,11 +70,16 @@ pub(super) fn from_lua_binary(value: mluau::Value, lua: &mluau::Lua, ed: &mut Em
 }
 
 /// Converts a Luau value to a string for sending as a message
-pub(super) fn from_lua_text(value: mluau::Value, lua: &mluau::Lua, ed: &mut EmbedderDataContext) -> mluau::Result<String> {
+pub(super) fn from_lua_text(value: mluau::Value, lua: &mluau::Lua, ed: EmbedderData) -> mluau::Result<String> {
     match value {
         mluau::Value::String(s) => {
-            ed.add(s.as_bytes().len(), "MessageEvent::Text")
-                .map_err(|e| mluau::Error::external(e.to_string()))?;
+            if let Some(max_payload_size) = ed.max_payload_size && s.as_bytes().len() > max_payload_size {
+                return Err(mluau::Error::external(format!(
+                    "Payload size {} exceeds maximum allowed size of {} bytes",
+                    s.as_bytes().len(),
+                    max_payload_size
+                )));
+            }
 
             let s = s.to_string_lossy();
             Ok(s)

@@ -1,51 +1,56 @@
-use std::{collections::HashMap, time::Duration};
+use std::collections::HashMap;
 
-use concurrentlyexec::{ConcurrentExecutor, ConcurrentExecutorState, ConcurrentlyExecute, ProcessOpts};
+use serde::{Deserialize, Serialize};
 
 use crate::luau::embedder_api::EmbedderData;
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
-#[derive(Clone, Copy, Debug)]
-pub struct ShutdownTimeouts {
-    pub bridge_shutdown: Duration,
-    pub executor_shutdown: Duration,
+#[derive(Serialize, Deserialize)]
+/// Internal representation of a message between host and foreign language
+pub enum ClientMessage {
+    SendText {
+        msg: String,
+    },
+    SendBinary {
+        msg: serde_bytes::ByteBuf,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+/// Internal representation of a message between foreign language and host
+pub enum ServerMessage {
+    SendText {
+        msg: String,
+    },
+    SendBinary {
+        msg: serde_bytes::ByteBuf,
+    },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct InitialData {
+    pub vfs: HashMap<String, String>,
+    pub ed: EmbedderData,
+    pub module_name: String,
 }
 
 #[allow(async_fn_in_trait)]
-pub trait ProxyBridge: 'static + Sized {
-    type ConcurrentlyExecuteClient: ConcurrentlyExecute;
+pub trait ServerTransport: 'static {
+    /// Push a message to the foreign language
+    fn send_to_foreign(&self, msg: ServerMessage) -> Result<(), Error>;
 
-    fn name() -> &'static str;
-
-    async fn new(
-        cs_state: ConcurrentExecutorState<Self::ConcurrentlyExecuteClient>, 
-        ed: EmbedderData, 
-        process_opts: ProcessOpts,
-        vfs: HashMap<String, String>,
-    ) -> Result<Self, Error>;
-
-    /// Push a text message to the foreign language
-    fn send_text(&self, msg: String) -> Result<(), Error>;
-
-    /// Push a binary message to the foreign language
-    fn send_binary(&self, msg: serde_bytes::ByteBuf) -> Result<(), Error>;
-
-    /// Receive a text message from the foreign language
-    async fn receive_text(&self) -> Result<Option<String>, Error>;
-
-    /// Receive a binary message from the foreign language
-    async fn receive_binary(&self) -> Result<Option<serde_bytes::ByteBuf>, Error>;
-
-    /// Evaluates code (string) from the source Luau to the foreign language
-    /// 
-    /// The specified modname is either a module name or the file name to load (depending on the underlying implementation)
-    /// 
-    /// May return one or one+ values depending on the foreign language semantics for modules (parallel luau may return multiple values while deno/v8 returns a single value)
-    async fn eval_from_source(&self, modname: String) -> Result<(), Error>;
+    /// Receive a message from the foreign language
+    async fn receive_from_foreign(&self) -> Result<ClientMessage, Error>;
 
     /// Shuts down the bridge and its resources
-    async fn shutdown(&self, timeouts: ShutdownTimeouts) -> Result<(), Error>;
+    async fn shutdown(&self) -> Result<(), Error> {
+        self.fire_shutdown();
+        if !self.is_shutdown() {
+            return Err("Transport did not shutdown properly".into());
+        }
+        Ok(())
+    }
 
     /// Fires a shutdown request without waiting for the result
     fn fire_shutdown(&self);
@@ -54,8 +59,11 @@ pub trait ProxyBridge: 'static + Sized {
     fn is_shutdown(&self) -> bool;
 }
 
-/// Extension trait for ProxyBridge's that support multiprocess execution via concurrentlyexec
-pub trait ProxyBridgeWithMultiprocessExt: ProxyBridge {
-    /// Returns the executor for concurrently executing tasks on a separate process
-    fn get_executor(&self) -> &ConcurrentExecutor<Self::ConcurrentlyExecuteClient>;
+#[allow(async_fn_in_trait)]
+pub trait ClientTransport: 'static {
+    /// Push a message to the host language
+    fn send_to_host(&self, msg: ClientMessage) -> Result<(), Error>;
+
+    /// Receive a binary message from the host language
+    async fn receive_from_host(&self) -> Result<ServerMessage, Error>;
 }

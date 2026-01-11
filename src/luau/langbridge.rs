@@ -1,109 +1,63 @@
-use std::collections::HashMap;
-
-use crate::{base::{ProxyBridge, ShutdownTimeouts}, luau::{bridge::ProxyLuaClient, embedder_api::{EmbedderData, EmbedderDataContext}, event::{from_lua_binary, from_lua_text}}};
-use concurrentlyexec::{ConcurrentExecutorState, ProcessOpts};
+use crate::{base::{ClientMessage, ServerMessage, ServerTransport}, luau::{embedder_api::EmbedderData, event::{from_lua_binary, from_lua_text}}};
 use mlua_scheduler::LuaSchedulerAsyncUserData;
 
 /// Common userdata for language bridges
-pub struct LangBridge<T: ProxyBridge> {
+pub struct LangBridge<T: ServerTransport> {
     bridge: T,
-    plc: ProxyLuaClient,
-    from_luau_shutdown_timeouts: ShutdownTimeouts,
+    ed: EmbedderData,
 }
 
-impl<T: ProxyBridge> LangBridge<T> {
+impl<T: ServerTransport> LangBridge<T> {
     /// Creates a new language bridge
-    pub fn new(bridge: T, plc: ProxyLuaClient, from_luau_shutdown_timeouts: ShutdownTimeouts) -> Self {
-        Self { bridge, plc, from_luau_shutdown_timeouts }
+    pub fn new(bridge: T, ed: EmbedderData) -> Self {
+        Self { bridge, ed }
     }
 
     pub fn bridge(&self) -> &T {
         &self.bridge
     }
-
-    /// Creates a new language bridge from Luau state and other parameters
-    pub async fn new_from_bridge(
-        lua: &mluau::Lua,
-        ed: EmbedderData,
-        process_opts: ProcessOpts,
-        cs_state: ConcurrentExecutorState<T::ConcurrentlyExecuteClient>,
-        vfs: HashMap<String, String>,
-        from_luau_shutdown_timeouts: ShutdownTimeouts
-    ) -> Result<Self, crate::base::Error> {
-        let plc = ProxyLuaClient::new(lua, ed)
-            .map_err(|e| format!("Failed to create ProxyLuaClient: {}", e))?;
-        let bridge_vals = T::new(
-            cs_state,
-            ed,
-            process_opts,
-            vfs
-        ).await?;
-
-        Ok(Self {
-            bridge: bridge_vals,
-            plc,
-            from_luau_shutdown_timeouts,
-        })
-    }
-
-    pub async fn run(&self, modname: String) -> Result<(), mluau::Error> {
-        self.bridge.eval_from_source(modname).await
-            .map_err(|e| mluau::Error::external(e.to_string()))?;
-        
-        Ok(())
-    }
 }
 
-impl<T: ProxyBridge> mluau::UserData for LangBridge<T> {
-    fn add_fields<F: mluau::UserDataFields<Self>>(fields: &mut F) {
-        fields.add_field("lang", T::name());
-    }
+impl<T: ServerTransport> mluau::UserData for LangBridge<T> {
     fn add_methods<M: mluau::UserDataMethods<Self>>(methods: &mut M) {
         // For convenience, expose null
         methods.add_method("null", |_, _, ()| {
             Ok(mluau::Value::NULL)
         });
 
-        methods.add_scheduler_async_method("run", async move |_lua, this, modname: String| {
-            this.run(modname).await
-        });
-
         methods.add_method("sendtext", move |lua, this, msg: mluau::Value| {
-            let mut ed = EmbedderDataContext::new(this.plc.ed);
-            let v = from_lua_text(msg, &lua, &mut ed)
+            let v = from_lua_text(msg, &lua, this.ed)
                 .map_err(|e| mluau::Error::external(format!("Failed to convert argument to string: {}", e)))?;
-            this.bridge.send_text(v)
+            this.bridge.send_to_foreign(ServerMessage::SendText { msg: v })
                 .map_err(|e| mluau::Error::external(format!("Failed to send text message: {}", e)))?;
             Ok(())
         });
 
         methods.add_method("sendbinary", move |lua, this, msg: mluau::Value| {
-            let mut ed = EmbedderDataContext::new(this.plc.ed);
-            let v = from_lua_binary(msg, &lua, &mut ed)
+            let v = from_lua_binary(msg, &lua, this.ed)
                 .map_err(|e| mluau::Error::external(format!("Failed to convert argument to binary: {}", e)))?;
-            this.bridge.send_binary(v)
+            this.bridge.send_to_foreign(ServerMessage::SendBinary { msg: v })
                 .map_err(|e| mluau::Error::external(format!("Failed to send binary message: {}", e)))?;
             Ok(())
         });
 
-        methods.add_scheduler_async_method("receivetext", async move |_lua, this, _: ()| {
-            let msg = this.bridge.receive_text().await
+        methods.add_scheduler_async_method("receive", async move |lua, this, _: ()| {
+            let msg = this.bridge.receive_from_foreign().await
                 .map_err(|e| mluau::Error::external(format!("Failed to receive text message: {}", e)))?;
-            Ok(msg)
-        });
-
-        methods.add_scheduler_async_method("receivebinary", async move |lua, this, _: ()| {
-            let msg = this.bridge.receive_binary().await
-                .map_err(|e| mluau::Error::external(format!("Failed to receive text message: {}", e)))?;
-            let buf = match msg {
-                Some(msg) => mluau::Value::Buffer(lua.create_buffer(msg.into_vec())?),
-                None => mluau::Value::Nil,
-            };
-            Ok(buf)
+            match msg {
+                ClientMessage::SendText { msg } => {
+                    let s = lua.create_string(&msg)?;
+                    Ok(mluau::Value::String(s))
+                },
+                ClientMessage::SendBinary { msg } => {
+                    let buf = lua.create_buffer(msg)?;
+                    Ok(mluau::Value::Buffer(buf))
+                },
+            }
         });
 
         methods.add_scheduler_async_method("shutdown", async move |_, this, ()| {
-            this.bridge.shutdown(this.from_luau_shutdown_timeouts).await
+            this.bridge.shutdown().await
                 .map_err(|e| mluau::Error::external(format!("Failed to shutdown foreign language bridge: {}", e)))
         });
 
@@ -113,7 +67,7 @@ impl<T: ProxyBridge> mluau::UserData for LangBridge<T> {
     }
 }
 
-impl<T: ProxyBridge> Drop for LangBridge<T> {
+impl<T: ServerTransport> Drop for LangBridge<T> {
     fn drop(&mut self) {
         // Ensure the bridge is shutdown on drop
         if !self.bridge.is_shutdown() {
