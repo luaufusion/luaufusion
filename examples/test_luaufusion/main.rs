@@ -85,10 +85,10 @@ fn main() {
             ("foo.js".to_string(), r#"
 const eventHandler = async () => {
     // Event handler test
-    //addEventListener("v8msg", async (msg) => {
-    //    console.log("[v8] Received message to event handler:", msg);
-    //});
-    //dispatchEvent(new CustomEvent("v8msg"));
+    addEventListener("v8msg", async (msg) => {
+        console.log("[v8] Received message to event handler:", msg);
+    });
+    dispatchEvent(new CustomEvent("v8msg"));
 
     // Now send a message to Luau
     let eb = globalThis.lua.eventBridge;
@@ -106,6 +106,7 @@ const eventHandler = async () => {
         if(msg == "SHUTDOWN") {
             console.log("[v8] Received SHUTDOWN, exiting event handler");
             eb.sendText("DOWN");
+            await (new Promise(resolve => setTimeout(resolve, 100)))
             break;
         } else if (msg == "GETBUFFER") {
             console.log("[v8] Receiving buffer from Luau");
@@ -123,7 +124,7 @@ console.log(`In foo.js ${structuredClone({})}`);
 try {
     await eventHandler();
 } catch(e) {
-    console.error(`Error in foo.js ${e}`);
+    console.error(`Error in foo.js ${e.stack}`);
 }
 "#.to_string()),
     ("foo1.json".to_string(), "{\"foo\":1929}".to_string()),
