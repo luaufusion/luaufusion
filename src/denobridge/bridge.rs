@@ -83,7 +83,6 @@ where
                 break;
             }
             _ = inner.deno.run_event_loop(PollEventLoopOptions {
-                wait_for_inspector: false,
                 pump_v8_message_loop: true,
             }) => {
                 tokio::task::yield_now().await;

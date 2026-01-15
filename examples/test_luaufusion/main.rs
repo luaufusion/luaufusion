@@ -4,6 +4,7 @@ use concurrentlyexec::{ConcurrentExecutorState, ProcessOpts};
 use luaufusion::base::ServerTransport;
 use luaufusion::transport::concurrentlyexec::{ConcurrentlyExecuteServer, ConcurrentlyExecuteServerData, run_process_client, set_use_v8};
 use mlua_scheduler::{taskmgr::NoopHooks, LuaSchedulerAsync, XRc};
+use mlua_scheduler::taskmgr::SchedulerImpl;
 use mluau::IntoLua;
 use luaufusion::luau::embedder_api::EmbedderData;
 use luaufusion::luau::langbridge::LangBridge;
@@ -12,6 +13,7 @@ use tokio::runtime::LocalOptions;
 
 const HEAP_LIMIT: usize = 10 * 1024 * 1024; // 10 MB
 
+type S = mlua_scheduler::schedulers::plinth::CoreScheduler;
 fn main() {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -46,19 +48,7 @@ fn main() {
         let compiler = mluau::Compiler::new().set_optimization_level(2);
         lua.set_compiler(compiler);
 
-        let returns_tracker = mlua_scheduler::taskmgr::ReturnTracker::new();
-
-        let mut wildcard_sender = returns_tracker.track_wildcard_thread();
-
-        tokio::task::spawn_local(async move {
-            while let Some((thread, result)) = wildcard_sender.recv().await {
-                if let Err(e) = result {
-                    eprintln!("Error in thread {e:?}: {:?}", thread.to_pointer());
-                }
-            }
-        });
-
-        let task_mgr = mlua_scheduler::taskmgr::TaskManager::new(&lua, returns_tracker, XRc::new(NoopHooks {})).await.expect("Failed to create task manager");
+        let task_mgr = S::setup_async(&lua, XRc::new(NoopHooks {})).await.expect("Failed to create task manager");
 
         lua.globals()
             .set(
@@ -75,7 +65,7 @@ fn main() {
         lua.globals()
             .set(
                 "task",
-                mlua_scheduler::userdata::task_lib(&lua).expect("Failed to create table"),
+                mlua_scheduler::userdata::task_lib::<S>(&lua).expect("Failed to create table"),
             )
             .expect("Failed to set task global");
 
@@ -210,11 +200,9 @@ return v8
         args.push_back(bridge_v8.into_lua(&lua).expect("Failed to push v8 runtime to Lua"));
 
         let output = task_mgr
-            .spawn_thread_and_wait(th, args)
+            .run_in_scheduler(th, args)
             .await
-            .expect("Failed to run Lua thread")
-            .expect("Lua thread returned no value")
-            .expect("Lua thread returned an error");
+            .expect("Failed to run Lua thread");
         
         println!("Output: {:?}", output);
         assert!(output.len() == 1, "Expected single return value from Lua main chunk");

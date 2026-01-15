@@ -74,13 +74,10 @@ impl V8IsolateManagerInner {
     pub fn setup_runtime_for_snapshot(loader: FusionModuleLoader) -> SetupRuntimeForSnapshot {
         let extensions = denoexts::extension::all_extensions(false);
 
-        deno_core::v8::V8::set_flags_from_string("--harmony-import-assertions --harmony-import-attributes --jitless");
-
         let mut deno = deno_core::JsRuntimeForSnapshot::new(deno_core::RuntimeOptions {
             extensions,
             module_loader: Some(Rc::new(loader)),
-            inspector: false,
-            import_assertions_support: deno_core::ImportAssertionsSupport::Yes,
+            //import_assertions_support: deno_core::ImportAssertionsSupport::Yes,
             ..Default::default()
         });
 
@@ -116,7 +113,7 @@ impl V8IsolateManagerInner {
         #[cfg(not(feature = "deno_include_snapshot"))]
         let extensions = denoexts::extension::all_extensions(false);
 
-        deno_core::v8::V8::set_flags_from_string("--harmony-import-assertions --harmony-import-attributes --jitless");
+        deno_core::v8::V8::set_flags_from_string("--jitless");
 
         #[cfg(feature = "deno_include_snapshot")]
         {
@@ -132,8 +129,7 @@ impl V8IsolateManagerInner {
             startup_snapshot: Some(V8_SNAPSHOT),
             extensions,
             module_loader: Some(Rc::new(loader)),
-            inspector: false,
-            import_assertions_support: deno_core::ImportAssertionsSupport::Yes,
+            //import_assertions_support: deno_core::ImportAssertionsSupport::Yes,
             ..Default::default()
         });
 
